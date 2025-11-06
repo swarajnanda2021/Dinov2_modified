@@ -15,6 +15,7 @@ from timm.layers import PatchDropout, trunc_normal_
 import xformers.ops as xops
 from xformers.ops import fmha
 
+from timm.models._manipulate import checkpoint_seq
 
 # Cache for attention bias to avoid recomputation
 attn_bias_cache = {}
@@ -318,6 +319,8 @@ class VisionTransformer(nn.Module):
             norm_layer=norm_layer,
         )
 
+        self.grad_checkpointing = False
+        
         if isinstance(img_size, tuple):
             num_patches = (img_size[0] // patch_size) * (img_size[1] // patch_size)
         else:
@@ -402,6 +405,10 @@ class VisionTransformer(nn.Module):
     @torch.jit.ignore
     def no_weight_decay(self):
         return {"pos_embed", "cls_token", "register_tokens", "mask_token"}
+    
+    @torch.jit.ignore
+    def set_grad_checkpointing(self, enable=True):
+        self.grad_checkpointing = enable
 
     def interpolate_pos_embed(self, x, h, w):
         """Interpolate position embeddings for different image sizes."""
@@ -520,10 +527,22 @@ class VisionTransformer(nn.Module):
                 x_prep = self.prepare_tokens(img)
             x_packed.append(x_prep)
 
-        for blk in self.blocks:
-            attn_bias, x_cat = get_attn_bias_and_cat(x_packed)
-            x_cat = blk(x_cat, attn_bias=attn_bias)
-            x_packed = attn_bias.split(x_cat)
+        if self.grad_checkpointing and not torch.jit.is_scripting():
+            # Checkpoint-friendly version
+            for blk in self.blocks:
+                attn_bias, x_cat = get_attn_bias_and_cat(x_packed)
+                x_cat = torch.utils.checkpoint.checkpoint(
+                    blk,
+                    x_cat,
+                    attn_bias,
+                    use_reentrant=False
+                )
+                x_packed = attn_bias.split(x_cat)
+        else:
+            for blk in self.blocks:
+                attn_bias, x_cat = get_attn_bias_and_cat(x_packed)
+                x_cat = blk(x_cat, attn_bias=attn_bias)
+                x_packed = attn_bias.split(x_cat)
 
         outputs = []
         for x, masks in zip(x_packed, masks_list):
@@ -566,8 +585,11 @@ class VisionTransformer(nn.Module):
             x = self.patch_drop(x)
             x = self.norm_pre(x)
             
-            for blk in self.blocks:
-                x = blk(x, attn_bias=None)
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint_seq(self.blocks, x)
+            else:
+                for blk in self.blocks:
+                    x = blk(x, attn_bias=None)
             
             x = self.norm(x)
             

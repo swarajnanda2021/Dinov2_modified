@@ -33,6 +33,14 @@ class CombinedModelDINO(nn.Module):
         self.patchhead = patchhead
         self.num_masks = num_masks
         self.patch_size = patch_size
+    
+    def set_grad_checkpointing(self, enable=True):
+        """Enable gradient checkpointing in the backbone."""
+        if hasattr(self.backbone, 'set_grad_checkpointing'):
+            self.backbone.set_grad_checkpointing(enable)
+            print(f"✓ Gradient checkpointing {'enabled' if enable else 'disabled'} in CombinedModelDINO backbone")
+        else:
+            print(f"⚠ Warning: Backbone does not support gradient checkpointing")
 
     def forward(self, crops, token_masks=None, mode='dino'):
         """

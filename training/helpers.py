@@ -309,13 +309,19 @@ def setup_ddp_model(model, args, find_unused=False):
     Setup model for distributed data parallel training.
     
     Args:
-        model: Model to wrap
+        model: Model to wrap    
         args: Arguments with GPU info
         find_unused: Whether to find unused parameters
         
     Returns:
         DDP-wrapped model
     """
+    # Enable gradient checkpointing BEFORE DDP wrapping
+    if hasattr(args, 'grad_checkpointing') and args.grad_checkpointing:
+        if hasattr(model, 'set_grad_checkpointing'):
+            model.set_grad_checkpointing(True)
+            print(f"✓ Enabled gradient checkpointing before DDP wrapping")
+
     ddp_model = nn.parallel.DistributedDataParallel(
         model,
         device_ids=[args.gpu],
