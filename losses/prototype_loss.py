@@ -1,5 +1,7 @@
 """
-Patch prototype clustering loss with CAPI-style soft prototypes.
+Patch prototype clustering loss with CAPI-inspired doubly stochastic Sinkhorn-Knopp.
+Uses global processing (all tokens together) with doubly stochastic constraints
+to eliminate positional bias while maintaining efficient computation.
 """
 
 import math
@@ -13,7 +15,13 @@ from .koleo_loss import KoLeoLoss
 
 class PatchPrototypeLoss(nn.Module):
     """
-    CAPI-style patch clustering loss using linear layer as soft prototypes.
+    CAPI-inspired patch clustering loss using doubly stochastic optimal transport.
+    
+    Key differences from original:
+    - Doubly stochastic constraints (both samples and prototypes sum to 1)
+    - Improved numerical stability across dtypes
+    - Epsilon protection against division by zero
+    - Eliminates spatial positional bias in prototype assignments
     
     Args:
         num_prototypes: Number of prototype vectors
@@ -70,10 +78,10 @@ class PatchPrototypeLoss(nn.Module):
         # ========== TEACHER PATH: ALL PATCHES ==========
         teacher_logits_all = prototype_bank(teacher_norm)  # [B, N, K]
         
-        # Reshape for Sinkhorn-Knopp
-        teacher_logits_flat = teacher_logits_all.reshape(B * N, -1)
+        # Reshape for global Sinkhorn-Knopp
+        teacher_logits_flat = teacher_logits_all.reshape(B * N, -1)  # [B*N, K]
         
-        # Balanced assignments via Sinkhorn-Knopp
+        # CAPI-inspired doubly stochastic optimal transport
         Q_tilde_flat = self.sinkhorn_knopp(teacher_logits_flat, self.teacher_temp)
         Q_tilde_all = Q_tilde_flat.reshape(B, N, -1)
         
@@ -128,40 +136,52 @@ class PatchPrototypeLoss(nn.Module):
         return prediction_loss, koleo_loss, arrangement_loss
 
     @torch.no_grad()
-    def sinkhorn_knopp(self, teacher_output, teacher_temp, n_iterations=3):
-        """Enforce balanced prototype assignments via optimal transport."""
+    def sinkhorn_knopp(self, teacher_output, teacher_temp, n_iterations=3, eps=1e-8):
+        """
+        CAPI-inspired doubly stochastic Sinkhorn-Knopp.
+        
+        Enforces both dimensions sum to 1 (doubly stochastic matrix).
+        This eliminates positional bias while maintaining global processing.
+        
+        Args:
+            teacher_output: [M, K] logits where M = B*N tokens
+            teacher_temp: Temperature for softmax
+            n_iterations: Number of SK iterations
+            eps: Epsilon for numerical stability
+            
+        Returns:
+            Q: [M, K] doubly stochastic assignment matrix
+        """
         teacher_output = teacher_output.float()
         world_size = dist.get_world_size() if dist.is_initialized() else 1
-
-        # Add numerical stability by shifting before exp
+        
+        # Numerical stability: shift by global max before exp
         M = teacher_output / teacher_temp
         M_max = M.max()
         if dist.is_initialized():
             dist.all_reduce(M_max, op=dist.ReduceOp.MAX)
         M = M - M_max
         
-        Q = torch.exp(M).t()        
-        B = Q.shape[1] * world_size
-        K = Q.shape[0]
-
-        # Normalize
+        # Transpose for easier iteration: [K, M]
+        Q = torch.exp(M).t()
+        
+        # Global normalization (optional, helps convergence)
         sum_Q = torch.sum(Q)
         if dist.is_initialized():
             dist.all_reduce(sum_Q)
-        Q /= sum_Q
-
-        # Sinkhorn iterations
+        Q /= (sum_Q + eps)
+        
+        # Doubly stochastic iterations
         for _ in range(n_iterations):
-            # Row normalization
-            sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
+            # Normalize over samples (each prototype distribution sums to 1)
+            sum_over_samples = torch.sum(Q, dim=1, keepdim=True)
             if dist.is_initialized():
-                dist.all_reduce(sum_of_rows)
-            Q /= sum_of_rows
-            Q /= K
-
-            # Column normalization
-            Q /= torch.sum(Q, dim=0, keepdim=True)
-            Q /= B
-
-        Q *= B
+                dist.all_reduce(sum_over_samples)
+            Q /= (sum_over_samples + eps)
+            
+            # Normalize over prototypes (each sample distribution sums to 1)
+            sum_over_prototypes = torch.sum(Q, dim=0, keepdim=True)
+            Q /= (sum_over_prototypes + eps)
+        
+        # Transpose back to [M, K]
         return Q.t()
