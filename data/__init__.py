@@ -2,7 +2,7 @@
 Data loading and augmentation for DINOv2 training.
 """
 
-from .dataset import DINOv2PathologyDataset
+from .datasets import DINOv2PathologyDataset
 from .transforms import TMEDinoTransforms
 
 __all__ = [

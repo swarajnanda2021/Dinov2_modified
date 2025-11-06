@@ -24,7 +24,7 @@ def parse_args():
     # Submitit specific arguments
     parser.add_argument("--ngpus", default=4, type=int, 
                         help="Number of GPUs per node")
-    parser.add_argument("--nodes", default=2, type=int, 
+    parser.add_argument("--nodes", default=1, type=int, 
                         help="Number of nodes")
     parser.add_argument("--timeout", default=10000, type=int, 
                         help="Job duration in minutes")
@@ -36,7 +36,7 @@ def parse_args():
 
 def get_shared_folder() -> Path:
     """Get shared folder for logs and checkpoints."""
-    p = Path("/data1/vanderbc/nandas1/TCGA_TMEDinov3_ViT-B_B3_seqpacking/logs")
+    p = Path("/data1/vanderbc/nandas1/TCGA_TMEDinov3_ViT-B_B2_seqpacking/logs")
     p.mkdir(exist_ok=True)
     return p
 
@@ -158,7 +158,7 @@ def main():
     args.teacher_temp_warmup_iters = 37_500
     
     # Optimization
-    args.batch_size_per_gpu = 96
+    args.batch_size_per_gpu = 192
     args.warmup_iterations = 12_500
     args.total_iterations = 300_000
     args.freeze_last_layer_iters = 1_250
