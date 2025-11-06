@@ -173,6 +173,7 @@ def main():
     args.save_checkpoint_freq = 2_000
     args.num_workers = 10
     args.visualization_freq = 100
+    args.grad_checkpointing = True
     
     # Dataset
     args.base_dir = "/data1/vanderbc/foundation_model_training_images/TCGA"
