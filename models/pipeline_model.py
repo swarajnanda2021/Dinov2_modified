@@ -57,6 +57,7 @@ def get_layer_split_points(depth: int, gpus_per_node: int):
     
     return split_points
 
+
 def create_pipeline_student_teacher(
     args,
     local_rank: int,
@@ -65,6 +66,12 @@ def create_pipeline_student_teacher(
 ):
     """
     Create pipeline-parallelized student and teacher models.
+    
+    Strategy:
+    1. Create full model on device
+    2. Initialize weights properly
+    3. Delete layers we don't need
+    4. Create identical teacher via deepcopy
     
     Args:
         args: Training arguments
@@ -89,17 +96,17 @@ def create_pipeline_student_teacher(
     split_points = get_layer_split_points(depth, args.gpus_per_node)
     
     # Determine which layers this GPU handles
-    if local_rank == 0: # first GPU handles the patch embedding and the first set of blocks
+    if local_rank == 0:
         layer_start = 0
         layer_end = split_points[0] if split_points else depth
         has_patch_embed = True
         has_heads = False
-    elif local_rank == args.gpus_per_node - 1: # last GPU handles the last set of blocks, the prototypes, the projection heads, and losses
+    elif local_rank == args.gpus_per_node - 1:
         layer_start = split_points[-1] if split_points else 0
         layer_end = depth
         has_patch_embed = False
         has_heads = True
-    else: # middle layers are only for intermediate transformer blocks
+    else:
         layer_start = split_points[local_rank - 1]
         layer_end = split_points[local_rank]
         has_patch_embed = False
@@ -108,95 +115,84 @@ def create_pipeline_student_teacher(
     print(f"GPU {local_rank}: Layers [{layer_start}:{layer_end}], "
           f"patch_embed={has_patch_embed}, heads={has_heads}")
     
-    # ========== Create FULL model on meta device (to avoid OOM) ==========
-    with torch.device('meta'):
-        full_student_encoder = ModernViT(
-            img_size=224,
-            patch_size=args.patch_size,
-            embed_dim=embed_dim,
-            depth=depth,
-            num_heads=num_heads,
-            mlp_ratio=4.0,
-            qkv_bias=True,
-            qk_norm=False,
-            dual_norm=False,
-            drop_path_rate=0.4,
-            pre_norm=False,
-            num_register_tokens=4,
-        )
-        
+    # ========== Create FULL model on device ==========
+    print("Creating full model on device...")
+    full_student_encoder = ModernViT(
+        img_size=224,
+        patch_size=args.patch_size,
+        embed_dim=embed_dim,
+        depth=depth,
+        num_heads=num_heads,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        qk_norm=False,
+        dual_norm=False,
+        drop_path_rate=0.4,
+        pre_norm=False,
+        num_register_tokens=4,
+    ).to(device)
+    
+    # Initialize weights
+    print("Initializing weights...")
+    full_student_encoder._init_weights()
+    
+    # ========== Partition model: Delete what we don't need ==========
+    print("Partitioning model...")
+    
+    # 1. Handle patch embedding (only first stage keeps it)
+    if not has_patch_embed:
+        full_student_encoder.patch_embed = None
+        full_student_encoder.cls_token = None
+        full_student_encoder.register_tokens = None
+        full_student_encoder.pos_embed = None
+        print("  Removed patch_embed, cls_token, register_tokens, pos_embed")
+    
+    # 2. Keep only our transformer blocks
+    blocks_to_keep = []
+    for layer_idx in range(layer_start, layer_end):
+        blocks_to_keep.append(full_student_encoder.blocks[layer_idx])
+    
+    full_student_encoder.blocks = nn.Sequential(*blocks_to_keep)
+    print(f"  Kept {len(blocks_to_keep)} transformer blocks [{layer_start}:{layer_end}]")
+    
+    # 3. Handle final norm and heads (only last stage keeps them)
+    if not has_heads:
+        full_student_encoder.norm = None
+        print("  Removed final norm")
+    
+    # ========== Create projection heads (only on last GPU) ==========
+    if has_heads:
         full_student_classhead = DINOHead(
             embed_dim,
             args.out_dim,
             use_bn=args.use_bn_in_head,
             norm_last_layer=args.norm_last_layer,
-        )
+        ).to(device)
         
         full_student_patchhead = DINOHead(
             embed_dim,
             args.out_dim,
             use_bn=args.use_bn_in_head,
             norm_last_layer=args.norm_last_layer,
-        )
-    
-        # Prototype bank (only on last GPU)
-        if has_heads:
-            full_prototype_bank = LinearPrototypeBank(
-                num_prototypes=args.num_prototypes,
-                embed_dim=embed_dim,
-                bias=True,
-            )
-        else:
-            full_prototype_bank = None
-    
-    # ========== Partition model for this GPU ==========
-    # Delete layers we don't need
-    
-    # 1. Handle patch embedding
-    if not has_patch_embed:
-        full_student_encoder.patch_embed = None
-        full_student_encoder.cls_token = None
-        full_student_encoder.register_tokens = None
-        full_student_encoder.pos_embed = None
-    
-    # 2. Handle transformer blocks - keep only our range
-    for layer_idx in range(depth):
-        if layer_idx < layer_start or layer_idx >= layer_end:
-            del full_student_encoder.blocks[layer_idx]
-    
-    # 3. Handle final norm and heads
-    if not has_heads:
-        full_student_encoder.norm = None
+        ).to(device)
+        
+        print("  Created projection heads")
+    else:
         full_student_classhead = None
         full_student_patchhead = None
+    
+    # ========== Create prototype bank (only on last GPU) ==========
+    if has_heads:
+        full_prototype_bank = LinearPrototypeBank(
+            num_prototypes=args.num_prototypes,
+            embed_dim=embed_dim,
+            bias=True,
+        ).to(device)
+        print(f"  Created prototype bank: {args.num_prototypes} prototypes")
+    else:
         full_prototype_bank = None
     
-    # ========== Move to device and materialize ==========
-    # This will only allocate memory for the layers this GPU owns
-    full_student_encoder = full_student_encoder.to_empty(device=device)
-    
-    if full_student_classhead is not None:
-        full_student_classhead = full_student_classhead.to_empty(device=device)
-    
-    if full_student_patchhead is not None:
-        full_student_patchhead = full_student_patchhead.to_empty(device=device)
-    
-    if full_prototype_bank is not None:
-        full_prototype_bank = full_prototype_bank.to_empty(device=device)
-    
-    # Initialize weights properly
-    if has_patch_embed:
-        full_student_encoder._init_weights()
-    else:
-        # Only init the blocks we own
-        for block in full_student_encoder.blocks:
-            full_student_encoder._init_module_weights(block)
-    
-    if has_heads:
-        full_student_encoder._init_module_weights(full_student_encoder.norm)
-        # Heads have their own initialization
-    
-    # ========== Create PipelineStage wrapper ==========
+    # ========== Wrap in PipelineStageWrapper ==========
     student_stage = PipelineStageWrapper(
         backbone=full_student_encoder,
         classhead=full_student_classhead,
@@ -205,25 +201,23 @@ def create_pipeline_student_teacher(
         num_stages=args.gpus_per_node,
         has_patch_embed=has_patch_embed,
         has_heads=has_heads,
+        grad_checkpointing=args.grad_checkpointing,
     )
 
-    # ========== Create teacher (same structure) ==========
+    # ========== Create teacher (identical copy) ==========
     teacher_stage = deepcopy(student_stage)
     teacher_stage.requires_grad_(False)
-
-    # ========== Wrap in PipelineStage ==========
-    from torch.distributed.pipelining import PipelineStage as TorchPipelineStage
     
-    # Note: We'll actually use our custom wrapper for now
-    # and handle scheduling manually for full control
+    print(f"✓ Created student and teacher pipeline stages for GPU {local_rank}")
     
     return student_stage, teacher_stage, full_prototype_bank
 
 
+
 class PipelineStageWrapper(nn.Module):
     """
-    Wrapper for a single pipeline stage.
-    Handles partial model execution with send/recv.
+    Wrapper for a single pipeline stage with gradient checkpointing support.
+    Handles partial model execution with send/recv between stages.
     """
     def __init__(
         self,
@@ -234,6 +228,7 @@ class PipelineStageWrapper(nn.Module):
         num_stages: int,
         has_patch_embed: bool,
         has_heads: bool,
+        grad_checkpointing: bool = False,
     ):
         super().__init__()
         self.backbone = backbone
@@ -243,63 +238,148 @@ class PipelineStageWrapper(nn.Module):
         self.num_stages = num_stages
         self.has_patch_embed = has_patch_embed
         self.has_heads = has_heads
+        self.grad_checkpointing = grad_checkpointing
+        
+        # For sequence packing: cache attention bias between forward calls
+        self._cached_attn_bias = None
 
-    
-    def forward(self, x, token_masks=None):
+    def _apply_blocks_with_checkpointing(self, x, attn_bias=None):
+        """
+        Apply transformer blocks with optional gradient checkpointing.
+        
+        Gradient checkpointing is applied per-block to save memory during backward pass.
+        """
+        if self.grad_checkpointing and self.training:
+            # Apply gradient checkpointing to each transformer block
+            for block in self.backbone.blocks:
+                # Checkpoint each block individually
+                def create_forward_fn(module):
+                    def forward_fn(*inputs):
+                        # Handle both (x,) and (x, attn_bias) signatures
+                        if len(inputs) == 1:
+                            return module(inputs[0], attn_bias=None)
+                        else:
+                            return module(inputs[0], attn_bias=inputs[1])
+                    return forward_fn
+                
+                if attn_bias is not None:
+                    x = torch.utils.checkpoint.checkpoint(
+                        create_forward_fn(block),
+                        x,
+                        attn_bias,
+                        use_reentrant=False
+                    )
+                else:
+                    x = torch.utils.checkpoint.checkpoint(
+                        create_forward_fn(block),
+                        x,
+                        use_reentrant=False
+                    )
+        else:
+            # No checkpointing: normal forward pass
+            for block in self.backbone.blocks:
+                x = block(x, attn_bias=attn_bias)
+        
+        return x
+
+    def forward(self, x, token_masks=None, attn_bias=None):
         """
         Forward through this pipeline stage.
         
-        For first stage: Apply patch embed + initial blocks
-        For middle stages: Apply blocks
-        For last stage: Apply final blocks + norm + heads
+        Handles three cases:
+        1. First stage: Apply patch embed + blocks
+        2. Middle stages: Apply blocks only
+        3. Last stage: Apply blocks + norm + heads
+        
+        Args:
+            x: Input tensor(s) - can be list for multi-crop or single tensor
+            token_masks: Optional token masking for iBOT
+            attn_bias: Optional attention bias for sequence packing
+            
+        Returns:
+            - First/middle stages: Processed features to send to next stage
+            - Last stage: Dict with clstoken, patchtokens, etc.
         """
-
-        # Handle different input formats (single crop vs multi-crop)
         is_multi_crop = isinstance(x, list)
         
+        # ========== FIRST STAGE: Patch Embedding + Initial Blocks ==========
         if self.local_rank == 0:
-            # First stage: patch embedding
             if is_multi_crop:
+                # Multi-crop: pack sequences together
                 x_processed = []
+                
+                # Process each crop through patch embedding
                 for crop in x:
-                    tokens = self.backbone.prepare_tokens(crop)
+                    if token_masks is not None and isinstance(token_masks, list):
+                        # Find corresponding mask (if provided)
+                        crop_idx = x.index(crop)
+                        mask = token_masks[crop_idx] if crop_idx < len(token_masks) else None
+                        tokens = self.backbone.prepare_tokens_with_masks(crop, mask)
+                    else:
+                        tokens = self.backbone.prepare_tokens(crop)
                     x_processed.append(tokens)
+                
+                # Create attention bias for sequence packing
+                from models.vision_transformer.modern_vit import get_attn_bias_and_cat
+                attn_bias, x_cat = get_attn_bias_and_cat(x_processed)
+                
+                # Cache attention bias for backward pass
+                self._cached_attn_bias = attn_bias
+                
+                # Apply transformer blocks with gradient checkpointing
+                x_cat = self._apply_blocks_with_checkpointing(x_cat, attn_bias)
+                
+                # Return packed tensor and attention bias
+                return x_cat, attn_bias
+                
             else:
+                # Single image
                 if token_masks is not None:
                     x_processed = self.backbone.prepare_tokens_with_masks(x, token_masks)
                 else:
                     x_processed = self.backbone.prepare_tokens(x)
-            
-            # Apply our transformer blocks
-            if is_multi_crop:
-                for i, tokens in enumerate(x_processed):
-                    for block in self.backbone.blocks:
-                        tokens = block(tokens)
-                    x_processed[i] = tokens
-            else:
-                for block in self.backbone.blocks:
-                    x_processed = block(x_processed)
-            
-            return x_processed
+                
+                # Apply transformer blocks with gradient checkpointing
+                x_processed = self._apply_blocks_with_checkpointing(x_processed, attn_bias=None)
+                
+                return x_processed, None
         
+        # ========== LAST STAGE: Final Blocks + Norm + Heads ==========
         elif self.has_heads:
-            # Last stage: apply final blocks + norm + heads
-            if is_multi_crop:
-                outputs = []
-                for tokens in x:
-                    for block in self.backbone.blocks:
-                        tokens = block(tokens)
-                    tokens = self.backbone.norm(tokens)
-                    outputs.append({
+            if is_multi_crop or attn_bias is not None:
+                # Packed multi-crop case
+                # x is already concatenated: [1, total_tokens, D]
+                
+                # Apply transformer blocks with gradient checkpointing
+                x = self._apply_blocks_with_checkpointing(x, attn_bias)
+                
+                # Apply final norm
+                x = self.backbone.norm(x)
+                
+                # Unpack sequences using attention bias
+                if attn_bias is not None:
+                    outputs_list = attn_bias.split(x)
+                else:
+                    # If no attention bias, assume single sequence
+                    outputs_list = [x]
+                
+                # Extract CLS and patch tokens for each crop
+                results = []
+                for tokens in outputs_list:
+                    results.append({
                         'clstoken': tokens[:, 0],
                         'regtokens': tokens[:, 1:5],
                         'patchtokens': tokens[:, 5:],
                     })
                 
-                return outputs
+                return results
+                
             else:
-                for block in self.backbone.blocks:
-                    x = block(x)
+                # Single image case
+                # Apply transformer blocks with gradient checkpointing
+                x = self._apply_blocks_with_checkpointing(x, attn_bias=None)
+                
+                # Apply final norm
                 x = self.backbone.norm(x)
                 
                 return {
@@ -308,18 +388,15 @@ class PipelineStageWrapper(nn.Module):
                     'patchtokens': x[:, 5:],
                 }
         
+        # ========== MIDDLE STAGE: Blocks Only ==========
         else:
-            # Middle stage: just apply blocks
-            if is_multi_crop:
-                for i, tokens in enumerate(x):
-                    for block in self.backbone.blocks:
-                        tokens = block(tokens)
-                    x[i] = tokens
-            else:
-                for block in self.backbone.blocks:
-                    x = block(x)
+            # Apply transformer blocks with gradient checkpointing
+            x = self._apply_blocks_with_checkpointing(x, attn_bias)
             
-            return x
+            # Return processed features (preserving attn_bias for next stage)
+            return x, attn_bias
+
+
 
 
 def create_pipeline_schedule(
@@ -329,11 +406,12 @@ def create_pipeline_schedule(
     num_microbatches: int,
 ):
     """
-    Create 1F1B schedule for pipeline execution.
+    Create GPipe schedule for pipeline execution.
     
-    Note: For now we'll use manual scheduling.
-    Full torch.distributed.pipelining integration coming in Phase 2.
+    We need to use torch.distributed.pipelining.ScheduleGPipe from torch.distributed.pipelining to create the schedule.
     """
-    # This will be expanded to use Schedule1F1B from torch.distributed.pipelining
-    # For now, return stages
+    
+    
+
+    
     return student_stage, teacher_stage
