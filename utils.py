@@ -764,6 +764,169 @@ def init_distributed_mode(args):
     setup_for_distributed(args.rank == 0)
 
 
+def create_hybrid_process_groups(args):
+    """
+    Create process groups for hybrid pipeline + data parallelism.
+    
+    Topology:
+    - Pipeline group: GPUs within same node (ranks that share model shards)
+    - Data group: Corresponding GPUs across nodes (data parallel replicas)
+    
+    Example with 2 nodes x 4 GPUs = 8 total GPUs:
+    Global ranks:  [0, 1, 2, 3,  4, 5, 6, 7]
+                   └─ node 0 ─┘ └─ node 1 ─┘
+    
+    Pipeline groups: [0,1,2,3], [4,5,6,7]  (within-node)
+    Data groups: [0,4], [1,5], [2,6], [3,7]  (across-node, same local rank)
+    
+    Args:
+        args: Training arguments with world_size, rank, gpus_per_node, num_nodes
+    
+    Returns:
+        pipeline_group: Process group for pipeline communication
+        data_group: Process group for data parallel gradient synchronization
+        local_rank: GPU rank within node (0 to gpus_per_node-1)
+        node_id: Which node this rank belongs to
+    """
+
+    if not args.use_pipeline_parallel:
+        # No pipeline parallelism, return None groups
+        return None, None, args.gpu, args.rank // args.gpus_per_node
+    
+    world_size = dist.get_world_size()
+    global_rank = dist.get_rank()
+
+    # Calculate node and local rank
+    node_id = global_rank // args.gpus_per_node
+    local_rank = global_rank % args.gpus_per_node
+
+    # Verify topology
+    expected_world_size = args.num_nodes * args.gpus_per_node
+    if world_size != expected_world_size:
+        raise ValueError(
+            f"World size mismatch: got {world_size}, "
+            f"expected {args.num_nodes} nodes x {args.gpus_per_node} GPUs = {expected_world_size}"
+        )
+    
+    # ========== Create pipeline groups (within each node) ==========
+    pipeline_groups = []
+    for node in range(args.num_nodes):
+        ranks = [node * args.gpus_per_node + i for i in range(args.gpus_per_node)]
+        group = dist.new_group(ranks=ranks)
+        pipeline_groups.append(group)
+        
+        if global_rank in ranks:
+            pipeline_group = group
+            if is_main_process() or global_rank == ranks[0]:
+                print(f"Pipeline group for node {node}: ranks {ranks}")
+    
+    # ========== Create data parallel groups (across nodes) ==========
+    data_groups = []
+    for local_r in range(args.gpus_per_node):
+        ranks = [node * args.gpus_per_node + local_r for node in range(args.num_nodes)]
+        group = dist.new_group(ranks=ranks)
+        data_groups.append(group)
+        
+        if global_rank in ranks:
+            data_group = group
+            if local_r == 0 or is_main_process():
+                print(f"Data parallel group for local_rank {local_r}: ranks {ranks}")
+    
+    print(f"Rank {global_rank}: node={node_id}, local_rank={local_rank}, "
+          f"pipeline_group_size={dist.get_world_size(pipeline_group)}, "
+          f"data_group_size={dist.get_world_size(data_group)}")
+    
+    return pipeline_group, data_group, local_rank, node_id
+
+def send_tensor(tensor, dst_rank, tag=0):
+    """Send tensor to destination rank."""
+    dist.send(tensor.contiguous(), dst=dst_rank, tag=tag)
+
+
+def recv_tensor(tensor_shape, dtype, device, src_rank, tag=0):
+    """Receive tensor from source rank."""
+    tensor = torch.empty(tensor_shape, dtype=dtype, device=device)
+    dist.recv(tensor, src=src_rank, tag=tag)
+    return tensor
+
+def pipeline_forward_pass(
+    stage,
+    x,
+    local_rank,
+    num_stages,
+    global_rank,
+    gpus_per_node,
+    token_masks=None,
+):
+    """
+    Execute forward pass through pipeline stage with send/recv.
+    
+    Args:
+        stage: PipelineStageWrapper for this GPU
+        x: Input (from previous stage or data loader)
+        local_rank: Local GPU rank within node
+        num_stages: Total pipeline stages
+        global_rank: Global rank
+        gpus_per_node: GPUs per node
+        token_masks: Optional masking
+    
+    Returns:
+        Output from this stage (or None if not last stage)
+    """
+    # Compute on this stage
+    output = stage(x, token_masks=token_masks)
+    
+    # Send to next stage if not last
+    if local_rank < num_stages - 1:
+        next_rank = global_rank + 1
+        
+        if isinstance(output, list):
+            # Multi-crop case
+            for i, tensor in enumerate(output):
+                send_tensor(tensor, next_rank, tag=i)
+        else:
+            send_tensor(output, next_rank, tag=0)
+        
+        return None  # Not last stage
+    else:
+        # Last stage: return output
+        return output
+
+
+def pipeline_backward_pass(
+    stage,
+    grad_output,
+    local_rank,
+    num_stages,
+    global_rank,
+    gpus_per_node,
+):
+    """
+    Execute backward pass through pipeline stage.
+    
+    Args:
+        stage: PipelineStageWrapper
+        grad_output: Gradients from next stage (or loss)
+        local_rank: Local GPU rank
+        num_stages: Total stages
+        global_rank: Global rank
+        gpus_per_node: GPUs per node
+    """
+    if local_rank == num_stages - 1:
+        # Last stage: backward from loss
+        grad_output.backward()
+    else:
+        # Receive gradients from next stage
+        # Then backward
+        # This is simplified - full implementation needs gradient flow
+        pass
+    
+    # Send gradients to previous stage if not first
+    if local_rank > 0:
+        # Send gradient to previous stage
+        prev_rank = global_rank - 1
+        # Implementation depends on activation saving strategy
+        pass
 
 
 def init_distributed_mode_condor(args):
