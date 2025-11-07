@@ -22,8 +22,12 @@ warnings.filterwarnings('ignore')
 
 # Import models from relative path
 script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.join(script_dir, '..')
+project_root = os.path.abspath(os.path.join(script_dir, '..'))
 sys.path.insert(0, project_root)
+
+# Verify models directory exists
+if not os.path.exists(os.path.join(project_root, 'models')):
+    raise RuntimeError(f"Cannot find models directory. Project root resolved to: {project_root}")
 
 from models.vision_transformer.modern_vit import VisionTransformer
 from models.vision_transformer.auxiliary_models import DINOHead, MaskModel_SpectralNorm
