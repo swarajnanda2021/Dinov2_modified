@@ -12,6 +12,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.decomposition import PCA
 import numpy as np
+from scipy.cluster.hierarchy import dendrogram, linkage
+from scipy.spatial.distance import squareform
 
 # Publication settings
 plt.rcParams.update({
@@ -73,60 +75,55 @@ def main():
     # ========== Create side-by-side plot ==========
     print("Creating side-by-side clustermaps...")
     
-    fig = plt.figure(figsize=(20, 9))
+    from scipy.cluster.hierarchy import dendrogram, linkage
+    from scipy.spatial.distance import squareform
     
-    # Left: PCA clustermap
-    ax1 = plt.subplot(1, 2, 1)
-    g1 = sns.clustermap(
-        similarity_pca, 
-        vmin=-1, vmax=1, 
-        cmap="coolwarm",
-        figsize=(9, 9),
-        xticklabels=False,
-        yticklabels=False,
-        cbar_kws={'label': 'Cosine Similarity'},
-    )
+    # Compute hierarchical clustering for PCA
+    dist_pca = 1 - similarity_pca
+    np.fill_diagonal(dist_pca, 0)
+    condensed_pca = squareform(dist_pca, checks=False)
+    linkage_pca = linkage(condensed_pca, method='average')
+    dendro_pca = dendrogram(linkage_pca, no_plot=True)
+    order_pca = dendro_pca['leaves']
     
-    # Position left plot
-    heatmap_pos = g1.ax_heatmap.get_position()
-    dendro_left_pos = g1.ax_row_dendrogram.get_position()
-    dendro_top_pos = g1.ax_col_dendrogram.get_position()
-    cbar_pos = g1.ax_cbar.get_position()
+    # Compute hierarchical clustering for raw
+    dist_raw = 1 - similarity_raw
+    np.fill_diagonal(dist_raw, 0)
+    condensed_raw = squareform(dist_raw, checks=False)
+    linkage_raw = linkage(condensed_raw, method='average')
+    dendro_raw = dendrogram(linkage_raw, no_plot=True)
+    order_raw = dendro_raw['leaves']
     
-    g1.ax_heatmap.set_position([0.08, 0.12, 0.35, 0.72])
-    g1.ax_row_dendrogram.set_position([0.03, 0.12, 0.04, 0.72])
-    g1.ax_col_dendrogram.set_position([0.08, 0.85, 0.35, 0.06])
-    g1.ax_cbar.set_position([0.44, 0.35, 0.01, 0.35])
+    # Reorder matrices
+    similarity_pca_ordered = similarity_pca[order_pca, :][:, order_pca]
+    similarity_raw_ordered = similarity_raw[order_raw, :][:, order_raw]
     
-    g1.ax_heatmap.set_title(f'PCA {args.n_components}D ({variance_explained:.1%} variance)', 
-                            fontsize=13, pad=35, fontweight='bold')
+    # Create figure with 1 row, 2 columns
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
     
-    # Right: Raw dimension clustermap
-    g2 = sns.clustermap(
-        similarity_raw, 
-        vmin=-1, vmax=1, 
-        cmap="coolwarm",
-        figsize=(9, 9),
-        xticklabels=False,
-        yticklabels=False,
-        cbar_kws={'label': 'Cosine Similarity'},
-    )
+    # Left: PCA heatmap
+    im1 = ax1.imshow(similarity_pca_ordered, cmap='coolwarm', vmin=-1, vmax=1, aspect='auto')
+    ax1.set_title(f'PCA {args.n_components}D\n({variance_explained:.1%} variance)', 
+                  fontsize=13, fontweight='bold')
+    ax1.set_xticks([])
+    ax1.set_yticks([])
+    plt.colorbar(im1, ax=ax1, label='Cosine Similarity', fraction=0.046, pad=0.04)
     
-    # Position right plot
-    g2.ax_heatmap.set_position([0.55, 0.12, 0.35, 0.72])
-    g2.ax_row_dendrogram.set_position([0.50, 0.12, 0.04, 0.72])
-    g2.ax_col_dendrogram.set_position([0.55, 0.85, 0.35, 0.06])
-    g2.ax_cbar.set_position([0.91, 0.35, 0.01, 0.35])
-    
-    g2.ax_heatmap.set_title(f'First {args.n_raw_dims}D (raw)', 
-                            fontsize=13, pad=35, fontweight='bold')
+    # Right: Raw heatmap
+    im2 = ax2.imshow(similarity_raw_ordered, cmap='coolwarm', vmin=-1, vmax=1, aspect='auto')
+    ax2.set_title(f'First {args.n_raw_dims}D (raw)', 
+                  fontsize=13, fontweight='bold')
+    ax2.set_xticks([])
+    ax2.set_yticks([])
+    plt.colorbar(im2, ax=ax2, label='Cosine Similarity', fraction=0.046, pad=0.04)
     
     # Main title
     fig.suptitle('Prototype Weight Matrix Clustering', 
-                fontsize=16, fontweight='bold', y=0.97)
+                fontsize=16, fontweight='bold')
     
+    plt.tight_layout()
     plt.savefig(args.output, dpi=300, bbox_inches='tight', facecolor='white')
-    plt.close('all')
+    plt.close()
     
     print(f"\n✓ Saved: {args.output}")
     
