@@ -1,9 +1,17 @@
+#!/usr/bin/env python3
+"""
+Plot training losses from log files.
+Run with no arguments: python plot_training_losses.py
+"""
+
 import matplotlib.pyplot as plt
 import re
 import numpy as np
 import glob
 import os
+import argparse
 from collections import defaultdict
+
 
 def extract_metrics_from_line(line):
     """
@@ -139,10 +147,19 @@ def main():
     Main function to process log files and generate visualization.
     Properly handles overlapping iterations between log files.
     """
-    base_path = '../logs/*_0_log.out'
-    output_path = 'training_losses.png'
+    parser = argparse.ArgumentParser(description='Plot training losses')
+    parser.add_argument('--base_path', type=str, default=None,
+                       help='Path pattern for log files (default: ../logs/*_0_log.out)')
+    parser.add_argument('--output_path', type=str, default='training_losses.png',
+                       help='Output path for plot (default: training_losses.png)')
+    args = parser.parse_args()
     
-    log_files = sorted(glob.glob(base_path))
+    # Default to relative path from script location
+    if args.base_path is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        args.base_path = os.path.join(script_dir, '..', 'logs', '*_0_log.out')
+    
+    log_files = sorted(glob.glob(args.base_path))
     if not log_files:
         print("No log files found")
         return
@@ -198,8 +215,8 @@ def main():
         unique_boundaries = list(set(all_epoch_boundaries))
         unique_boundaries.sort(key=lambda x: x[0])
         
-        plot_training_losses(sorted_iters, all_losses, unique_boundaries, output_path)
-        print(f"\nPlot saved to {output_path}")
+        plot_training_losses(sorted_iters, all_losses, unique_boundaries, args.output_path)
+        print(f"\nPlot saved to {args.output_path}")
         
         print("\nLoss Statistics:")
         for metric in sorted(all_losses.keys()):
