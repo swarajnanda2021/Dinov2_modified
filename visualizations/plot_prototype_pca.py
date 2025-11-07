@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Top-K Prototype Heatmap Visualization
-Shows which prototypes are most active in different spatial regions of tissue.
-Works with LinearPrototypeBank (nn.Linear) architecture.
+Prototype Assignment PCA Visualization
+Reduces K-dimensional prototype assignments to RGB via PCA.
+Shows spatial structure of prototype mixtures.
 
 File organization:
   visualizations/
-    prototype_heatmaps/
+    prototype_pca/
       LUAD/
-        LUAD_region_0.png
-        LUAD_region_1.png
+        LUAD_region_0_pca.png
+        LUAD_region_0_comparison.png
       SARC/
-        SARC_region_0.png
+        SARC_region_0_pca.png
 """
 
 import os
@@ -26,6 +26,9 @@ import matplotlib.gridspec as gridspec
 import openslide
 from pathlib import Path
 from scipy import ndimage
+from scipy.ndimage import zoom
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -34,7 +37,6 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(script_dir, '..'))
 sys.path.insert(0, project_root)
 
-# Verify models directory exists
 if not os.path.exists(os.path.join(project_root, 'models')):
     raise RuntimeError(f"Cannot find models directory. Project root resolved to: {project_root}")
 
@@ -300,17 +302,14 @@ def extract_patch_tokens(backbone, patches, device):
 
 
 def compute_prototype_assignments(patch_tokens, proto_layer, teacher_temp=0.07):
-    """
-    Compute prototype assignments using the nn.Linear layer.
-    Matches training exactly (includes bias if present).
-    """
+    """Compute prototype assignments using the nn.Linear layer"""
     B, N, D = patch_tokens.shape
     patch_tokens_flat = patch_tokens.reshape(-1, D)
     
     # Normalize patch tokens
     patch_tokens_norm = F.normalize(patch_tokens_flat, p=2, dim=-1)
     
-    # Get logits from linear layer (xW^T + b)
+    # Get logits from linear layer
     with torch.no_grad():
         logits = proto_layer(patch_tokens_norm)
     
@@ -320,152 +319,218 @@ def compute_prototype_assignments(patch_tokens, proto_layer, teacher_temp=0.07):
     # Reshape back
     assignments = assignments.reshape(B, N, -1)
     
-    print(f"Computing assignments via nn.Linear (teacher_temp={teacher_temp})")
+    print(f"Computed assignments: {assignments.shape}")
     
     return assignments
 
-def find_top_k_prototypes(assignments, k=5):
+
+def create_prototype_pca_map(assignments, method='pca', n_components=3):
     """
-    Simple and interpretable: Find prototypes that "own" the most tokens.
+    Reduce K-dimensional prototype assignments to 3D via PCA.
     
-    For each token, assign it to the prototype with highest probability (argmax).
-    Then count which prototypes are used most frequently.
+    Args:
+        assignments: [B, N, K] prototype assignment probabilities
+        method: 'pca' or 'tsne'
+        n_components: 2 or 3 (for grayscale/RGB)
+    
+    Returns:
+        pca_map: [H, W, n_components] spatial map
+        reducer: Fitted dimensionality reduction object
+        variance: Explained variance (PCA only)
     """
     B, N, K = assignments.shape
     
-    # Argmax: which prototype owns each token?
-    prototype_assignments = assignments.argmax(dim=-1)  # [B, N]
+    # Reshape assignments to spatial grid (16×16 patches × 14×14 tokens each)
+    H, W = 224, 224  # 16 patches × 14 tokens per patch
     
-    # Count frequency of each prototype
-    prototype_counts = torch.bincount(
-        prototype_assignments.flatten(), 
-        minlength=K
-    ).float()  # [K]
+    # Flatten to [H*W, K]
+    assignments_flat = torch.zeros(H * W, K)
     
-    # Get top-K most frequent
-    top_k_values, top_k_indices = torch.topk(prototype_counts, k)
-    
-    print(f"\nTop-{k} prototypes by token ownership:")
-    for i, (idx, count) in enumerate(zip(top_k_indices, top_k_values)):
-        percentage = (count / (B * N)) * 100
-        max_prob = assignments[:, :, idx].max().item()
-        mean_prob = assignments[:, :, idx].mean().item()
-        print(f"  {i+1}. Proto {idx.item():5d}: "
-              f"{count.item():.0f} tokens ({percentage:.1f}%), "
-              f"max_prob={max_prob:.3f}, mean_prob={mean_prob:.4f}")
-    
-    return top_k_indices, top_k_values
-
-
-def create_prototype_heatmaps(assignments, top_k_indices):
-    """Create spatial heatmaps for top-K prototypes"""
-    B, N, K = assignments.shape
-    n_prototypes = len(top_k_indices)
-    
-    heatmaps = []
-    
-    for proto_idx in top_k_indices:
-        # Extract assignments for this prototype
-        proto_assignments = assignments[:, :, proto_idx]  # [B, N]
+    for patch_idx in range(B):
+        patch_i = patch_idx // 16
+        patch_j = patch_idx % 16
         
-        # Reshape to spatial grid (16x16 patches, 14x14 tokens per patch)
-        heatmap_full = np.zeros((224, 224))
+        patch_assignments = assignments[patch_idx].cpu()  # [196, K]
+        patch_reshaped = patch_assignments.reshape(14, 14, K)
         
-        for patch_idx in range(B):
-            patch_i = patch_idx // 16
-            patch_j = patch_idx % 16
-            
-            # Get this patch's assignments
-            patch_assignments = proto_assignments[patch_idx].cpu().numpy()  # [196]
-            
-            # Reshape to 14x14
-            patch_heatmap = patch_assignments.reshape(14, 14)
-            
-            # Place in full heatmap
-            heatmap_full[patch_i*14:(patch_i+1)*14, patch_j*14:(patch_j+1)*14] = patch_heatmap
-        
-        heatmaps.append(heatmap_full)
+        # Place in full spatial grid
+        for ti in range(14):
+            for tj in range(14):
+                spatial_i = patch_i * 14 + ti
+                spatial_j = patch_j * 14 + tj
+                idx = spatial_i * W + spatial_j
+                assignments_flat[idx] = patch_reshaped[ti, tj]
     
-    return heatmaps
+    assignments_np = assignments_flat.numpy()
+    
+    # Apply dimensionality reduction
+    if method == 'pca':
+        reducer = PCA(n_components=n_components)
+        reduced = reducer.fit_transform(assignments_np)
+        variance = reducer.explained_variance_ratio_.sum()
+        print(f"  PCA: {n_components} components explain {variance:.1%} of assignment variance")
+    elif method == 'tsne':
+        reducer = TSNE(n_components=n_components, perplexity=30, random_state=42, n_iter=1000)
+        reduced = reducer.fit_transform(assignments_np)
+        variance = None
+        print(f"  t-SNE: Computed {n_components}D embedding")
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    
+    # Reshape to spatial grid
+    pca_map = reduced.reshape(H, W, n_components)
+    
+    # Normalize to [0, 1] for visualization
+    for c in range(n_components):
+        channel = pca_map[:, :, c]
+        channel_min = channel.min()
+        channel_max = channel.max()
+        pca_map[:, :, c] = (channel - channel_min) / (channel_max - channel_min + 1e-8)
+    
+    return pca_map, reducer, variance
 
 
-def plot_prototype_heatmaps(original_image, heatmaps, top_k_indices, top_k_values, output_path):
+def plot_prototype_pca_detailed(original_image, assignments, output_path):
     """
-    Plot original image + top-K prototype heatmaps with single shared colorbar.
-    Publication-ready layout.
+    Create detailed PCA visualization.
+    
+    Layout: Original | PCA-RGB | PC1 | PC2 | PC3
     """
-    k = len(heatmaps)
+    fig = plt.figure(figsize=(20, 4.5), facecolor='white')
     
-    # Create figure
-    fig_width = 3.2 * (k + 1)
-    fig = plt.figure(figsize=(fig_width, 4.5), facecolor='white')
+    gs = gridspec.GridSpec(1, 5, figure=fig,
+                          hspace=0.02, wspace=0.15,
+                          left=0.04, right=0.96, top=0.85, bottom=0.12)
     
-    # Create gridspec
-    gs = gridspec.GridSpec(2, k+1, figure=fig, 
-                          height_ratios=[0.05, 1],
-                          hspace=0.02, wspace=0.25,
-                          left=0.04, right=0.96, top=0.90, bottom=0.12)
+    # Get PCA map
+    pca_map, reducer, variance = create_prototype_pca_map(
+        assignments, method='pca', n_components=3
+    )
     
-    # Find global vmax for consistent colorbar
-    vmax = max(hm.max() for hm in heatmaps)
+    # Upsample to match original resolution (224 → 3584)
+    scale = 3584 / 224
+    pca_map_upsampled = zoom(pca_map, (scale, scale, 1), order=1)
     
-    # Plot original image (row 1, col 0)
-    ax_orig = fig.add_subplot(gs[1, 0])
-    ax_orig.imshow(original_image, extent=[0, 3584, 3584, 0], interpolation='nearest')
-    ax_orig.set_title('Original Image\n(3584×3584)', fontsize=11, fontweight='bold', pad=8)
+    # 1. Original image
+    ax_orig = fig.add_subplot(gs[0, 0])
+    ax_orig.imshow(original_image, extent=[0, 3584, 3584, 0])
+    ax_orig.set_title('Original\nImage', fontsize=12, fontweight='bold', pad=10)
     ax_orig.set_xlabel('Pixels', fontsize=9)
     ax_orig.set_ylabel('Pixels', fontsize=9)
     ax_orig.set_xticks([0, 1792, 3584])
     ax_orig.set_yticks([0, 1792, 3584])
-    ax_orig.tick_params(axis='both', labelsize=8)
+    ax_orig.tick_params(labelsize=8)
     
     for spine in ax_orig.spines.values():
         spine.set_edgecolor('#333333')
         spine.set_linewidth(1.5)
     
-    # Plot heatmaps (row 1, cols 1 to k)
-    for i, (heatmap, proto_idx, proto_value) in enumerate(zip(heatmaps, top_k_indices, top_k_values)):
-        ax = fig.add_subplot(gs[1, i+1])
+    # 2. PCA-RGB composite
+    ax_rgb = fig.add_subplot(gs[0, 1])
+    ax_rgb.imshow(pca_map_upsampled, extent=[0, 3584, 3584, 0])
+    ax_rgb.set_title(f'PCA-RGB\n({variance:.1%} variance)', 
+                    fontsize=12, fontweight='bold', pad=10)
+    ax_rgb.set_xlabel('Pixels', fontsize=9)
+    ax_rgb.set_xticks([0, 1792, 3584])
+    ax_rgb.set_yticks([])
+    ax_rgb.tick_params(labelsize=8)
+    
+    for spine in ax_rgb.spines.values():
+        spine.set_edgecolor('#333333')
+        spine.set_linewidth(1.5)
+    
+    # 3-5. Individual components
+    component_names = ['PC1', 'PC2', 'PC3']
+    component_vars = reducer.explained_variance_ratio_
+    
+    for c in range(3):
+        ax_comp = fig.add_subplot(gs[0, c+2])
+        im = ax_comp.imshow(pca_map_upsampled[:, :, c], 
+                           cmap='viridis', extent=[0, 3584, 3584, 0])
+        ax_comp.set_title(f'{component_names[c]}\n({component_vars[c]:.1%} var.)', 
+                        fontsize=12, fontweight='bold', pad=10)
+        ax_comp.set_xlabel('Pixels', fontsize=9)
+        ax_comp.set_xticks([0, 1792, 3584])
+        ax_comp.set_yticks([])
+        ax_comp.tick_params(labelsize=8)
         
-        # Plot heatmap with viridis colormap
-        im = ax.imshow(heatmap, cmap='viridis', extent=[0, 3584, 3584, 0], 
-                      interpolation='bilinear', vmin=0, vmax=vmax)
-        
-        # Title with prototype info
-        ax.set_title(f'Prototype #{proto_idx.item()}\n(Score: {proto_value.item():.0f})', 
-                    fontsize=11, fontweight='bold', pad=8)
-        ax.set_xlabel('Pixels', fontsize=9)
-        ax.set_xticks([0, 1792, 3584])
-        ax.set_yticks([0, 1792, 3584])
-        ax.tick_params(axis='both', labelsize=8)
-        
-        # Only show ylabel on first heatmap
-        if i == 0:
-            ax.set_ylabel('Pixels', fontsize=9)
-        else:
-            ax.set_yticklabels([])
-        
-        for spine in ax.spines.values():
+        for spine in ax_comp.spines.values():
             spine.set_edgecolor('#333333')
             spine.set_linewidth(1.5)
+        
+        # Add colorbar
+        cbar = plt.colorbar(im, ax=ax_comp, fraction=0.046, pad=0.04)
+        cbar.set_label('Intensity', fontsize=8)
+        cbar.ax.tick_params(labelsize=7)
     
-    # Add single colorbar spanning all heatmaps (row 0, cols 1 to k)
-    cbar_ax = fig.add_subplot(gs[0, 1:])
-    cbar = plt.colorbar(im, cax=cbar_ax, orientation='horizontal')
-    cbar.set_label('Assignment Probability', fontsize=10, labelpad=5)
-    cbar.ax.tick_params(labelsize=8)
-    cbar_ax.xaxis.set_ticks_position('top')
-    cbar_ax.xaxis.set_label_position('top')
+    plt.suptitle('Prototype Assignment PCA Visualization', 
+                fontsize=14, fontweight='bold')
     
-    # Save
+    plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+    print(f"  ✓ Saved: {output_path}")
+
+
+def plot_method_comparison(original_image, assignments, output_path):
+    """
+    Compare PCA vs t-SNE for prototype assignment visualization.
+    
+    Layout: Original | PCA-RGB | t-SNE-RGB
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), facecolor='white')
+    
+    # 1. Original
+    axes[0].imshow(original_image)
+    axes[0].set_title('Original Image', fontsize=13, fontweight='bold', pad=10)
+    axes[0].axis('off')
+    
+    # 2. PCA
+    try:
+        pca_map, _, variance_pca = create_prototype_pca_map(
+            assignments, method='pca', n_components=3
+        )
+        scale = 3584 / 224
+        pca_map_up = zoom(pca_map, (scale, scale, 1), order=1)
+        
+        axes[1].imshow(pca_map_up)
+        axes[1].set_title(f'PCA Visualization\n({variance_pca:.1%} variance)', 
+                         fontsize=13, fontweight='bold', pad=10)
+        axes[1].axis('off')
+    except Exception as e:
+        axes[1].text(0.5, 0.5, f'PCA Failed:\n{str(e)}',
+                    ha='center', va='center', transform=axes[1].transAxes,
+                    fontsize=10)
+        axes[1].axis('off')
+    
+    # 3. t-SNE
+    try:
+        tsne_map, _, _ = create_prototype_pca_map(
+            assignments, method='tsne', n_components=3
+        )
+        scale = 3584 / 224
+        tsne_map_up = zoom(tsne_map, (scale, scale, 1), order=1)
+        
+        axes[2].imshow(tsne_map_up)
+        axes[2].set_title('t-SNE Visualization', 
+                         fontsize=13, fontweight='bold', pad=10)
+        axes[2].axis('off')
+    except Exception as e:
+        axes[2].text(0.5, 0.5, f't-SNE Failed:\n{str(e)}',
+                    ha='center', va='center', transform=axes[2].transAxes,
+                    fontsize=10)
+        axes[2].axis('off')
+    
+    plt.suptitle('Prototype Assignment: Method Comparison',
+                fontsize=15, fontweight='bold')
+    plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"  ✓ Saved: {output_path}")
 
 
 def process_region(slide, region_info, region_index, backbone, proto_layer, 
-                   device, cancer_dir, cancer_type, k=5):
-    """Process a single region and create visualization"""
+                   device, cancer_dir, cancer_type):
+    """Process a single region and create visualizations"""
     print(f"\n{'='*60}")
     print(f"PROCESSING {cancer_type} - REGION {region_index}")
     print(f"{'='*60}")
@@ -483,24 +548,25 @@ def process_region(slide, region_info, region_index, backbone, proto_layer,
     print("Computing prototype assignments...")
     assignments = compute_prototype_assignments(patch_tokens, proto_layer)
     
-    # Find top-K prototypes
-    top_k_indices, top_k_values = find_top_k_prototypes(assignments, k=k)
+    # Create detailed PCA visualization
+    print("Creating detailed PCA visualization...")
+    output_path_detailed = os.path.join(cancer_dir, 
+                                       f'{cancer_type}_region_{region_index}_pca.png')
+    plot_prototype_pca_detailed(original_image, assignments, output_path_detailed)
     
-    # Create heatmaps
-    print("Creating spatial heatmaps...")
-    heatmaps = create_prototype_heatmaps(assignments, top_k_indices)
-    
-    # Plot
-    output_path = os.path.join(cancer_dir, f'{cancer_type}_region_{region_index}.png')
-    plot_prototype_heatmaps(original_image, heatmaps, top_k_indices, top_k_values, output_path)
+    # Create method comparison
+    print("Creating method comparison...")
+    output_path_comp = os.path.join(cancer_dir, 
+                                   f'{cancer_type}_region_{region_index}_comparison.png')
+    plot_method_comparison(original_image, assignments, output_path_comp)
     
     # Clean up
-    del patch_tokens, assignments, heatmaps
+    del patch_tokens, assignments
     torch.cuda.empty_cache()
 
 
 def process_wsi(wsi_path, cancer_type, backbone, proto_layer, device, 
-                main_output_dir, n_regions=3, k=5):
+                main_output_dir, n_regions=3):
     """Process a WSI with multiple regions"""
     print(f"\n{'#'*60}")
     print(f"# {cancer_type}")
@@ -524,15 +590,19 @@ def process_wsi(wsi_path, cancer_type, backbone, proto_layer, device,
         for i, region in enumerate(regions):
             try:
                 process_region(slide, region, i, backbone, proto_layer, 
-                             device, cancer_dir, cancer_type, k=k)
+                             device, cancer_dir, cancer_type)
             except Exception as e:
                 print(f"Error processing region {i}: {str(e)}")
+                import traceback
+                traceback.print_exc()
                 continue
         
         return True
         
     except Exception as e:
         print(f"Error processing {cancer_type}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return False
         
     finally:
@@ -542,15 +612,15 @@ def process_wsi(wsi_path, cancer_type, backbone, proto_layer, device,
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate prototype heatmap visualizations')
+    parser = argparse.ArgumentParser(
+        description='Generate prototype assignment PCA visualizations'
+    )
     parser.add_argument('--checkpoint', type=str, default=None,
                        help='Path to checkpoint (default: ../logs/checkpoint.pth)')
     parser.add_argument('--output_dir', type=str, default=None,
-                       help='Output directory (default: ../visualizations/prototype_heatmaps)')
+                       help='Output directory (default: ../visualizations/prototype_pca)')
     parser.add_argument('--n_regions', type=int, default=3,
                        help='Number of regions per WSI (default: 3)')
-    parser.add_argument('--k', type=int, default=5,
-                       help='Number of top prototypes to visualize (default: 5)')
     args = parser.parse_args()
     
     # Default to relative paths from script location
@@ -560,8 +630,8 @@ def main():
         args.checkpoint = os.path.join(script_dir, '..', 'logs', 'checkpoint.pth')
     
     if args.output_dir is None:
-        # Create main folder for heatmap outputs
-        args.output_dir = os.path.join(script_dir, '..', 'visualizations', 'prototype_heatmaps')
+        # Create main folder for prototype PCA outputs
+        args.output_dir = os.path.join(script_dir, '..', 'visualizations', 'prototype_pca')
     
     # WSI paths
     wsi_paths = {
@@ -572,6 +642,7 @@ def main():
         'KIRC': "/data1/vanderbc/foundation_model_training_images/TCGA/TCGA-KIRC_svs/svs/fffdfd4f-a579-4377-aa11-0aab83b644be/TCGA-DV-5576-01Z-00-DX1.ddd18b71-fc48-40f7-bc87-fb50d9ff468c.svs",
     }
     
+    # Create main output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -590,7 +661,7 @@ def main():
             continue
         
         process_wsi(wsi_path, cancer_type, backbone, proto_layer, device, 
-                   args.output_dir, n_regions=args.n_regions, k=args.k)
+                   args.output_dir, n_regions=args.n_regions)
     
     print("\n" + "="*60)
     print("ALL PROCESSING COMPLETE!")
@@ -598,16 +669,16 @@ def main():
     print(f"\nOutput structure:")
     print(f"  {args.output_dir}/")
     print(f"    LUAD/")
-    print(f"      LUAD_region_0.png")
-    print(f"      LUAD_region_1.png")
-    print(f"      LUAD_region_2.png")
+    print(f"      LUAD_region_0_pca.png           (Original | PCA-RGB | PC1 | PC2 | PC3)")
+    print(f"      LUAD_region_0_comparison.png    (Original | PCA | t-SNE)")
+    print(f"      LUAD_region_1_pca.png")
+    print(f"      LUAD_region_1_comparison.png")
     print(f"    SARC/")
-    print(f"      SARC_region_0.png")
+    print(f"      SARC_region_0_pca.png")
+    print(f"      SARC_region_0_comparison.png")
     print(f"      ...")
-    print(f"\nEach PNG shows: Original | Proto #X | Proto #Y | Proto #Z | ... (top-{args.k})")
-    print(f"✓ Operating on backbone patch tokens (768-dim)")
-    print(f"✓ Works with LinearPrototypeBank (nn.Linear)")
-    print(f"✓ Single shared colorbar at top")
+    print(f"\n✓ PCA on K-dimensional prototype assignments")
+    print(f"✓ RGB = first 3 principal components of assignment distributions")
 
 
 if __name__ == "__main__":
