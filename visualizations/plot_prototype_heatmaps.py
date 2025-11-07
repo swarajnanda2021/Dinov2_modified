@@ -20,12 +20,13 @@ from scipy import ndimage
 import warnings
 warnings.filterwarnings('ignore')
 
-# Add paths
-sys.path.insert(0, '/data1/vanderbc/nandas1/TCGA_TMEDinov3_ViT-B_B3')
-sys.path.append('/data1/vanderbc/nandas1/PostProc')
+# Import models from relative path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.join(script_dir, '..')
+sys.path.insert(0, project_root)
 
-from vision_transformer import DINOHead, MaskModel_SpectralNorm
-from soft_moe.vision_transformer import VisionTransformer
+from models.vision_transformer.modern_vit import VisionTransformer
+from models.vision_transformer.auxiliary_models import DINOHead, MaskModel_SpectralNorm
 
 # Publication-ready matplotlib settings
 plt.rcParams.update({
