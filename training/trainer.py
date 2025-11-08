@@ -1095,16 +1095,14 @@ def _train_with_pipeline_parallelism(args):
             dist.barrier()
         
         # ========== PIPELINE BACKWARD PASS ==========
-        # Only last stage has losses computed
-        if losses is not None:
-            schedule.backward_pass(
-                losses=losses,
-                optimizer_student=optimizer_student,
-                optimizer_prototypes=optimizer_prototypes,
-                args=args,
-                current_iteration=current_iteration,
-                scaler=fp16_scaler,
-            )
+        schedule.backward_pass(
+            losses=losses,
+            optimizer_student=optimizer_student,
+            optimizer_prototypes=optimizer_prototypes,
+            args=args,
+            current_iteration=current_iteration,
+            scaler=fp16_scaler,
+        )
         
         # ========== EMA UPDATE ==========
         schedule.update_teacher_ema(

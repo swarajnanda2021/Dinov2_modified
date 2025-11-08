@@ -600,7 +600,7 @@ class PipelineSchedule:
     
     def backward_pass(
         self,
-        losses: Dict[str, torch.Tensor],
+        losses: Optional[Dict[str, torch.Tensor]],  # Can be None for non-last stages
         optimizer_student,
         optimizer_prototypes,
         args,
@@ -610,14 +610,15 @@ class PipelineSchedule:
         """
         Complete backward pass for ALL pipeline stages.
         
-        Strategy:
-        1. Last stage: Compute loss and backward
-        2. All stages: Sync gradients within data parallel group
-        3. All stages: Step optimizers
+        Args:
+            losses: Loss dict (only present on last stage, None for others)
         """
         
         # ========== STEP 1: Compute and backward (ONLY last stage) ==========
         if self.is_last_stage:
+            if losses is None:
+                raise RuntimeError("Last stage should have losses, but got None")
+                
             # Compute total losses
             student_loss = (
                 losses['dino_class_loss'] +
@@ -642,12 +643,22 @@ class PipelineSchedule:
             if self.debug:
                 print(f"[Rank {self.local_rank}] Completed backward on last stage", 
                     force=True, flush=True)
+        else:
+            # Non-last stages: still participate but skip backward
+            if self.debug:
+                print(f"[Rank {self.local_rank}] Waiting at backward barrier", 
+                    force=True, flush=True)
         
         # ========== BARRIER: Wait for backward to complete ==========
+        if self.debug:
+            print(f"[Rank {self.local_rank}] Entering backward barrier", 
+                force=True, flush=True)
         dist.barrier(group=self.pipeline_group)
+        if self.debug:
+            print(f"[Rank {self.local_rank}] Passed backward barrier", 
+                force=True, flush=True)
         
         # ========== STEP 2: Sync gradients (ALL stages) ==========
-        # All stages need to sync their portion of the model
         if scaler is not None:
             scaler.unscale_(optimizer_student)
             if self.is_last_stage:
@@ -686,21 +697,13 @@ class PipelineSchedule:
         
         # ========== STEP 5: Optimizer steps (ALL stages) ==========
         if scaler is None:
-            # Step student optimizer (all stages)
             optimizer_student.step()
-            
-            # Step prototype optimizer (only last stage)
             if self.is_last_stage:
                 optimizer_prototypes.step()
         else:
-            # Step student optimizer (all stages)
             scaler.step(optimizer_student)
-            
-            # Step prototype optimizer (only last stage)
             if self.is_last_stage:
                 scaler.step(optimizer_prototypes)
-            
-            # Update scaler (only need to do once, let rank 0 do it)
             if self.local_rank == 0:
                 scaler.update()
         
@@ -711,11 +714,10 @@ class PipelineSchedule:
         # ========== BARRIER: Ensure all ranks finish together ==========
         dist.barrier(group=self.pipeline_group)
         
-        # ========== Check for NaNs (only on last stage) ==========
-        if self.is_last_stage:
+        # ========== Check for NaNs (only on last stage with valid losses) ==========
+        if self.is_last_stage and losses is not None:
             if self.check_for_nans(losses=losses, check_gradients=True):
-                raise RuntimeError(f"[Rank {self.local_rank}] Training stopped due to NaN!")
-    
+                raise RuntimeError(f"[Rank {self.local_rank}] Training stopped due to NaN!")    
 
     def _sync_gradients_data_parallel(self, model):
         """
