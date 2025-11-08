@@ -75,7 +75,7 @@ class PipelineSchedule:
         self.embed_dim = embed_dim
         self.num_patches = num_patches
         self.num_registers = num_registers
-        self.debug = debug
+        self.debug = True #debug
         
         # Pipeline stage identification
         self.is_first_stage = (local_rank == 0)
@@ -90,8 +90,8 @@ class PipelineSchedule:
         self.num_tokens_per_image = 1 + num_registers + num_patches
         
         if self.debug:
-            print(f"[Rank {local_rank}] Pipeline schedule initialized")
-            print(f"  Tokens/image: {self.num_tokens_per_image}, embed_dim: {embed_dim}")
+            print(f"[Rank {local_rank}] Pipeline schedule initialized", flush=True)
+            print(f"  Tokens/image: {self.num_tokens_per_image}, embed_dim: {embed_dim}", flush=True)
     
     def forward_pass(
         self,
@@ -116,7 +116,7 @@ class PipelineSchedule:
         
         # ========== STAGE 1: Process all forwards on this GPU ==========
         if self.is_first_stage:
-            print(f"[Rank {self.local_rank}] Stage 1: Processing all 4 forwards...")
+            print(f"[Rank {self.local_rank}] Stage 1: Processing all 4 forwards...", flush=True)
             
             # Forward 1: Teacher global
             teacher_output, teacher_attn_bias = self.teacher_stage(
@@ -138,7 +138,7 @@ class PipelineSchedule:
                 original_images, token_masks=token_masks
             )
             
-            print(f"[Rank {self.local_rank}] Stage 1: Computed, sending to next stage...")
+            print(f"[Rank {self.local_rank}] Stage 1: Computed, sending to next stage...", flush=True)
             
             # Send all 4 outputs to next GPU
             self._send_all_outputs_to_next_stage(
@@ -148,11 +148,11 @@ class PipelineSchedule:
                 student_ibot_output, student_ibot_attn_bias,
             )
             
-            print(f"[Rank {self.local_rank}] Stage 1: All sends complete")
+            print(f"[Rank {self.local_rank}] Stage 1: All sends complete", flush=True)
             return None
         
         elif self.is_middle_stage:
-            print(f"[Rank {self.local_rank}] Middle stage: Receiving all 4 inputs...")
+            print(f"[Rank {self.local_rank}] Middle stage: Receiving all 4 inputs...", flush=True)
             
             # Receive all 4 inputs from previous GPU
             (teacher_input, teacher_attn_bias,
@@ -160,7 +160,7 @@ class PipelineSchedule:
             teacher_ibot_input, teacher_ibot_attn_bias,
             student_ibot_input, student_ibot_attn_bias) = self._recv_all_inputs_from_prev_stage()
             
-            print(f"[Rank {self.local_rank}] Middle stage: Processing all 4 forwards...")
+            print(f"[Rank {self.local_rank}] Middle stage: Processing all 4 forwards...", flush=True)
             
             # Process all 4 forwards
             teacher_output, teacher_attn_bias = self.teacher_stage(
@@ -179,7 +179,7 @@ class PipelineSchedule:
                 student_ibot_input, token_masks=None, attn_bias=student_ibot_attn_bias
             )
             
-            print(f"[Rank {self.local_rank}] Middle stage: Sending to next stage...")
+            print(f"[Rank {self.local_rank}] Middle stage: Sending to next stage...", flush=True)
             
             # Send all 4 outputs to next GPU
             self._send_all_outputs_to_next_stage(
@@ -189,11 +189,11 @@ class PipelineSchedule:
                 student_ibot_output, student_ibot_attn_bias,
             )
             
-            print(f"[Rank {self.local_rank}] Middle stage: All sends complete")
+            print(f"[Rank {self.local_rank}] Middle stage: All sends complete", flush=True)
             return None
         
         else:  # Last stage
-            print(f"[Rank {self.local_rank}] Last stage: Receiving all 4 inputs...")
+            print(f"[Rank {self.local_rank}] Last stage: Receiving all 4 inputs...", flush=True)
             
             # Receive all 4 inputs
             (teacher_input, teacher_attn_bias,
@@ -201,7 +201,7 @@ class PipelineSchedule:
             teacher_ibot_input, teacher_ibot_attn_bias,
             student_ibot_input, student_ibot_attn_bias) = self._recv_all_inputs_from_prev_stage()
             
-            print(f"[Rank {self.local_rank}] Last stage: Processing all 4 forwards...")
+            print(f"[Rank {self.local_rank}] Last stage: Processing all 4 forwards...", flush=True)
             
             # Process all 4 forwards
             teacher_features = self.teacher_stage(
@@ -220,7 +220,7 @@ class PipelineSchedule:
                 student_ibot_input, token_masks=None, attn_bias=student_ibot_attn_bias
             )
             
-            print(f"[Rank {self.local_rank}] Last stage: Computing losses...")
+            print(f"[Rank {self.local_rank}] Last stage: Computing losses...", flush=True)
             
             # Now compute losses with all features available
             losses = self._compute_losses(
@@ -262,7 +262,7 @@ class PipelineSchedule:
             self._send_to_next_stage(output, attn_bias)
             
             if self.debug:
-                print(f"[Rank {self.local_rank}] First stage output: {output.shape}")
+                print(f"[Rank {self.local_rank}] First stage output: {output.shape}", flush=True)
             
             return None
         
@@ -273,7 +273,7 @@ class PipelineSchedule:
             self._send_to_next_stage(output, attn_bias)
             
             if self.debug:
-                print(f"[Rank {self.local_rank}] Middle stage output: {output.shape}")
+                print(f"[Rank {self.local_rank}] Middle stage output: {output.shape}", flush=True)
             
             return None
         
@@ -283,7 +283,7 @@ class PipelineSchedule:
             output = model_stage(input_tensor, token_masks=None, attn_bias=attn_bias)
             
             if self.debug:
-                print(f"[Rank {self.local_rank}] Last stage output: {type(output)}")
+                print(f"[Rank {self.local_rank}] Last stage output: {type(output)}", flush=True)
             
             return output
     
@@ -535,7 +535,7 @@ class PipelineSchedule:
             losses['teacher_proto_loss'] = teacher_proto_loss
         
         if self.debug:
-            print(f"[Rank {self.local_rank}] Computed losses: {list(losses.keys())}")
+            print(f"[Rank {self.local_rank}] Computed losses: {list(losses.keys())}", flush=True)
         
         return losses
     
@@ -642,7 +642,7 @@ class PipelineSchedule:
             scaler.update()
         
         if self.debug:
-            print(f"[Rank {self.local_rank}] Backward pass completed")
+            print(f"[Rank {self.local_rank}] Backward pass completed", flush=True)
         
         if self.check_for_nans(losses=losses, check_gradients=True):
             raise RuntimeError(f"[Rank {self.local_rank}] Training stopped due to NaN!")
@@ -664,7 +664,7 @@ class PipelineSchedule:
                 dist.all_reduce(param.grad, group=self.data_group, op=dist.ReduceOp.AVG)
         
         if self.debug:
-            print(f"[Rank {self.local_rank}] Synced gradients across data parallel group")
+            print(f"[Rank {self.local_rank}] Synced gradients across data parallel group", flush=True)
     
     def check_for_nans(self, losses=None, check_gradients=False):
         """
@@ -732,4 +732,4 @@ class PipelineSchedule:
                     param_t.data.mul_(momentum).add_((1 - momentum) * param_s.detach().data)
         
         if self.debug:
-            print(f"[Rank {self.local_rank}] Teacher EMA update completed")
+            print(f"[Rank {self.local_rank}] Teacher EMA update completed", flush=True)
