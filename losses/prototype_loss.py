@@ -34,7 +34,8 @@ class PatchPrototypeLoss(nn.Module):
         num_prototypes=8192, 
         embed_dim=768,
         teacher_temp=0.07, 
-        student_temp=0.1
+        student_temp=0.1,
+        group=None,
     ):
         super().__init__()
         
@@ -42,6 +43,7 @@ class PatchPrototypeLoss(nn.Module):
         self.embed_dim = embed_dim
         self.teacher_temp = teacher_temp
         self.student_temp = student_temp
+        self.group = group 
         
         # KoLeo for preventing collapse
         self.koleo_loss = KoLeoLoss()
@@ -123,7 +125,7 @@ class PatchPrototypeLoss(nn.Module):
             assignments = torch.argmax(Q_tilde_masked, dim=-1)
             usage = torch.bincount(assignments, minlength=self.k).float()
             if dist.is_initialized():
-                dist.all_reduce(usage)
+                dist.all_reduce(usage, group=self.group)
             usage_std = usage.std() / (usage.mean() + 1e-6)
             
             self.last_prediction_loss = prediction_loss.item()
@@ -153,13 +155,13 @@ class PatchPrototypeLoss(nn.Module):
             Q: [M, K] doubly stochastic assignment matrix
         """
         teacher_output = teacher_output.float()
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        world_size = dist.get_world_size(self.group) if dist.is_initialized() else 1  # CHANGE THIS
         
         # Numerical stability: shift by global max before exp
         M = teacher_output / teacher_temp
         M_max = M.max()
         if dist.is_initialized():
-            dist.all_reduce(M_max, op=dist.ReduceOp.MAX)
+            dist.all_reduce(M_max, op=dist.ReduceOp.MAX, group=self.group)
         M = M - M_max
         
         # Transpose for easier iteration: [K, M]
@@ -168,7 +170,7 @@ class PatchPrototypeLoss(nn.Module):
         # Global normalization (optional, helps convergence)
         sum_Q = torch.sum(Q)
         if dist.is_initialized():
-            dist.all_reduce(sum_Q)
+            dist.all_reduce(sum_Q, group=self.group)
         Q /= (sum_Q + eps)
         
         # Doubly stochastic iterations
@@ -176,7 +178,7 @@ class PatchPrototypeLoss(nn.Module):
             # Normalize over samples (each prototype distribution sums to 1)
             sum_over_samples = torch.sum(Q, dim=1, keepdim=True)
             if dist.is_initialized():
-                dist.all_reduce(sum_over_samples)
+                dist.all_reduce(sum_over_samples, group=self.group)
             Q /= (sum_over_samples + eps)
             
             # Normalize over prototypes (each sample distribution sums to 1)

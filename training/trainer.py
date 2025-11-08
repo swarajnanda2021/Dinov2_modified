@@ -216,11 +216,13 @@ def _train_with_standard_ddp(args):
         warmup_teacher_temp_iters=args.teacher_temp_warmup_iters,
         n_iterations=5,
         student_temp=0.1,
+        group=data_group,
     ).cuda()
 
     ibot_patch_loss = iBOTPatchLoss(
         student_temp=0.1,
         n_iterations=3,
+        group=data_group,
     ).cuda()
     
     dino_koleo_loss = KoLeoLoss().cuda()
@@ -230,6 +232,7 @@ def _train_with_standard_ddp(args):
         embed_dim=args.embeddingdim,  
         teacher_temp=args.clustering_teacher_temp,
         student_temp=args.clustering_student_temp,
+        group=data_group,
     ).cuda()   
 
     print(f"Initialized PatchPrototypeLoss with {args.num_prototypes} prototypes")
@@ -1078,6 +1081,9 @@ def _train_with_pipeline_parallelism(args):
             token_masks=random_token_masks,
             iteration=current_iteration,
         )
+
+        if dist.is_initialized():
+            dist.barrier()
         
         # ========== PIPELINE BACKWARD PASS ==========
         # Only last stage has losses computed

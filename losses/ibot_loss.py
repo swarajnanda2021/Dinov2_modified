@@ -16,10 +16,11 @@ class iBOTPatchLoss(nn.Module):
         student_temp: Student temperature
         n_iterations: Sinkhorn-Knopp iterations
     """
-    def __init__(self, student_temp=0.1, n_iterations=3):
+    def __init__(self, student_temp=0.1, n_iterations=3, group=None,):
         super().__init__()
         self.student_temp = student_temp
         self.n_iterations = n_iterations
+        self.group = group 
 
     def forward_masked(
         self,
@@ -97,20 +98,20 @@ class iBOTPatchLoss(nn.Module):
         
         Q = torch.exp(teacher_output / teacher_temp).t()
         
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        world_size = dist.get_world_size(self.group) if dist.is_initialized() else 1  # CHANGE THIS
         
         B = Q.shape[1] * world_size
         K = Q.shape[0]
         
         sum_Q = torch.sum(Q)
         if dist.is_initialized():
-            dist.all_reduce(sum_Q)
+            dist.all_reduce(sum_Q, group=self.group)
         Q /= sum_Q
         
         for it in range(n_iterations):
             sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
             if dist.is_initialized():
-                dist.all_reduce(sum_of_rows)
+                dist.all_reduce(sum_of_rows, group=self.group)
             Q /= sum_of_rows
             Q /= K
             
