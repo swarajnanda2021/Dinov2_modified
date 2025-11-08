@@ -330,6 +330,40 @@ class PipelineSchedule:
             else:
                 num_batch_sizes_tensor = torch.tensor([0], dtype=torch.int64, device=device)
                 dist.send(num_batch_sizes_tensor, dst=self.next_rank, group=self.pipeline_group)
+
+    def _send_all_outputs_to_next_stage(
+        self,
+        teacher_output, teacher_attn_bias,
+        student_output, student_attn_bias,
+        teacher_ibot_output, teacher_ibot_attn_bias,
+        student_ibot_output, student_ibot_attn_bias,
+    ):
+        """Send all 4 forward pass outputs to next stage in sequence."""
+        if self.next_rank is None:
+            return
+        
+        # Send them one by one (they're sent in order, so recv knows what to expect)
+        self._send_to_next_stage(teacher_output, teacher_attn_bias)
+        self._send_to_next_stage(student_output, student_attn_bias)
+        self._send_to_next_stage(teacher_ibot_output, teacher_ibot_attn_bias)
+        self._send_to_next_stage(student_ibot_output, student_ibot_attn_bias)
+
+
+    def _recv_all_inputs_from_prev_stage(self):
+        """Receive all 4 forward pass inputs from previous stage in sequence."""
+        if self.prev_rank is None:
+            raise RuntimeError("Cannot receive - no previous stage")
+        
+        # Receive in same order they were sent
+        teacher_input, teacher_attn_bias = self._recv_from_prev_stage()
+        student_input, student_attn_bias = self._recv_from_prev_stage()
+        teacher_ibot_input, teacher_ibot_attn_bias = self._recv_from_prev_stage()
+        student_ibot_input, student_ibot_attn_bias = self._recv_from_prev_stage()
+        
+        return (teacher_input, teacher_attn_bias,
+                student_input, student_attn_bias,
+                teacher_ibot_input, teacher_ibot_attn_bias,
+                student_ibot_input, student_ibot_attn_bias)
     
     def _recv_from_prev_stage(self) -> Tuple[torch.Tensor, Optional[Any]]:
         """Receive tensor and attention bias from previous stage."""
