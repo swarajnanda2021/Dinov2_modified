@@ -625,18 +625,6 @@ def _train_with_standard_ddp(args):
         if current_iteration % 100 == 0:
             torch.cuda.empty_cache()
         
-        # ========== Visualize masks ==========
-        if current_iteration % args.visualization_freq == 0 and current_iteration < 5000 and args.num_masks > 0:
-            sample_image = original_images[:1]
-            with torch.no_grad():
-                vis_masks = mask_model_frozen(sample_image)['masks']
-                save_iteration_masks_efficient(
-                    sample_image,
-                    vis_masks,
-                    current_iteration,
-                    os.path.join(args.output_dir, 'mask_visualizations'),
-                    num_samples=1
-                )
         
         # ========== Logging ==========
         metric_logger.update(student_loss=student_loss.item())
@@ -1116,6 +1104,9 @@ def _train_with_pipeline_parallelism(args):
 
         
         # ========== Logging (broadcast losses from last stage) ==========
+        # Calculate last stage rank
+        last_stage_rank = (args.rank // args.gpus_per_node) * args.gpus_per_node + (args.gpus_per_node - 1)
+
         if utils.is_main_process() and current_iteration % 10 == 0:
             print(f"[Rank {args.rank}] Starting loss broadcast", flush=True)
 
@@ -1176,23 +1167,9 @@ def _train_with_pipeline_parallelism(args):
             print(f"It {current_iteration}/{args.total_iterations/1000:.0f}k (ETA {eta_string}), "
                 f"Progress: {progress*100:.1f}%, max mem: {memory:.1f} GB : {metric_logger}")
         
-        # ========== Visualization (same as standard) ==========
-        if current_iteration % args.visualization_freq == 0 and current_iteration < 5000 and args.num_masks > 0:
-            if local_rank == 0:  # Only visualize on first GPU of each node
-                sample_image = original_images[:1]
-                with torch.no_grad():
-                    vis_masks = mask_model_frozen(sample_image)['masks']
-                    save_iteration_masks_efficient(
-                        sample_image,
-                        vis_masks,
-                        current_iteration,
-                        os.path.join(args.output_dir, 'mask_visualizations'),
-                        num_samples=1
-                    )
-        
         # ========== Save checkpoints ==========
         if current_iteration % args.save_checkpoint_freq == 0:
-            save_pipeline_checkpoint(
+            utils.save_pipeline_checkpoint(
                 student_stage=student_stage,
                 teacher_stage=teacher_stage,
                 prototype_bank=prototype_bank,
