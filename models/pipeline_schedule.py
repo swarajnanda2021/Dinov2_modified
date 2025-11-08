@@ -658,18 +658,11 @@ class PipelineSchedule:
             print(f"[Rank {self.local_rank}] Passed backward barrier", 
                 force=True, flush=True)
         
-        # ========== STEP 2: Unscale gradients (conditionally) ==========
-        # CRITICAL FIX: Only unscale on last stage if using scaler
-        # Other stages haven't called scaler.scale(), so they can't unscale
-        if scaler is not None:
-            if self.is_last_stage:
-                # Last stage: unscale both optimizers
-                scaler.unscale_(optimizer_student)
-                scaler.unscale_(optimizer_prototypes)
-            else:
-                # Non-last stages: unscale only student optimizer
-                # (it has gradients from the pipeline backward)
-                scaler.unscale_(optimizer_student)
+        # ========== STEP 2: Unscale gradients (ONLY on last stage) ==========
+        # Only last stage interacts with scaler since only it called scale()
+        if scaler is not None and self.is_last_stage:
+            scaler.unscale_(optimizer_student)
+            scaler.unscale_(optimizer_prototypes)
         
         # ========== STEP 3: Sync gradients across data parallel group ==========
         self._sync_gradients_data_parallel(self.student_stage)
@@ -713,9 +706,8 @@ class PipelineSchedule:
             scaler.step(optimizer_student)
             if self.is_last_stage:
                 scaler.step(optimizer_prototypes)
-                # Only rank 0 of last stage updates the scaler
-                if self.local_rank == (self.num_stages - 1):
-                    scaler.update()
+                # Update scaler once per iteration (only on last stage)
+                scaler.update()
         
         if self.debug:
             print(f"[Rank {self.local_rank}] Completed optimizer steps", 
