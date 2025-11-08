@@ -600,7 +600,7 @@ class PipelineSchedule:
     
     def backward_pass(
         self,
-        losses: Optional[Dict[str, torch.Tensor]],  # Can be None for non-last stages
+        losses: Optional[Dict[str, torch.Tensor]],
         optimizer_student,
         optimizer_prototypes,
         args,
@@ -658,13 +658,20 @@ class PipelineSchedule:
             print(f"[Rank {self.local_rank}] Passed backward barrier", 
                 force=True, flush=True)
         
-        # ========== STEP 2: Sync gradients (ALL stages) ==========
+        # ========== STEP 2: Unscale gradients (conditionally) ==========
+        # CRITICAL FIX: Only unscale on last stage if using scaler
+        # Other stages haven't called scaler.scale(), so they can't unscale
         if scaler is not None:
-            scaler.unscale_(optimizer_student)
             if self.is_last_stage:
+                # Last stage: unscale both optimizers
+                scaler.unscale_(optimizer_student)
                 scaler.unscale_(optimizer_prototypes)
+            else:
+                # Non-last stages: unscale only student optimizer
+                # (it has gradients from the pipeline backward)
+                scaler.unscale_(optimizer_student)
         
-        # Sync student gradients across data parallel group
+        # ========== STEP 3: Sync gradients across data parallel group ==========
         self._sync_gradients_data_parallel(self.student_stage)
         
         # Sync prototype gradients (only last stage has prototypes)
@@ -674,12 +681,12 @@ class PipelineSchedule:
         if self.debug:
             print(f"[Rank {self.local_rank}] Synced gradients", force=True, flush=True)
         
-        # ========== STEP 3: Gradient clipping (ALL stages) ==========
+        # ========== STEP 4: Gradient clipping (ALL stages) ==========
         if args.clip_grad:
             import utils
             utils.clip_gradients(self.student_stage, args.clip_grad)
         
-        # ========== STEP 4: Cancel last layer gradients (ONLY last stage) ==========
+        # ========== STEP 5: Cancel last layer gradients (ONLY last stage) ==========
         if self.is_last_stage:
             import utils
             student_module = utils.get_module(self.student_stage)
@@ -695,17 +702,20 @@ class PipelineSchedule:
                     args.freeze_last_layer_iters
                 )
         
-        # ========== STEP 5: Optimizer steps (ALL stages) ==========
+        # ========== STEP 6: Optimizer steps (conditionally with scaler) ==========
         if scaler is None:
+            # No mixed precision
             optimizer_student.step()
             if self.is_last_stage:
                 optimizer_prototypes.step()
         else:
+            # Mixed precision
             scaler.step(optimizer_student)
             if self.is_last_stage:
                 scaler.step(optimizer_prototypes)
-            if self.local_rank == 0:
-                scaler.update()
+                # Only rank 0 of last stage updates the scaler
+                if self.local_rank == (self.num_stages - 1):
+                    scaler.update()
         
         if self.debug:
             print(f"[Rank {self.local_rank}] Completed optimizer steps", 
@@ -717,7 +727,7 @@ class PipelineSchedule:
         # ========== Check for NaNs (only on last stage with valid losses) ==========
         if self.is_last_stage and losses is not None:
             if self.check_for_nans(losses=losses, check_gradients=True):
-                raise RuntimeError(f"[Rank {self.local_rank}] Training stopped due to NaN!")    
+                raise RuntimeError(f"[Rank {self.local_rank}] Training stopped due to NaN!")  
 
     def _sync_gradients_data_parallel(self, model):
         """
