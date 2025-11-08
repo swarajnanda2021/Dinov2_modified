@@ -702,12 +702,14 @@ class PipelineSchedule:
             if self.is_last_stage:
                 optimizer_prototypes.step()
         else:
-            # Mixed precision
-            scaler.step(optimizer_student)
+            # Mixed precision - ONLY last stage uses scaler
             if self.is_last_stage:
+                scaler.step(optimizer_student)
                 scaler.step(optimizer_prototypes)
-                # Update scaler once per iteration (only on last stage)
                 scaler.update()
+            else:
+                # Non-last stages: regular step (gradients already synced)
+                optimizer_student.step()
         
         if self.debug:
             print(f"[Rank {self.local_rank}] Completed optimizer steps", 
