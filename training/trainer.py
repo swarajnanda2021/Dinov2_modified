@@ -47,6 +47,21 @@ def train_dinov2(args):
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
+
+    # ============ Dispatch to appropriate training mode ============
+    if args.use_pipeline_parallel:
+        return _train_with_pipeline_parallelism(args)
+    else:
+        return _train_with_standard_ddp(args)
+
+def _train_with_standard_ddp(args):
+    """
+    Standard DDP training (original implementation).
+    This is the existing code moved into its own function.
+    
+    Args:
+        args: Training arguments namespace
+    """
     
     # Augmentation configuration
     augmentation_free_mode = (args.global_views == 0)
@@ -698,3 +713,411 @@ def train_dinov2(args):
             f.write(json.dumps(final_log_stats) + "\n")
 
     print("Training Complete!")
+
+
+
+
+def _train_with_pipeline_parallelism(args):
+    """
+    Pipeline parallel training with hybrid data parallelism.
+    Uses PipelineSchedule for multi-stage model execution.
+    
+    Args:
+        args: Training arguments namespace
+    """
+    # ============ Setup ============
+    print("\n" + "="*70)
+    print("INITIALIZING PIPELINE PARALLEL TRAINING")
+    print("="*70)
+    
+    # Basic distributed setup is already done in train_dinov2()
+    cudnn.benchmark = True
+    
+    # ============ Create Hybrid Process Groups ============
+    print("\nCreating hybrid pipeline + data parallel process groups...")
+    pipeline_group, data_group, local_rank, node_id = utils.create_hybrid_process_groups(args)
+    
+    print(f"Rank {args.rank}: node={node_id}, local_rank={local_rank}")
+    print(f"  Pipeline group size: {dist.get_world_size(pipeline_group)}")
+    print(f"  Data parallel group size: {dist.get_world_size(data_group)}")
+    
+    # ============ Augmentation configuration (same as standard) ============
+    augmentation_free_mode = (args.global_views == 0)
+    
+    print("\n========== Augmentation Configuration ==========")
+    print(f"Global views (teacher/student): {args.global_views}")
+    print(f"Standard local crops: {args.n_standard_local_crops}")
+    print(f"Local crop size: {args.local_crop_size}x{args.local_crop_size}")
+    print(f"Number of masks: {args.num_masks}")
+    print(f"Crops per mask: {args.crops_per_mask}")
+    total_student_views = calculate_total_student_views(args)
+    print(f"Total student views: {total_student_views}")
+    print("================================================\n")
+    
+    # ============ Load pre-trained mask model (same as standard) ============
+    mask_model_frozen = None
+    if args.num_masks > 0:
+        mask_model_frozen = load_pretrained_mask_model(args.mask_checkpoint, args.num_masks)
+        mask_model_frozen = mask_model_frozen.cuda()
+        mask_model_frozen.eval()
+        
+        for param in mask_model_frozen.parameters():
+            param.requires_grad = False
+        
+        print(f"Loaded and froze mask model with {args.num_masks} masks")
+    else:
+        print("No mask model loaded (num_masks=0)")
+
+    # ============ Create dataset (same as standard) ============
+    trainset = DINOv2PathologyDataset(
+        base_dir=args.base_dir,
+        index_file="dataset_index.pkl",
+        n_standard_local_crops=args.n_standard_local_crops,
+        global_views=args.global_views,
+        local_crop_size=args.local_crop_size,
+        worker_id=0,
+        num_workers=args.num_workers,
+        rank=args.gpu,
+        world_size=dist.get_world_size(),
+        seed=args.seed,
+        global_size=224,
+    )
+
+    train_loader = torch.utils.data.DataLoader(
+        trainset,
+        batch_size=args.batch_size_per_gpu,
+        num_workers=args.num_workers,
+        drop_last=True,
+        pin_memory=True,
+        persistent_workers=True,
+        worker_init_fn=worker_init_fn
+    )
+
+    # ============ Create Pipeline Models ============
+    print("\nCreating pipeline-parallelized models...")
+    from models.pipeline_model import create_pipeline_student_teacher
+    
+    student_stage, teacher_stage, prototype_bank = create_pipeline_student_teacher(
+        args=args,
+        local_rank=local_rank,
+        device=torch.device('cuda', args.gpu),
+        pipeline_group=pipeline_group,
+    )
+    
+    print(f"✓ Created pipeline stages for GPU {local_rank}")
+    
+    # ============ Initialize losses ============
+    dino_class_loss = DINOLoss(
+        ncrops=total_student_views,
+        warmup_teacher_temp=args.warmup_teacher_temp,
+        teacher_temp=args.teacher_temp,
+        warmup_teacher_temp_iters=args.teacher_temp_warmup_iters,
+        n_iterations=5,
+        student_temp=0.1,
+    ).cuda()
+
+    ibot_patch_loss = iBOTPatchLoss(
+        student_temp=0.1,
+        n_iterations=3,
+    ).cuda()
+    
+    dino_koleo_loss = KoLeoLoss().cuda()
+    
+    patch_prototype_loss = PatchPrototypeLoss(
+        num_prototypes=args.num_prototypes,
+        embed_dim=args.embeddingdim,  
+        teacher_temp=args.clustering_teacher_temp,
+        student_temp=args.clustering_student_temp,
+    ).cuda()
+    
+    loss_modules = {
+        'dino_class_loss': dino_class_loss,
+        'ibot_patch_loss': ibot_patch_loss,
+        'dino_koleo_loss': dino_koleo_loss,
+        'patch_prototype_loss': patch_prototype_loss,
+    }
+    
+    print(f"✓ Initialized loss modules")
+
+    # ============ Create PipelineSchedule ============
+    print("\nCreating PipelineSchedule...")
+    from models.pipeline_schedule import PipelineSchedule
+    
+    schedule = PipelineSchedule(
+        student_stage=student_stage,
+        teacher_stage=teacher_stage,
+        prototype_bank=prototype_bank,
+        loss_modules=loss_modules,
+        local_rank=local_rank,
+        pipeline_group=pipeline_group,
+        data_group=data_group,
+        batch_size_per_node=args.batch_size_per_gpu,
+        gpus_per_node=args.gpus_per_node,
+        embed_dim=args.embeddingdim,
+        num_patches=196,
+        num_registers=4,
+        debug=False,
+    )
+    
+    print(f"✓ Created PipelineSchedule")
+    
+    # ============ Create fp16_scaler ============
+    fp16_scaler = torch.cuda.amp.GradScaler() if args.use_fp16 else None
+
+    # ============ Create optimizers ============
+    # Student optimizer (only for this stage's parameters)
+    optimizer_student = torch.optim.AdamW([
+        *utils.get_params_groups(student_stage.module.backbone),
+    ])
+    
+    # Add heads if on last stage
+    if student_stage.module.has_heads:
+        optimizer_student.add_param_group({
+            'params': list(student_stage.module.classhead.parameters()) + 
+                     list(student_stage.module.patchhead.parameters())
+        })
+    
+    # Prototypes optimizer (only on last stage)
+    if prototype_bank is not None:
+        optimizer_prototypes = torch.optim.AdamW(
+            prototype_bank.module.parameters(),
+            betas=(0.9, 0.95),
+            weight_decay=0.0,
+        )
+    else:
+        # Create dummy optimizer for non-last stages
+        optimizer_prototypes = torch.optim.AdamW([torch.zeros(1).cuda()], lr=0)
+
+    print(f"✓ Created optimizers")
+
+    # ============ Create schedulers (same as standard) ============
+    student_lr_schedule = utils.cosine_scheduler(
+        base_value=args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256.,
+        final_value=args.min_lr,
+        total_iters=args.total_iterations,
+        warmup_iters=args.warmup_iterations,
+        start_warmup_value=0
+    )
+
+    proto_lr_schedule = utils.cosine_scheduler(
+        base_value=args.lr * 0.5,
+        final_value=0,
+        total_iters=args.total_iterations,
+        warmup_iters=args.warmup_iterations,
+        start_warmup_value=0
+    )
+    
+    wd_schedule = utils.cosine_scheduler(
+        base_value=args.weight_decay,
+        final_value=args.weight_decay_end,
+        total_iters=args.total_iterations,
+        warmup_iters=args.warmup_iterations,
+        start_warmup_value=args.weight_decay
+    )
+
+    momentum_schedule = utils.cosine_scheduler(
+        base_value=args.momentum_teacher,
+        final_value=1.0,
+        total_iters=args.total_iterations,
+        warmup_iters=0,
+        start_warmup_value=args.momentum_teacher
+    )
+
+    # ============ Load checkpoint (TODO: needs pipeline-specific handling) ============
+    to_restore = {"iteration": 0, "dataset_position": 0}
+    
+    # For now, skip checkpoint loading in pipeline mode
+    # TODO: Implement pipeline checkpoint compatibility
+    print("\n⚠️  WARNING: Checkpoint loading not yet implemented for pipeline mode")
+    print("    Starting from scratch")
+    
+    current_iteration = 0
+    dataset_position = 0
+
+    # ============ Setup metric logger ============
+    metric_logger = utils.IterationMetricLogger(total_iterations=args.total_iterations)
+    metric_logger.start_time = time.time()
+    
+    data_iterator = iter(train_loader)
+    
+    if utils.is_main_process():
+        print(f"\nStarting pipeline parallel training at iteration {current_iteration}")
+    
+    # ============ Training loop ============
+    print("\n" + "="*70)
+    print("STARTING TRAINING LOOP")
+    print("="*70 + "\n")
+    
+    while current_iteration < args.total_iterations:
+        # ========== Get batch (same as standard) ==========
+        try:
+            batch_data = next(data_iterator)
+        except StopIteration:
+            data_iterator = iter(train_loader)
+            batch_data = next(data_iterator)
+        
+        # ========== Organize Crops (same as standard) ==========
+        idx = 0
+        
+        # Teacher views (global crops only)
+        teacher_global_crops = []
+        for i in range(args.global_views):
+            teacher_global_crops.append(batch_data[idx].cuda(non_blocking=True))
+            idx += 1
+        
+        # Student views - all crops
+        student_all_crops = []
+        
+        # Add global crops
+        for crop in teacher_global_crops:
+            student_all_crops.append(crop)
+        
+        # Add standard local crops
+        for i in range(args.n_standard_local_crops):
+            crop = batch_data[idx].cuda(non_blocking=True)
+            student_all_crops.append(crop)
+            idx += 1
+        
+        # Get original images
+        original_images = batch_data[-1].cuda(non_blocking=True)
+        
+        # Generate masks if configured
+        if args.num_masks > 0 and mask_model_frozen is not None:
+            with torch.no_grad():
+                mask_output = mask_model_frozen(original_images)
+                masks = mask_output['masks']
+            
+            masked_images = apply_masks_to_images(original_images, masks)
+            student_all_crops.extend(masked_images)
+            
+            if args.crops_per_mask > 0:
+                for masked_img in masked_images:
+                    crops = extract_local_crops_from_masked(
+                        masked_img, 
+                        n_crops=args.crops_per_mask,
+                        crop_size=args.local_crop_size
+                    )
+                    student_all_crops.extend(crops)
+        
+        # Generate random token masks for iBOT
+        batch_size = original_images.shape[0]
+        n_patches_h = n_patches_w = 224 // args.patch_size
+        
+        random_token_masks = generate_random_token_masks(
+            batch_size, n_patches_h, n_patches_w,
+            args.token_mask_ratio, original_images.device
+        )
+        
+        # ========== Update learning rates ==========
+        for i, param_group in enumerate(optimizer_student.param_groups):
+            param_group["lr"] = student_lr_schedule[current_iteration]
+            if i == 0:
+                param_group["weight_decay"] = wd_schedule[current_iteration]
+
+        for param_group in optimizer_prototypes.param_groups:
+            param_group["lr"] = proto_lr_schedule[current_iteration]
+        
+        optimizer_student.zero_grad()
+        optimizer_prototypes.zero_grad()
+        
+        # ========== PIPELINE FORWARD PASS ==========
+        losses = schedule.forward_pass(
+            crops=student_all_crops,
+            original_images=original_images,
+            token_masks=random_token_masks,
+            iteration=current_iteration,
+        )
+        
+        # ========== PIPELINE BACKWARD PASS ==========
+        # Only last stage has losses computed
+        if losses is not None:
+            schedule.backward_pass(
+                losses=losses,
+                optimizer_student=optimizer_student,
+                optimizer_prototypes=optimizer_prototypes,
+                args=args,
+                current_iteration=current_iteration,
+                scaler=fp16_scaler,
+            )
+        
+        # ========== EMA UPDATE ==========
+        schedule.update_teacher_ema(
+            momentum=momentum_schedule[current_iteration]
+        )
+        
+        # ========== Logging (broadcast losses from last stage) ==========
+        if losses is None:
+            # Not last stage - receive losses for logging
+            losses = {}
+            for key in ['dino_class_loss', 'koleo_loss', 'ibot_loss', 
+                       'clustering_loss', 'koleo_proto_loss', 'teacher_proto_loss']:
+                loss_tensor = torch.zeros(1, device='cuda')
+                # Broadcast from last GPU in pipeline group
+                last_stage_rank = args.rank - (args.rank % args.gpus_per_node) + (args.gpus_per_node - 1)
+                dist.broadcast(loss_tensor, src=last_stage_rank, group=pipeline_group)
+                losses[key] = loss_tensor.item()
+        else:
+            # Last stage - broadcast losses to other stages
+            for key in ['dino_class_loss', 'koleo_loss', 'ibot_loss', 
+                       'clustering_loss', 'koleo_proto_loss', 'teacher_proto_loss']:
+                loss_tensor = torch.tensor([losses[key].item()], device='cuda')
+                dist.broadcast(loss_tensor, src=args.rank, group=pipeline_group)
+        
+        # Update metrics
+        metric_logger.update(
+            student_loss=(
+                losses['dino_class_loss'] +
+                args.koleo_loss_weight * losses['koleo_loss'] +
+                args.ibot_loss_weight * losses['ibot_loss'] +
+                args.clustering_weight * losses['clustering_loss']
+            )
+        )
+        metric_logger.update(dino_class_loss=losses['dino_class_loss'])
+        metric_logger.update(koleo_loss=losses['koleo_loss'])
+        metric_logger.update(ibot_loss=losses['ibot_loss'])
+        metric_logger.update(clustering_loss=losses['clustering_loss'])
+        metric_logger.update(proto_koleo_loss=losses['koleo_proto_loss'])
+        metric_logger.update(teacher_proto_arrangement_loss=losses['teacher_proto_loss'])
+        metric_logger.update(lr=optimizer_student.param_groups[0]["lr"])
+        metric_logger.update(wd=optimizer_student.param_groups[0]["weight_decay"])
+        
+        # Print progress
+        if utils.is_main_process() and current_iteration % 10 == 0:
+            elapsed = time.time() - metric_logger.start_time
+            progress = current_iteration / args.total_iterations
+            eta_seconds = elapsed / max(progress, 1e-8) * (1 - progress)
+            eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+            
+            memory = torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)
+            
+            metric_logger.synchronize_between_processes()
+            print(f"It {current_iteration}/{args.total_iterations/1000:.0f}k (ETA {eta_string}), "
+                f"Progress: {progress*100:.1f}%, max mem: {memory:.1f} GB : {metric_logger}")
+        
+        # ========== Visualization (same as standard) ==========
+        if current_iteration % args.visualization_freq == 0 and current_iteration < 5000 and args.num_masks > 0:
+            if local_rank == 0:  # Only visualize on first GPU of each node
+                sample_image = original_images[:1]
+                with torch.no_grad():
+                    vis_masks = mask_model_frozen(sample_image)['masks']
+                    save_iteration_masks_efficient(
+                        sample_image,
+                        vis_masks,
+                        current_iteration,
+                        os.path.join(args.output_dir, 'mask_visualizations'),
+                        num_samples=1
+                    )
+        
+        # ========== Save checkpoints (TODO: implement) ==========
+        if current_iteration % args.save_checkpoint_freq == 0:
+            # TODO: Implement pipeline checkpoint saving
+            if utils.is_main_process():
+                print(f"\n⚠️  Checkpoint saving at iteration {current_iteration} not yet implemented for pipeline mode")
+        
+        current_iteration += 1
+
+    # ========== Final log ==========
+    if utils.is_main_process():
+        print("\n" + "="*70)
+        print("PIPELINE PARALLEL TRAINING COMPLETE!")
+        print("="*70)
