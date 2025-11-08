@@ -969,6 +969,10 @@ def _train_with_pipeline_parallelism(args):
     print("="*70 + "\n")
     
     while current_iteration < args.total_iterations:
+
+        if current_iteration % 1 == 0:  # Print every iteration initially
+            print(f"[Rank {args.rank}] Starting iteration {current_iteration}", flush=True)
+        
         # ========== Get batch (same as standard) ==========
         try:
             batch_data = next(data_iterator)
@@ -1147,6 +1151,9 @@ def _train_with_pipeline_parallelism(args):
                 pipeline_group=pipeline_group,
                 data_group=data_group,
             )
+        
+        if dist.is_initialized():
+            dist.barrier() # Ensure all ranks finish iteration together
         
         current_iteration += 1
 
