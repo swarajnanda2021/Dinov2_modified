@@ -60,7 +60,7 @@ def create_pipeline_student_teacher(
     2. Initialize weights
     3. Partition: delete layers we don't need
     4. Create projection heads on last stage only
-    5. Create identical teacher via deepcopy
+    5. Create identical teacher by recreating architecture + copying state_dict
     
     Returns:
         student_stage, teacher_stage, prototype_bank (or None if not last GPU)
@@ -98,8 +98,8 @@ def create_pipeline_student_teacher(
     print(f"GPU {local_rank}: Layers [{layer_start}:{layer_end}], "
           f"patch_embed={has_patch_embed}, heads={has_heads}")
     
-    # ========== Create FULL model ==========
-    full_student_encoder = ModernViT(
+    # ========== Create STUDENT encoder ==========
+    student_encoder = ModernViT(
         img_size=224,
         patch_size=args.patch_size,
         embed_dim=embed_dim,
@@ -114,56 +114,123 @@ def create_pipeline_student_teacher(
         num_register_tokens=4,
     ).to(device)
     
-    full_student_encoder._init_weights()
+    student_encoder._init_weights()
     
     if args.grad_checkpointing:
-        full_student_encoder.set_grad_checkpointing(True)
+        student_encoder.set_grad_checkpointing(True)
         print(f"✓ Enabled gradient checkpointing in pipeline student encoder")
     
-    # ========== Partition backbone ==========
-    # Keep only layers we need
+    # ========== Partition student backbone ==========
     if not has_patch_embed:
-        full_student_encoder.patch_embed = None
-        full_student_encoder.cls_token = None
-        full_student_encoder.register_tokens = None
-        full_student_encoder.pos_embed = None
-        print("  Removed patch_embed")
+        student_encoder.patch_embed = None
+        student_encoder.cls_token = None
+        student_encoder.register_tokens = None
+        student_encoder.pos_embed = None
+        print("  Removed patch_embed from student")
     
     # Keep only our transformer blocks
     blocks_to_keep = []
     for layer_idx in range(layer_start, layer_end):
-        blocks_to_keep.append(full_student_encoder.blocks[layer_idx])
+        blocks_to_keep.append(student_encoder.blocks[layer_idx])
     
-    full_student_encoder.blocks = nn.Sequential(*blocks_to_keep)
-    print(f"  Kept {len(blocks_to_keep)} blocks [{layer_start}:{layer_end}]")
+    student_encoder.blocks = nn.Sequential(*blocks_to_keep)
+    print(f"  Kept {len(blocks_to_keep)} blocks [{layer_start}:{layer_end}] in student")
     
-    # Keep or remove final norm
     if not has_heads:
-        full_student_encoder.norm = None
-        print("  Removed final norm")
+        student_encoder.norm = None
+        print("  Removed final norm from student")
     
-    # ========== Create projection heads (ONLY on last stage) ==========
+    # ========== Create student projection heads (ONLY on last stage) ==========
     if has_heads:
-        print("  Creating projection heads on last stage")
+        print("  Creating student projection heads on last stage")
         
-        full_student_classhead = DINOHead(
+        student_classhead = DINOHead(
             embed_dim,
             args.out_dim,
             use_bn=args.use_bn_in_head,
             norm_last_layer=args.norm_last_layer,
         ).to(device)
         
-        full_student_patchhead = DINOHead(
+        student_patchhead = DINOHead(
             embed_dim,
             args.out_dim,
             use_bn=args.use_bn_in_head,
             norm_last_layer=args.norm_last_layer,
         ).to(device)
         
-        print(f"  Created DINO heads: {embed_dim} -> {args.out_dim}")
+        print(f"  Created student DINO heads: {embed_dim} -> {args.out_dim}")
     else:
-        full_student_classhead = None
-        full_student_patchhead = None
+        student_classhead = None
+        student_patchhead = None
+    
+    # ========== Create TEACHER encoder (separate instance) ==========
+    teacher_encoder = ModernViT(
+        img_size=224,
+        patch_size=args.patch_size,
+        embed_dim=embed_dim,
+        depth=depth,
+        num_heads=num_heads,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        qk_norm=False,
+        dual_norm=False,
+        drop_path_rate=0.4,
+        pre_norm=False,
+        num_register_tokens=4,
+    ).to(device)
+    
+    teacher_encoder._init_weights()
+    
+    if args.grad_checkpointing:
+        teacher_encoder.set_grad_checkpointing(True)
+    
+    # ========== Partition teacher backbone (same as student) ==========
+    if not has_patch_embed:
+        teacher_encoder.patch_embed = None
+        teacher_encoder.cls_token = None
+        teacher_encoder.register_tokens = None
+        teacher_encoder.pos_embed = None
+    
+    teacher_blocks_to_keep = []
+    for layer_idx in range(layer_start, layer_end):
+        teacher_blocks_to_keep.append(teacher_encoder.blocks[layer_idx])
+    
+    teacher_encoder.blocks = nn.Sequential(*teacher_blocks_to_keep)
+    
+    if not has_heads:
+        teacher_encoder.norm = None
+    
+    # ========== Create teacher projection heads (ONLY on last stage) ==========
+    if has_heads:
+        print("  Creating teacher projection heads on last stage")
+        
+        teacher_classhead = DINOHead(
+            embed_dim,
+            args.out_dim,
+            use_bn=args.use_bn_in_head,
+            norm_last_layer=False,  # Teacher doesn't need norm_last_layer
+        ).to(device)
+        
+        teacher_patchhead = DINOHead(
+            embed_dim,
+            args.out_dim,
+            use_bn=args.use_bn_in_head,
+            norm_last_layer=False,
+        ).to(device)
+        
+        print(f"  Created teacher DINO heads: {embed_dim} -> {args.out_dim}")
+    else:
+        teacher_classhead = None
+        teacher_patchhead = None
+    
+    # ========== Copy weights from student to teacher ==========
+    teacher_encoder.load_state_dict(student_encoder.state_dict())
+    
+    if has_heads:
+        teacher_classhead.load_state_dict(student_classhead.state_dict())
+        teacher_patchhead.load_state_dict(student_patchhead.state_dict())
+    
+    print(f"  Copied student weights to teacher")
     
     # ========== Create prototype bank (ONLY on last stage) ==========
     if has_heads:
@@ -178,9 +245,9 @@ def create_pipeline_student_teacher(
     
     # ========== Wrap in PipelineStageWrapper ==========
     student_stage = PipelineStageWrapper(
-        backbone=full_student_encoder,
-        classhead=full_student_classhead,
-        patchhead=full_student_patchhead,
+        backbone=student_encoder,
+        classhead=student_classhead,
+        patchhead=student_patchhead,
         local_rank=local_rank,
         num_stages=args.gpus_per_node,
         has_patch_embed=has_patch_embed,
@@ -188,14 +255,25 @@ def create_pipeline_student_teacher(
         grad_checkpointing=args.grad_checkpointing,
     )
 
-    # ========== Create teacher (identical copy) ==========
-    teacher_stage = deepcopy(student_stage)
+    teacher_stage = PipelineStageWrapper(
+        backbone=teacher_encoder,
+        classhead=teacher_classhead,
+        patchhead=teacher_patchhead,
+        local_rank=local_rank,
+        num_stages=args.gpus_per_node,
+        has_patch_embed=has_patch_embed,
+        has_heads=has_heads,
+        grad_checkpointing=args.grad_checkpointing,
+    )
+    
+    # Teacher doesn't need gradients
     teacher_stage.requires_grad_(False)
     
     print(f"✓ Created student and teacher pipeline stages for GPU {local_rank}")
     
     return student_stage, teacher_stage, full_prototype_bank
 
+    
 
 class PipelineStageWrapper(nn.Module):
     """
