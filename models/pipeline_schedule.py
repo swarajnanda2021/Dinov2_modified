@@ -609,7 +609,7 @@ class PipelineSchedule:
         """
         Complete backward pass matching trainer.py lines 645-690.
         
-        ADDED: Data parallel gradient synchronization across nodes.
+        Do both backwards BEFORE stepping either optimizer.
         """
         if not self.is_last_stage:
             # Non-last stages: backward happens automatically via autograd
@@ -628,27 +628,20 @@ class PipelineSchedule:
             losses['koleo_proto_loss']
         )
         
-        # ========== Backward for Prototypes ==========
+        # ========== Do BOTH backwards BEFORE any optimizer steps ==========
         if scaler is None:
+            # Backward pass for prototypes
             prototype_loss_total.backward()
             
-            # *** NEW: Sync gradients across data parallel group ***
-            self._sync_gradients_data_parallel(self.prototype_bank)
-            
-            optimizer_prototypes.step()
-        else:
-            scaler.scale(prototype_loss_total).backward()
-            
-            # *** NEW: Sync gradients across data parallel group ***
-            self._sync_gradients_data_parallel(self.prototype_bank)
-            
-            scaler.step(optimizer_prototypes)
-        
-        # ========== Backward for Student ==========
-        if scaler is None:
+            # Backward pass for student (BEFORE stepping prototype optimizer!)
             student_loss.backward()
             
-            # *** NEW: Sync gradients across data parallel group ***
+            # NOW we can safely step optimizers
+            # Step 1: Sync and update prototypes
+            self._sync_gradients_data_parallel(self.prototype_bank)
+            optimizer_prototypes.step()
+            
+            # Step 2: Sync and update student
             self._sync_gradients_data_parallel(self.student_stage)
             
             # Gradient clipping
@@ -671,11 +664,18 @@ class PipelineSchedule:
                 )
             
             optimizer_student.step()
-        else:
-            # Mixed precision path
-            scaler.scale(student_loss).backward()
             
-            # *** NEW: Sync gradients across data parallel group ***
+        else:
+            # Mixed precision: same logic
+            scaler.scale(prototype_loss_total).backward()
+            scaler.scale(student_loss).backward()  # Do BOTH backwards first
+            
+            # Unscale and sync prototypes
+            scaler.unscale_(optimizer_prototypes)
+            self._sync_gradients_data_parallel(self.prototype_bank)
+            scaler.step(optimizer_prototypes)
+            
+            # Unscale and sync student
             scaler.unscale_(optimizer_student)
             self._sync_gradients_data_parallel(self.student_stage)
             
