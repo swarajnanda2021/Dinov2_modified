@@ -6,9 +6,9 @@ Supports 4-GPU and 8-GPU nodes with hybrid data+pipeline parallelism.
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 from typing import Optional, List
 from copy import deepcopy
+
 
 def get_model_config(model_size: str):
     """
@@ -213,7 +213,6 @@ def create_pipeline_student_teacher(
     return student_stage, teacher_stage, full_prototype_bank
 
 
-
 class PipelineStageWrapper(nn.Module):
     """
     Wrapper for a single pipeline stage with gradient checkpointing support.
@@ -396,22 +395,3 @@ class PipelineStageWrapper(nn.Module):
             # Return processed features (preserving attn_bias for next stage)
             return x, attn_bias
 
-
-
-
-def create_pipeline_schedule(
-    student_stage,
-    teacher_stage,
-    local_rank: int,
-    num_microbatches: int,
-):
-    """
-    Create GPipe schedule for pipeline execution.
-    
-    We need to use torch.distributed.pipelining.ScheduleGPipe from torch.distributed.pipelining to create the schedule.
-    """
-    
-    
-
-    
-    return student_stage, teacher_stage
