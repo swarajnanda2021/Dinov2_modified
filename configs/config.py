@@ -128,8 +128,6 @@ def get_args_parser():
                         help='Number of GPUs per node (4 or 8)')
     parser.add_argument('--num_nodes', default=1, type=int,
                         help='Number of nodes for training')
-    parser.add_argument('--pipeline_chunks', default=4, type=int,
-                        help='Number of microbatches for pipeline parallelism')
     parser.add_argument('--model_size', default='base', type=str,
                         choices=['base', 'large', 'huge', 'giant', 'giant2b'],
                         help='Model size: base (ViT-B), large (ViT-L ~300M), '

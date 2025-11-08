@@ -1147,7 +1147,8 @@ def _train_with_pipeline_parallelism(args):
                 pipeline_group=pipeline_group,
                 data_group=data_group,
             )
-                current_iteration += 1
+        
+        current_iteration += 1
 
     # ========== Final log ==========
     if utils.is_main_process():
