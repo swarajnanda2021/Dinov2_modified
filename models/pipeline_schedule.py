@@ -102,12 +102,24 @@ class PipelineSchedule:
     ) -> Optional[Dict[str, torch.Tensor]]:
         """
         Execute forward pass through pipeline.
-        Simplified version that processes one forward at a time.
+        Only first stage has actual crop data; other stages receive activations.
         """
         
-        # Prepare inputs
-        teacher_global_crops = crops[:2]
-        student_all_crops = crops
+
+        # Only first stage has actual data
+        if not self.is_first_stage:
+            # Verify inputs are None for non-first stages
+            assert crops is None, "Non-first stage should not receive crops"
+            assert original_images is None, "Non-first stage should not receive images"
+            assert token_masks is None, "Non-first stage should not receive masks"
+        
+        # Prepare inputs (only matters for first stage)
+        if self.is_first_stage:
+            teacher_global_crops = crops[:2]
+            student_all_crops = crops
+        else:
+            teacher_global_crops = None
+            student_all_crops = None
         
         # All ranks participate in all communications
         if self.is_first_stage:

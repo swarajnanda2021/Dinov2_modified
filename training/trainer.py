@@ -768,30 +768,38 @@ def _train_with_pipeline_parallelism(args):
     else:
         print("No mask model loaded (num_masks=0)")
 
-    # ============ Create dataset (same as standard) ============
-    trainset = DINOv2PathologyDataset(
-        base_dir=args.base_dir,
-        index_file="dataset_index.pkl",
-        n_standard_local_crops=args.n_standard_local_crops,
-        global_views=args.global_views,
-        local_crop_size=args.local_crop_size,
-        worker_id=0,
-        num_workers=args.num_workers,
-        rank=args.gpu,
-        world_size=dist.get_world_size(),
-        seed=args.seed,
-        global_size=224,
-    )
+    # ============ Create dataset (ONLY on first stage) ============
+    if local_rank == 0:  # Only first stage loads data
+        trainset = DINOv2PathologyDataset(
+            base_dir=args.base_dir,
+            index_file="dataset_index.pkl",
+            n_standard_local_crops=args.n_standard_local_crops,
+            global_views=args.global_views,
+            local_crop_size=args.local_crop_size,
+            worker_id=0,
+            num_workers=args.num_workers,
+            rank=args.gpu,
+            world_size=dist.get_world_size(),
+            seed=args.seed,
+            global_size=224,
+        )
 
-    train_loader = torch.utils.data.DataLoader(
-        trainset,
-        batch_size=args.batch_size_per_gpu,
-        num_workers=args.num_workers,
-        drop_last=True,
-        pin_memory=True,
-        persistent_workers=True,
-        worker_init_fn=worker_init_fn
-    )
+        train_loader = torch.utils.data.DataLoader(
+            trainset,
+            batch_size=args.batch_size_per_gpu,
+            num_workers=args.num_workers,
+            drop_last=True,
+            pin_memory=True,
+            persistent_workers=True,
+            worker_init_fn=worker_init_fn
+        )
+        
+        data_iterator = iter(train_loader)
+        print(f"[Rank {args.rank}] Created dataloader on first stage")
+    else:
+        train_loader = None
+        data_iterator = None
+        print(f"[Rank {args.rank}] Skipped dataloader (not first stage)")
 
     # ============ Create Pipeline Models ============
     print("\nCreating pipeline-parallelized models...")
@@ -973,65 +981,75 @@ def _train_with_pipeline_parallelism(args):
         if current_iteration % 1 == 0:  # Print every iteration initially
             print(f"[Rank {args.rank}] Starting iteration {current_iteration}", flush=True)
         
-        # ========== Get batch (same as standard) ==========
-        try:
-            batch_data = next(data_iterator)
-            dataset_position += 1
-        except StopIteration:
-            data_iterator = iter(train_loader)
-            batch_data = next(data_iterator)
+        # ========== Get batch (ONLY on first stage) ==========
+        if local_rank == 0:
+            try:
+                batch_data = next(data_iterator)
+                dataset_position += 1
+            except StopIteration:
+                data_iterator = iter(train_loader)
+                batch_data = next(data_iterator)
+        else:
+            batch_data = None  # Other stages don't need raw data
         
-        # ========== Organize Crops (same as standard) ==========
-        idx = 0
-        
-        # Teacher views (global crops only)
-        teacher_global_crops = []
-        for i in range(args.global_views):
-            teacher_global_crops.append(batch_data[idx].cuda(non_blocking=True))
-            idx += 1
-        
-        # Student views - all crops
-        student_all_crops = []
-        
-        # Add global crops
-        for crop in teacher_global_crops:
-            student_all_crops.append(crop)
-        
-        # Add standard local crops
-        for i in range(args.n_standard_local_crops):
-            crop = batch_data[idx].cuda(non_blocking=True)
-            student_all_crops.append(crop)
-            idx += 1
-        
-        # Get original images
-        original_images = batch_data[-1].cuda(non_blocking=True)
-        
-        # Generate masks if configured
-        if args.num_masks > 0 and mask_model_frozen is not None:
-            with torch.no_grad():
-                mask_output = mask_model_frozen(original_images)
-                masks = mask_output['masks']
+        # ========== Organize Crops (ONLY on first stage) ==========
+        if local_rank == 0:
+            idx = 0
             
-            masked_images = apply_masks_to_images(original_images, masks)
-            student_all_crops.extend(masked_images)
+            # Teacher views (global crops only)
+            teacher_global_crops = []
+            for i in range(args.global_views):
+                teacher_global_crops.append(batch_data[idx].cuda(non_blocking=True))
+                idx += 1
             
-            if args.crops_per_mask > 0:
-                for masked_img in masked_images:
-                    crops = extract_local_crops_from_masked(
-                        masked_img, 
-                        n_crops=args.crops_per_mask,
-                        crop_size=args.local_crop_size
-                    )
-                    student_all_crops.extend(crops)
-        
-        # Generate random token masks for iBOT
-        batch_size = original_images.shape[0]
-        n_patches_h = n_patches_w = 224 // args.patch_size
-        
-        random_token_masks = generate_random_token_masks(
-            batch_size, n_patches_h, n_patches_w,
-            args.token_mask_ratio, original_images.device
-        )
+            # Student views - all crops
+            student_all_crops = []
+            
+            # Add global crops
+            for crop in teacher_global_crops:
+                student_all_crops.append(crop)
+            
+            # Add standard local crops
+            for i in range(args.n_standard_local_crops):
+                crop = batch_data[idx].cuda(non_blocking=True)
+                student_all_crops.append(crop)
+                idx += 1
+            
+            # Get original images
+            original_images = batch_data[-1].cuda(non_blocking=True)
+            
+            # Generate masks if configured
+            if args.num_masks > 0 and mask_model_frozen is not None:
+                with torch.no_grad():
+                    mask_output = mask_model_frozen(original_images)
+                    masks = mask_output['masks']
+                
+                masked_images = apply_masks_to_images(original_images, masks)
+                student_all_crops.extend(masked_images)
+                
+                if args.crops_per_mask > 0:
+                    for masked_img in masked_images:
+                        crops = extract_local_crops_from_masked(
+                            masked_img, 
+                            n_crops=args.crops_per_mask,
+                            crop_size=args.local_crop_size
+                        )
+                        student_all_crops.extend(crops)
+            
+            # Generate random token masks for iBOT
+            batch_size = original_images.shape[0]
+            n_patches_h = n_patches_w = 224 // args.patch_size
+            
+            random_token_masks = generate_random_token_masks(
+                batch_size, n_patches_h, n_patches_w,
+                args.token_mask_ratio, original_images.device
+            )
+        else:
+            # Other stages: set dummy values (won't be used)
+            teacher_global_crops = None
+            student_all_crops = None
+            original_images = None
+            random_token_masks = None
         
         # ========== Update learning rates ==========
         for i, param_group in enumerate(optimizer_student.param_groups):
