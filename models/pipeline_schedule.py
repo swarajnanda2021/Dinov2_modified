@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from typing import Dict, List, Optional, Tuple, Any
+from utils import get_module
 
 try:
     from xformers.ops import fmha
@@ -627,6 +628,9 @@ class PipelineSchedule:
             losses['teacher_proto_loss'] +
             losses['koleo_proto_loss']
         )
+
+        # Get the underlying modules (handles both DDP and non-DDP)
+        student_module = get_module(self.student_stage)
         
         # ========== Do BOTH backwards BEFORE any optimizer steps ==========
         if scaler is None:
@@ -651,15 +655,15 @@ class PipelineSchedule:
             
             # Cancel last layer gradients
             import utils
-            if self.student_stage.module.has_heads:
+            if student_module.has_heads:
                 utils.cancel_gradients_last_layer(
-                    current_iteration, 
-                    self.student_stage.module.classhead, 
+                    current_iteration,
+                    student_module.classhead,
                     args.freeze_last_layer_iters
                 )
                 utils.cancel_gradients_last_layer(
                     current_iteration,
-                    self.student_stage.module.patchhead,
+                    student_module.patchhead,
                     args.freeze_last_layer_iters
                 )
             
@@ -684,15 +688,15 @@ class PipelineSchedule:
                 utils.clip_gradients(self.student_stage, args.clip_grad)
             
             import utils
-            if self.student_stage.module.has_heads:
+            if student_module.has_heads:
                 utils.cancel_gradients_last_layer(
                     current_iteration,
-                    self.student_stage.module.classhead,
+                    student_module.classhead,
                     args.freeze_last_layer_iters
                 )
                 utils.cancel_gradients_last_layer(
                     current_iteration,
-                    self.student_stage.module.patchhead,
+                    student_module.patchhead,
                     args.freeze_last_layer_iters
                 )
             
