@@ -744,13 +744,6 @@ class PipelineSchedule:
     def check_for_nans(self, losses=None, check_gradients=False):
         """
         Check for NaN in losses and gradients.
-        
-        Args:
-            losses: Optional dict of loss values
-            check_gradients: Whether to check gradients
-            
-        Returns:
-            has_nan: Boolean indicating if NaN was found
         """
         has_nan = False
         
@@ -768,12 +761,6 @@ class PipelineSchedule:
                     print(f"[Rank {self.local_rank}] NaN detected in gradient: {name}")
                     has_nan = True
                     break
-        
-        # Synchronize NaN detection across all ranks
-        if dist.is_initialized():
-            has_nan_tensor = torch.tensor([1.0 if has_nan else 0.0], device='cuda')
-            dist.all_reduce(has_nan_tensor, op=dist.ReduceOp.MAX)
-            has_nan = has_nan_tensor.item() > 0.5
         
         return has_nan
     
