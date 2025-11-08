@@ -43,7 +43,7 @@ def parse_args():
 
 def get_shared_folder() -> Path:
     """Get shared folder for logs and checkpoints."""
-    p = Path("/data1/vanderbc/nandas1/TCGA_TMEDinov3_ViT-B_B2_seqpacking/logs")
+    p = Path("/data1/vanderbc/nandas1/TCGA_TMEDinov3_ViT-B_pipelineparallel/logs")
     p.mkdir(exist_ok=True, parents=True)
     return p
 
