@@ -101,128 +101,98 @@ class PipelineSchedule:
         iteration: int = 0,
     ) -> Optional[Dict[str, torch.Tensor]]:
         """
-        Execute forward pass through pipeline using flush strategy.
-        
-        Strategy:
-        1. Each GPU processes ALL 4 forward passes
-        2. Send all results to next GPU
-        3. Barrier/sync between stages
-        4. Last GPU collects everything and computes losses
+        Execute forward pass through pipeline.
+        Simplified version that processes one forward at a time.
         """
         
-        # ========== Prepare inputs ==========
+        # Prepare inputs
         teacher_global_crops = crops[:2]
-        student_all_crops = crops  # All crops
+        student_all_crops = crops
         
-        # ========== STAGE 1: Process all forwards on this GPU ==========
+        # All ranks participate in all communications
         if self.is_first_stage:
-            print(f"[Rank {self.local_rank}] Stage 1: Processing all 4 forwards...", flush=True)
-            
-            # Forward 1: Teacher global
+            print(f"[Rank {self.local_rank}] Iter {iteration}: Starting forward passes...", flush=True)
+        
+        # ========== Forward 1: Teacher global ==========
+        if self.is_first_stage:
             teacher_output, teacher_attn_bias = self.teacher_stage(
                 teacher_global_crops, token_masks=None
             )
-            
-            # Forward 2: Student all crops
+            self._send_to_next_stage(teacher_output, teacher_attn_bias)
+            print(f"[Rank {self.local_rank}] Sent teacher global to next stage", flush=True)
+        elif self.is_last_stage:
+            teacher_input, teacher_attn_bias = self._recv_from_prev_stage()
+            teacher_features = self.teacher_stage(teacher_input, token_masks=None, attn_bias=teacher_attn_bias)
+            print(f"[Rank {self.local_rank}] Computed teacher global features", flush=True)
+        else:
+            teacher_input, teacher_attn_bias = self._recv_from_prev_stage()
+            teacher_output, teacher_attn_bias = self.teacher_stage(teacher_input, token_masks=None, attn_bias=teacher_attn_bias)
+            self._send_to_next_stage(teacher_output, teacher_attn_bias)
+            print(f"[Rank {self.local_rank}] Forwarded teacher global", flush=True)
+        
+        # **ADD BARRIER AFTER EACH PIPELINE STAGE**
+        dist.barrier(group=self.pipeline_group)
+        
+        # ========== Forward 2: Student all crops ==========
+        if self.is_first_stage:
             student_output, student_attn_bias = self.student_stage(
                 student_all_crops, token_masks=None
             )
-            
-            # Forward 3: Teacher iBOT (no masking)
+            self._send_to_next_stage(student_output, student_attn_bias)
+            print(f"[Rank {self.local_rank}] Sent student all crops to next stage", flush=True)
+        elif self.is_last_stage:
+            student_input, student_attn_bias = self._recv_from_prev_stage()
+            student_features = self.student_stage(student_input, token_masks=None, attn_bias=student_attn_bias)
+            print(f"[Rank {self.local_rank}] Computed student all crops features", flush=True)
+        else:
+            student_input, student_attn_bias = self._recv_from_prev_stage()
+            student_output, student_attn_bias = self.student_stage(student_input, token_masks=None, attn_bias=student_attn_bias)
+            self._send_to_next_stage(student_output, student_attn_bias)
+            print(f"[Rank {self.local_rank}] Forwarded student all crops", flush=True)
+        
+        dist.barrier(group=self.pipeline_group)
+        
+        # ========== Forward 3: Teacher iBOT ==========
+        if self.is_first_stage:
             teacher_ibot_output, teacher_ibot_attn_bias = self.teacher_stage(
                 original_images, token_masks=None
             )
-            
-            # Forward 4: Student iBOT (with masking)
+            self._send_to_next_stage(teacher_ibot_output, teacher_ibot_attn_bias)
+            print(f"[Rank {self.local_rank}] Sent teacher iBOT to next stage", flush=True)
+        elif self.is_last_stage:
+            teacher_ibot_input, teacher_ibot_attn_bias = self._recv_from_prev_stage()
+            teacher_ibot_features = self.teacher_stage(teacher_ibot_input, token_masks=None, attn_bias=teacher_ibot_attn_bias)
+            print(f"[Rank {self.local_rank}] Computed teacher iBOT features", flush=True)
+        else:
+            teacher_ibot_input, teacher_ibot_attn_bias = self._recv_from_prev_stage()
+            teacher_ibot_output, teacher_ibot_attn_bias = self.teacher_stage(teacher_ibot_input, token_masks=None, attn_bias=teacher_ibot_attn_bias)
+            self._send_to_next_stage(teacher_ibot_output, teacher_ibot_attn_bias)
+            print(f"[Rank {self.local_rank}] Forwarded teacher iBOT", flush=True)
+        
+        dist.barrier(group=self.pipeline_group)
+        
+        # ========== Forward 4: Student iBOT ==========
+        if self.is_first_stage:
             student_ibot_output, student_ibot_attn_bias = self.student_stage(
                 original_images, token_masks=token_masks
             )
-            
-            print(f"[Rank {self.local_rank}] Stage 1: Computed, sending to next stage...", flush=True)
-            
-            # Send all 4 outputs to next GPU
-            self._send_all_outputs_to_next_stage(
-                teacher_output, teacher_attn_bias,
-                student_output, student_attn_bias,
-                teacher_ibot_output, teacher_ibot_attn_bias,
-                student_ibot_output, student_ibot_attn_bias,
-            )
-            
-            print(f"[Rank {self.local_rank}] Stage 1: All sends complete", flush=True)
-            return None
+            self._send_to_next_stage(student_ibot_output, student_ibot_attn_bias)
+            print(f"[Rank {self.local_rank}] Sent student iBOT to next stage", flush=True)
+        elif self.is_last_stage:
+            student_ibot_input, student_ibot_attn_bias = self._recv_from_prev_stage()
+            student_ibot_features = self.student_stage(student_ibot_input, token_masks=None, attn_bias=student_ibot_attn_bias)
+            print(f"[Rank {self.local_rank}] Computed student iBOT features", flush=True)
+        else:
+            student_ibot_input, student_ibot_attn_bias = self._recv_from_prev_stage()
+            student_ibot_output, student_ibot_attn_bias = self.student_stage(student_ibot_input, token_masks=None, attn_bias=student_ibot_attn_bias)
+            self._send_to_next_stage(student_ibot_output, student_ibot_attn_bias)
+            print(f"[Rank {self.local_rank}] Forwarded student iBOT", flush=True)
         
-        elif self.is_middle_stage:
-            print(f"[Rank {self.local_rank}] Middle stage: Receiving all 4 inputs...", flush=True)
-            
-            # Receive all 4 inputs from previous GPU
-            (teacher_input, teacher_attn_bias,
-            student_input, student_attn_bias,
-            teacher_ibot_input, teacher_ibot_attn_bias,
-            student_ibot_input, student_ibot_attn_bias) = self._recv_all_inputs_from_prev_stage()
-            
-            print(f"[Rank {self.local_rank}] Middle stage: Processing all 4 forwards...", flush=True)
-            
-            # Process all 4 forwards
-            teacher_output, teacher_attn_bias = self.teacher_stage(
-                teacher_input, token_masks=None, attn_bias=teacher_attn_bias
-            )
-            
-            student_output, student_attn_bias = self.student_stage(
-                student_input, token_masks=None, attn_bias=student_attn_bias
-            )
-            
-            teacher_ibot_output, teacher_ibot_attn_bias = self.teacher_stage(
-                teacher_ibot_input, token_masks=None, attn_bias=teacher_ibot_attn_bias
-            )
-            
-            student_ibot_output, student_ibot_attn_bias = self.student_stage(
-                student_ibot_input, token_masks=None, attn_bias=student_ibot_attn_bias
-            )
-            
-            print(f"[Rank {self.local_rank}] Middle stage: Sending to next stage...", flush=True)
-            
-            # Send all 4 outputs to next GPU
-            self._send_all_outputs_to_next_stage(
-                teacher_output, teacher_attn_bias,
-                student_output, student_attn_bias,
-                teacher_ibot_output, teacher_ibot_attn_bias,
-                student_ibot_output, student_ibot_attn_bias,
-            )
-            
-            print(f"[Rank {self.local_rank}] Middle stage: All sends complete", flush=True)
-            return None
+        dist.barrier(group=self.pipeline_group)
         
-        else:  # Last stage
-            print(f"[Rank {self.local_rank}] Last stage: Receiving all 4 inputs...", flush=True)
-            
-            # Receive all 4 inputs
-            (teacher_input, teacher_attn_bias,
-            student_input, student_attn_bias,
-            teacher_ibot_input, teacher_ibot_attn_bias,
-            student_ibot_input, student_ibot_attn_bias) = self._recv_all_inputs_from_prev_stage()
-            
-            print(f"[Rank {self.local_rank}] Last stage: Processing all 4 forwards...", flush=True)
-            
-            # Process all 4 forwards
-            teacher_features = self.teacher_stage(
-                teacher_input, token_masks=None, attn_bias=teacher_attn_bias
-            )
-            
-            student_features = self.student_stage(
-                student_input, token_masks=None, attn_bias=student_attn_bias
-            )
-            
-            teacher_ibot_features = self.teacher_stage(
-                teacher_ibot_input, token_masks=None, attn_bias=teacher_ibot_attn_bias
-            )
-            
-            student_ibot_features = self.student_stage(
-                student_ibot_input, token_masks=None, attn_bias=student_ibot_attn_bias
-            )
-            
-            print(f"[Rank {self.local_rank}] Last stage: Computing losses...", flush=True)
-            
-            # Now compute losses with all features available
+        # ========== Compute losses (only last stage) ==========
+        if self.is_last_stage:
+            print(f"[Rank {self.local_rank}] Computing losses...", flush=True)
             losses = self._compute_losses(
                 student_features=student_features,
                 teacher_features=teacher_features,
@@ -231,8 +201,10 @@ class PipelineSchedule:
                 token_masks=token_masks,
                 iteration=iteration,
             )
-            
+            print(f"[Rank {self.local_rank}] Losses computed: {list(losses.keys())}", flush=True)
             return losses
+        else:
+            return None
     
     def _forward_through_pipeline(
         self,
