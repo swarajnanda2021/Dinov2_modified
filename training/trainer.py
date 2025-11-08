@@ -1108,10 +1108,22 @@ def _train_with_pipeline_parallelism(args):
         schedule.update_teacher_ema(
             momentum=momentum_schedule[current_iteration]
         )
+
+        if dist.is_initialized():
+            dist.barrier(group=pipeline_group)
+            if current_iteration % 10 == 0:
+                print(f"[Rank {args.rank}] Completed EMA update, starting logging", flush=True)
+
         
         # ========== Logging (broadcast losses from last stage) ==========
+        if utils.is_main_process() and current_iteration % 10 == 0:
+            print(f"[Rank {args.rank}] Starting loss broadcast", flush=True)
+
         if losses is None:
             # Not last stage - receive losses for logging
+            if current_iteration % 10 == 0:
+                print(f"[Rank {args.rank}] Waiting to receive losses from rank {last_stage_rank}", flush=True)
+   
             losses = {}
             for key in ['dino_class_loss', 'koleo_loss', 'ibot_loss', 
                     'clustering_loss', 'koleo_proto_loss', 'teacher_proto_loss']:
@@ -1122,10 +1134,16 @@ def _train_with_pipeline_parallelism(args):
                 losses[key] = loss_tensor.item()
         else:
             # Last stage - broadcast losses to other stages
+            if current_iteration % 10 == 0:
+                print(f"[Rank {args.rank}] Broadcasting losses to other ranks", flush=True)
+    
             for key in ['dino_class_loss', 'koleo_loss', 'ibot_loss', 
                     'clustering_loss', 'koleo_proto_loss', 'teacher_proto_loss']:
                 loss_tensor = torch.tensor([losses[key].item()], device='cuda')
                 dist.broadcast(loss_tensor, src=args.rank, group=pipeline_group)
+        
+        if utils.is_main_process() and current_iteration % 10 == 0:
+            print(f"[Rank {args.rank}] Completed loss broadcast", flush=True)
         
         # Update metrics
         metric_logger.update(
