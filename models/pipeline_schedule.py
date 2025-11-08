@@ -626,22 +626,22 @@ class PipelineSchedule:
         with torch.no_grad():
             # Update backbone parameters (all stages have backbone)
             for param_s, param_t in zip(
-                self.student_stage.module.backbone.parameters(),
-                self.teacher_stage.module.backbone.parameters()
+                self.student_stage.backbone.parameters(),
+                self.teacher_stage.backbone.parameters()
             ):
                 param_t.data.mul_(momentum).add_((1 - momentum) * param_s.detach().data)
             
             # Update heads (only last stage has heads)
-            if self.is_last_stage and self.student_stage.module.has_heads:
+            if self.is_last_stage and self.student_stage.has_heads:
                 for param_s, param_t in zip(
-                    self.student_stage.module.classhead.parameters(),
-                    self.teacher_stage.module.classhead.parameters()
+                    self.student_stage.classhead.parameters(),
+                    self.teacher_stage.classhead.parameters()
                 ):
                     param_t.data.mul_(momentum).add_((1 - momentum) * param_s.detach().data)
                 
                 for param_s, param_t in zip(
-                    self.student_stage.module.patchhead.parameters(),
-                    self.teacher_stage.module.patchhead.parameters()
+                    self.student_stage.patchhead.parameters(),
+                    self.teacher_stage.patchhead.parameters()
                 ):
                     param_t.data.mul_(momentum).add_((1 - momentum) * param_s.detach().data)
         
