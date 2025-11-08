@@ -90,8 +90,8 @@ class PipelineSchedule:
         self.num_tokens_per_image = 1 + num_registers + num_patches
         
         if self.debug:
-            print(f"[Rank {local_rank}] Pipeline schedule initialized", flush=True)
-            print(f"  Tokens/image: {self.num_tokens_per_image}, embed_dim: {embed_dim}", flush=True)
+            print(f"[Rank {local_rank}] Pipeline schedule initialized", force=True, flush=True)
+            print(f"  Tokens/image: {self.num_tokens_per_image}, embed_dim: {embed_dim}", force=True, flush=True)
     
     def forward_pass(
         self,
@@ -104,6 +104,10 @@ class PipelineSchedule:
         Execute forward pass through pipeline.
         Only first stage has actual crop data; other stages receive activations.
         """
+        
+        print(f"[Rank {self.local_rank}] Iter {iteration}: Entering forward_pass", force=True, flush=True)
+        dist.barrier(group=self.pipeline_group)
+        print(f"[Rank {self.local_rank}] Iter {iteration}: Passed entry barrier", force=True, flush=True)
         
 
         # Only first stage has actual data
@@ -123,7 +127,7 @@ class PipelineSchedule:
         
         # All ranks participate in all communications
         if self.is_first_stage:
-            print(f"[Rank {self.local_rank}] Iter {iteration}: Starting forward passes...", flush=True)
+            print(f"[Rank {self.local_rank}] Iter {iteration}: Starting forward passes...", force=True, flush=True)
         
         # ========== Forward 1: Teacher global ==========
         if self.is_first_stage:
@@ -131,16 +135,16 @@ class PipelineSchedule:
                 teacher_global_crops, token_masks=None
             )
             self._send_to_next_stage(teacher_output, teacher_attn_bias)
-            print(f"[Rank {self.local_rank}] Sent teacher global to next stage", flush=True)
+            print(f"[Rank {self.local_rank}] Sent teacher global to next stage", force=True, flush=True)
         elif self.is_last_stage:
             teacher_input, teacher_attn_bias = self._recv_from_prev_stage()
             teacher_features = self.teacher_stage(teacher_input, token_masks=None, attn_bias=teacher_attn_bias)
-            print(f"[Rank {self.local_rank}] Computed teacher global features", flush=True)
+            print(f"[Rank {self.local_rank}] Computed teacher global features", force=True, flush=True)
         else:
             teacher_input, teacher_attn_bias = self._recv_from_prev_stage()
             teacher_output, teacher_attn_bias = self.teacher_stage(teacher_input, token_masks=None, attn_bias=teacher_attn_bias)
             self._send_to_next_stage(teacher_output, teacher_attn_bias)
-            print(f"[Rank {self.local_rank}] Forwarded teacher global", flush=True)
+            print(f"[Rank {self.local_rank}] Forwarded teacher global", force=True, flush=True)
         
         # **ADD BARRIER AFTER EACH PIPELINE STAGE**
         dist.barrier(group=self.pipeline_group)
@@ -151,16 +155,16 @@ class PipelineSchedule:
                 student_all_crops, token_masks=None
             )
             self._send_to_next_stage(student_output, student_attn_bias)
-            print(f"[Rank {self.local_rank}] Sent student all crops to next stage", flush=True)
+            print(f"[Rank {self.local_rank}] Sent student all crops to next stage", force=True, flush=True)
         elif self.is_last_stage:
             student_input, student_attn_bias = self._recv_from_prev_stage()
             student_features = self.student_stage(student_input, token_masks=None, attn_bias=student_attn_bias)
-            print(f"[Rank {self.local_rank}] Computed student all crops features", flush=True)
+            print(f"[Rank {self.local_rank}] Computed student all crops features", force=True, flush=True)
         else:
             student_input, student_attn_bias = self._recv_from_prev_stage()
             student_output, student_attn_bias = self.student_stage(student_input, token_masks=None, attn_bias=student_attn_bias)
             self._send_to_next_stage(student_output, student_attn_bias)
-            print(f"[Rank {self.local_rank}] Forwarded student all crops", flush=True)
+            print(f"[Rank {self.local_rank}] Forwarded student all crops", force=True, flush=True)
         
         dist.barrier(group=self.pipeline_group)
         
@@ -170,16 +174,16 @@ class PipelineSchedule:
                 original_images, token_masks=None
             )
             self._send_to_next_stage(teacher_ibot_output, teacher_ibot_attn_bias)
-            print(f"[Rank {self.local_rank}] Sent teacher iBOT to next stage", flush=True)
+            print(f"[Rank {self.local_rank}] Sent teacher iBOT to next stage", force=True, flush=True)
         elif self.is_last_stage:
             teacher_ibot_input, teacher_ibot_attn_bias = self._recv_from_prev_stage()
             teacher_ibot_features = self.teacher_stage(teacher_ibot_input, token_masks=None, attn_bias=teacher_ibot_attn_bias)
-            print(f"[Rank {self.local_rank}] Computed teacher iBOT features", flush=True)
+            print(f"[Rank {self.local_rank}] Computed teacher iBOT features", force=True, flush=True)
         else:
             teacher_ibot_input, teacher_ibot_attn_bias = self._recv_from_prev_stage()
             teacher_ibot_output, teacher_ibot_attn_bias = self.teacher_stage(teacher_ibot_input, token_masks=None, attn_bias=teacher_ibot_attn_bias)
             self._send_to_next_stage(teacher_ibot_output, teacher_ibot_attn_bias)
-            print(f"[Rank {self.local_rank}] Forwarded teacher iBOT", flush=True)
+            print(f"[Rank {self.local_rank}] Forwarded teacher iBOT", force=True, flush=True)
         
         dist.barrier(group=self.pipeline_group)
         
@@ -189,22 +193,22 @@ class PipelineSchedule:
                 original_images, token_masks=token_masks
             )
             self._send_to_next_stage(student_ibot_output, student_ibot_attn_bias)
-            print(f"[Rank {self.local_rank}] Sent student iBOT to next stage", flush=True)
+            print(f"[Rank {self.local_rank}] Sent student iBOT to next stage", force=True, flush=True)
         elif self.is_last_stage:
             student_ibot_input, student_ibot_attn_bias = self._recv_from_prev_stage()
             student_ibot_features = self.student_stage(student_ibot_input, token_masks=None, attn_bias=student_ibot_attn_bias)
-            print(f"[Rank {self.local_rank}] Computed student iBOT features", flush=True)
+            print(f"[Rank {self.local_rank}] Computed student iBOT features", force=True, flush=True)
         else:
             student_ibot_input, student_ibot_attn_bias = self._recv_from_prev_stage()
             student_ibot_output, student_ibot_attn_bias = self.student_stage(student_ibot_input, token_masks=None, attn_bias=student_ibot_attn_bias)
             self._send_to_next_stage(student_ibot_output, student_ibot_attn_bias)
-            print(f"[Rank {self.local_rank}] Forwarded student iBOT", flush=True)
+            print(f"[Rank {self.local_rank}] Forwarded student iBOT", force=True, flush=True)
         
         dist.barrier(group=self.pipeline_group)
         
         # ========== Compute losses (only last stage) ==========
         if self.is_last_stage:
-            print(f"[Rank {self.local_rank}] Computing losses...", flush=True)
+            print(f"[Rank {self.local_rank}] Computing losses...", force=True, flush=True)
             losses = self._compute_losses(
                 student_features=student_features,
                 teacher_features=teacher_features,
@@ -213,7 +217,7 @@ class PipelineSchedule:
                 token_masks=token_masks,
                 iteration=iteration,
             )
-            print(f"[Rank {self.local_rank}] Losses computed: {list(losses.keys())}", flush=True)
+            print(f"[Rank {self.local_rank}] Losses computed: {list(losses.keys())}", force=True, flush=True)
             return losses
         else:
             return None
@@ -246,7 +250,7 @@ class PipelineSchedule:
             self._send_to_next_stage(output, attn_bias)
             
             if self.debug:
-                print(f"[Rank {self.local_rank}] First stage output: {output.shape}", flush=True)
+                print(f"[Rank {self.local_rank}] First stage output: {output.shape}", force=True, flush=True)
             
             return None
         
@@ -257,7 +261,7 @@ class PipelineSchedule:
             self._send_to_next_stage(output, attn_bias)
             
             if self.debug:
-                print(f"[Rank {self.local_rank}] Middle stage output: {output.shape}", flush=True)
+                print(f"[Rank {self.local_rank}] Middle stage output: {output.shape}", force=True, flush=True)
             
             return None
         
@@ -267,7 +271,7 @@ class PipelineSchedule:
             output = model_stage(input_tensor, token_masks=None, attn_bias=attn_bias)
             
             if self.debug:
-                print(f"[Rank {self.local_rank}] Last stage output: {type(output)}", flush=True)
+                print(f"[Rank {self.local_rank}] Last stage output: {type(output)}", force=True, flush=True)
             
             return output
     
@@ -280,6 +284,9 @@ class PipelineSchedule:
         if self.next_rank is None:
             return
         
+        print(f"[Rank {self.local_rank}] Attempting send to rank {self.next_rank}, tensor shape: {tensor.shape}", 
+          force=True, flush=True)
+
         device = tensor.device
         
         # 1. Send tensor shape
@@ -314,6 +321,9 @@ class PipelineSchedule:
             else:
                 num_batch_sizes_tensor = torch.tensor([0], dtype=torch.int64, device=device)
                 dist.send(num_batch_sizes_tensor, dst=self.next_rank, group=self.pipeline_group)
+        
+        print(f"[Rank {self.local_rank}] Send complete to rank {self.next_rank}", force=True, flush=True)
+
 
     def _send_all_outputs_to_next_stage(
         self,
@@ -354,6 +364,9 @@ class PipelineSchedule:
         if self.prev_rank is None:
             raise RuntimeError("Cannot receive - no previous stage")
         
+        print(f"[Rank {self.local_rank}] Waiting to receive from rank {self.prev_rank}", 
+          force=True, flush=True)
+        
         device = torch.cuda.current_device()
         
         # 1. Receive tensor shape
@@ -392,6 +405,9 @@ class PipelineSchedule:
                 batch_sizes = batch_sizes_tensor.tolist()
             
             attn_bias = self._reconstruct_attn_bias(seqlens, batch_sizes)
+        
+        print(f"[Rank {self.local_rank}] Receive complete from rank {self.prev_rank}, shape: {tensor_shape}", 
+          force=True, flush=True)
         
         return tensor, attn_bias
     
@@ -519,7 +535,7 @@ class PipelineSchedule:
             losses['teacher_proto_loss'] = teacher_proto_loss
         
         if self.debug:
-            print(f"[Rank {self.local_rank}] Computed losses: {list(losses.keys())}", flush=True)
+            print(f"[Rank {self.local_rank}] Computed losses: {list(losses.keys())}", force=True, flush=True)
         
         return losses
     
@@ -626,7 +642,7 @@ class PipelineSchedule:
             scaler.update()
         
         if self.debug:
-            print(f"[Rank {self.local_rank}] Backward pass completed", flush=True)
+            print(f"[Rank {self.local_rank}] Backward pass completed", force=True, flush=True)
         
         if self.check_for_nans(losses=losses, check_gradients=True):
             raise RuntimeError(f"[Rank {self.local_rank}] Training stopped due to NaN!")
@@ -648,7 +664,7 @@ class PipelineSchedule:
                 dist.all_reduce(param.grad, group=self.data_group, op=dist.ReduceOp.AVG)
         
         if self.debug:
-            print(f"[Rank {self.local_rank}] Synced gradients across data parallel group", flush=True)
+            print(f"[Rank {self.local_rank}] Synced gradients across data parallel group", force=True, flush=True)
     
     def check_for_nans(self, losses=None, check_gradients=False):
         """
@@ -716,4 +732,4 @@ class PipelineSchedule:
                     param_t.data.mul_(momentum).add_((1 - momentum) * param_s.detach().data)
         
         if self.debug:
-            print(f"[Rank {self.local_rank}] Teacher EMA update completed", flush=True)
+            print(f"[Rank {self.local_rank}] Teacher EMA update completed", force=True, flush=True)

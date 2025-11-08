@@ -979,7 +979,11 @@ def _train_with_pipeline_parallelism(args):
     print("\n" + "="*70)
     print("STARTING TRAINING LOOP")
     print("="*70 + "\n")
-    
+
+    print(f"[Rank {args.rank}] Waiting at training loop startup barrier...", force=True, flush=True)
+    dist.barrier()
+    print(f"[Rank {args.rank}] All ranks ready, starting training!", force=True, flush=True)
+
     while current_iteration < args.total_iterations:
 
         if current_iteration % 1 == 0:  # Print every iteration initially
