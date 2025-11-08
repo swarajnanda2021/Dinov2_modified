@@ -40,8 +40,8 @@ VIT_DEPTH = 12
 # --- Pipeline Parallel (alternative to standard DDP) ---
 USE_PIPELINE_PARALLEL = False
 MODEL_SIZE = 'base'                # 'base', 'large', 'huge', 'giant', 'giant2b'
-GPUS_PER_NODE = 4                  # Must match NGPUS if using pipeline parallel
-NUM_NODES = 1                      # Must match NODES if using pipeline parallel
+GPUS_PER_NODE = NGPUS              # Must match NGPUS if using pipeline parallel
+NUM_NODES = NODES                  # Must match NODES if using pipeline parallel
 
 # --- Mask Model ---
 MASK_CHECKPOINT = "/data1/vanderbc/nandas1/TCGA_TMEDinov3_ViT-B/checkpoint_saved_mask_model.pth"
