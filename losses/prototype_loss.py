@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from .koleo_loss import KoLeoLoss
-
+from utils import get_module
 
 class PatchPrototypeLoss(nn.Module):
     """
@@ -111,7 +111,7 @@ class PatchPrototypeLoss(nn.Module):
         prediction_loss = -torch.sum(Q_tilde_masked.detach() * student_log_probs_masked) / M_total
         
         # ========== KOLEO LOSS ON WEIGHTS ==========
-        weight_normalized = F.normalize(prototype_bank.module.proto_layer.weight, p=2, dim=1)
+        weight_normalized = F.normalize(get_module(prototype_bank).proto_layer.weight, p=2, dim=1)
         koleo_loss = self.koleo_loss(weight_normalized)
         
         # ========== METRICS ==========

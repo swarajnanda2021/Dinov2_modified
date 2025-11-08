@@ -1560,3 +1560,16 @@ def multi_scale(samples, model):
     v /= 3
     v /= v.norm()
     return v
+
+
+def get_module(model):
+    """
+    Get the actual module from a potentially DDP-wrapped model.
+    
+    Args:
+        model: Either a raw nn.Module or a DDP-wrapped module
+        
+    Returns:
+        The underlying module
+    """
+    return model.module if hasattr(model, 'module') else model
