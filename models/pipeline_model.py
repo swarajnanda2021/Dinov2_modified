@@ -116,6 +116,10 @@ def create_pipeline_student_teacher(
     
     full_student_encoder._init_weights()
     
+    if args.grad_checkpointing:
+        full_student_encoder.set_grad_checkpointing(True)
+        print(f"✓ Enabled gradient checkpointing in pipeline student encoder")
+    
     # ========== Partition backbone ==========
     # Keep only layers we need
     if not has_patch_embed:
@@ -224,33 +228,37 @@ class PipelineStageWrapper(nn.Module):
         self._cached_attn_bias = None
 
     def _apply_blocks_with_checkpointing(self, x, attn_bias=None):
-        """Apply transformer blocks with optional gradient checkpointing."""
-        if self.grad_checkpointing and self.training:
-            for block in self.backbone.blocks:
-                def create_forward_fn(module):
-                    def forward_fn(*inputs):
-                        if len(inputs) == 1:
-                            return module(inputs[0], attn_bias=None)
-                        else:
-                            return module(inputs[0], attn_bias=inputs[1])
-                    return forward_fn
-                
-                if attn_bias is not None:
+        # Let the backbone handle its own checkpointing
+        # (since we already enabled it via set_grad_checkpointing)
+        
+        if attn_bias is not None:
+            # Custom path for attention bias
+            if self.grad_checkpointing and self.training:
+                # Checkpoint in reasonable chunks
+                chunk_size = 4
+                for i in range(0, len(self.backbone.blocks), chunk_size):
+                    def create_chunk_forward(start, end):
+                        def forward(x):
+                            for j in range(start, end):
+                                x = self.backbone.blocks[j](x, attn_bias=attn_bias)
+                            return x
+                        return forward
+                    
+                    end_idx = min(i + chunk_size, len(self.backbone.blocks))
                     x = torch.utils.checkpoint.checkpoint(
-                        create_forward_fn(block),
-                        x,
-                        attn_bias,
-                        use_reentrant=False
-                    )
-                else:
-                    x = torch.utils.checkpoint.checkpoint(
-                        create_forward_fn(block),
+                        create_chunk_forward(i, end_idx),
                         x,
                         use_reentrant=False
                     )
+            else:
+                for block in self.backbone.blocks:
+                    x = block(x, attn_bias=attn_bias)
         else:
+            # No attention bias: use backbone's native checkpointing
+            # This hits ModernViT.forward_features_list or forward
+            # which already handles checkpointing efficiently
             for block in self.backbone.blocks:
-                x = block(x, attn_bias=attn_bias)
+                x = block(x, attn_bias=None)
         
         return x
 
