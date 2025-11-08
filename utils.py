@@ -849,6 +849,219 @@ def recv_tensor(tensor_shape, dtype, device, src_rank, tag=0):
     dist.recv(tensor, src=src_rank, tag=tag)
     return tensor
 
+"""
+Pipeline parallelism checkpoint utilities.
+Handles saving/loading checkpoints across distributed pipeline stages.
+"""
+
+import os
+import torch
+import torch.distributed as dist
+import random
+import numpy as np
+
+
+def save_pipeline_checkpoint(
+    student_stage,
+    teacher_stage,
+    prototype_bank,
+    optimizer_student,
+    optimizer_prototypes,
+    fp16_scaler,
+    loss_modules,
+    iteration,
+    dataset_position,
+    args,
+    output_dir,
+    local_rank,
+    pipeline_group,
+    data_group,
+):
+    """
+    Save pipeline checkpoint with proper distributed coordination.
+    
+    Strategy:
+    1. Each rank saves its own stage state to CPU
+    2. Gather all stage states to rank 0 of each data parallel group
+    3. Rank 0 saves complete checkpoint
+    
+    Args:
+        student_stage: Student pipeline stage (DDP wrapped)
+        teacher_stage: Teacher pipeline stage (DDP wrapped)
+        prototype_bank: Prototype bank (only on last stage, can be None)
+        optimizer_student: Student optimizer
+        optimizer_prototypes: Prototype optimizer
+        fp16_scaler: Mixed precision scaler
+        loss_modules: Dict of loss modules
+        iteration: Current iteration
+        dataset_position: Current dataset position
+        args: Training arguments
+        output_dir: Output directory
+        local_rank: Local GPU rank within node
+        pipeline_group: Pipeline process group
+        data_group: Data parallel process group
+    """
+    
+    # Only save from rank 0 of each pipeline group (i.e., first GPU of each node)
+    # This ensures we save one checkpoint per data parallel replica
+    is_saver = (local_rank == 0)
+    
+    if not is_saver:
+        # Other ranks in pipeline just wait
+        if dist.is_initialized():
+            dist.barrier()
+        return
+    
+    print(f"\n[Rank {dist.get_rank()}] Saving pipeline checkpoint at iteration {iteration}...")
+    
+    # ========== Collect checkpoint data ==========
+    checkpoint = {
+        'iteration': iteration,
+        'dataset_position': dataset_position,
+        'args': args,
+    }
+    
+    # Save student stage
+    checkpoint['student_stage'] = student_stage.state_dict()
+    
+    # Save teacher stage
+    checkpoint['teacher_stage'] = teacher_stage.state_dict()
+    
+    # Save prototype bank (only exists on last stage)
+    if prototype_bank is not None:
+        checkpoint['prototype_bank'] = prototype_bank.state_dict()
+    
+    # Save optimizers
+    checkpoint['optimizer_student'] = optimizer_student.state_dict()
+    checkpoint['optimizer_prototypes'] = optimizer_prototypes.state_dict()
+    
+    # Save scaler
+    if fp16_scaler is not None:
+        checkpoint['fp16_scaler'] = fp16_scaler.state_dict()
+    
+    # Save loss modules (only on last stage where they're used)
+    if prototype_bank is not None:  # Last stage indicator
+        checkpoint['loss_modules'] = {
+            key: module.state_dict() 
+            for key, module in loss_modules.items()
+        }
+    
+    # Save RNG states
+    checkpoint['torch_rng_state'] = torch.get_rng_state()
+    checkpoint['cuda_rng_state'] = torch.cuda.get_rng_state_all()
+    checkpoint['numpy_rng_state'] = np.random.get_state()
+    checkpoint['random_rng_state'] = random.getstate()
+    
+    # ========== Save to disk ==========
+    checkpoint_path = os.path.join(output_dir, f'checkpoint_iter_{iteration:08d}.pth')
+    torch.save(checkpoint, checkpoint_path)
+    
+    # Also save as latest checkpoint
+    latest_path = os.path.join(output_dir, 'checkpoint.pth')
+    torch.save(checkpoint, latest_path)
+    
+    print(f"[Rank {dist.get_rank()}] ✓ Saved checkpoint: {checkpoint_path}")
+    
+    # Barrier to ensure all saves complete
+    if dist.is_initialized():
+        dist.barrier()
+
+
+def load_pipeline_checkpoint(
+    checkpoint_path,
+    student_stage,
+    teacher_stage,
+    prototype_bank,
+    optimizer_student,
+    optimizer_prototypes,
+    fp16_scaler,
+    loss_modules,
+    local_rank,
+    pipeline_group,
+    data_group,
+):
+    """
+    Load pipeline checkpoint with proper distributed coordination.
+    
+    Strategy:
+    1. Rank 0 loads checkpoint from disk
+    2. Each rank loads its own stage state
+    3. Restore RNG states
+    
+    Returns:
+        run_variables: Dict with 'iteration' and 'dataset_position'
+    """
+    
+    if not os.path.exists(checkpoint_path):
+        print(f"No checkpoint found at {checkpoint_path}")
+        return {'iteration': 0, 'dataset_position': 0}
+    
+    print(f"\n[Rank {dist.get_rank()}] Loading pipeline checkpoint from {checkpoint_path}...")
+    
+    # All ranks load (file system can handle it)
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    
+    # ========== Load model states ==========
+    
+    # Load student stage
+    if 'student_stage' in checkpoint:
+        student_stage.load_state_dict(checkpoint['student_stage'], strict=False)
+        print(f"[Rank {dist.get_rank()}] Loaded student_stage")
+    
+    # Load teacher stage
+    if 'teacher_stage' in checkpoint:
+        teacher_stage.load_state_dict(checkpoint['teacher_stage'], strict=False)
+        print(f"[Rank {dist.get_rank()}] Loaded teacher_stage")
+    
+    # Load prototype bank (only on last stage)
+    if prototype_bank is not None and 'prototype_bank' in checkpoint:
+        prototype_bank.load_state_dict(checkpoint['prototype_bank'], strict=False)
+        print(f"[Rank {dist.get_rank()}] Loaded prototype_bank")
+    
+    # Load optimizers
+    if 'optimizer_student' in checkpoint:
+        optimizer_student.load_state_dict(checkpoint['optimizer_student'])
+        print(f"[Rank {dist.get_rank()}] Loaded optimizer_student")
+    
+    if 'optimizer_prototypes' in checkpoint:
+        optimizer_prototypes.load_state_dict(checkpoint['optimizer_prototypes'])
+        print(f"[Rank {dist.get_rank()}] Loaded optimizer_prototypes")
+    
+    # Load scaler
+    if fp16_scaler is not None and 'fp16_scaler' in checkpoint:
+        fp16_scaler.load_state_dict(checkpoint['fp16_scaler'])
+        print(f"[Rank {dist.get_rank()}] Loaded fp16_scaler")
+    
+    # Load loss modules (only on last stage)
+    if prototype_bank is not None and 'loss_modules' in checkpoint:
+        for key, state_dict in checkpoint['loss_modules'].items():
+            if key in loss_modules:
+                loss_modules[key].load_state_dict(state_dict)
+        print(f"[Rank {dist.get_rank()}] Loaded loss_modules")
+    
+    # ========== Restore RNG states ==========
+    if 'torch_rng_state' in checkpoint:
+        try:
+            torch.set_rng_state(checkpoint['torch_rng_state'])
+            torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state'])
+            np.random.set_state(checkpoint['numpy_rng_state'])
+            random.setstate(checkpoint['random_rng_state'])
+            print(f"[Rank {dist.get_rank()}] Restored RNG states")
+        except Exception as e:
+            print(f"[Rank {dist.get_rank()}] WARNING: Failed to restore RNG states: {e}")
+    
+    # ========== Return run variables ==========
+    run_variables = {
+        'iteration': checkpoint.get('iteration', 0),
+        'dataset_position': checkpoint.get('dataset_position', 0),
+    }
+    
+    print(f"[Rank {dist.get_rank()}] ✓ Loaded checkpoint from iteration {run_variables['iteration']}")
+    
+    return run_variables
+
+
+
 def pipeline_forward_pass(
     stage,
     x,

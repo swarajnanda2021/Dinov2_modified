@@ -923,16 +923,36 @@ def _train_with_pipeline_parallelism(args):
         start_warmup_value=args.momentum_teacher
     )
 
-    # ============ Load checkpoint (TODO: needs pipeline-specific handling) ============
-    to_restore = {"iteration": 0, "dataset_position": 0}
-    
-    # For now, skip checkpoint loading in pipeline mode
-    # TODO: Implement pipeline checkpoint compatibility
-    print("\n⚠️  WARNING: Checkpoint loading not yet implemented for pipeline mode")
-    print("    Starting from scratch")
-    
-    current_iteration = 0
-    dataset_position = 0
+    # ============ Load checkpoint ============
+    checkpoint_path = os.path.join(args.output_dir, "checkpoint.pth")
+
+    if os.path.exists(checkpoint_path):
+        run_variables = utils.load_pipeline_checkpoint(
+            checkpoint_path=checkpoint_path,
+            student_stage=student_stage,
+            teacher_stage=teacher_stage,
+            prototype_bank=prototype_bank,
+            optimizer_student=optimizer_student,
+            optimizer_prototypes=optimizer_prototypes,
+            fp16_scaler=fp16_scaler,
+            loss_modules=loss_modules,
+            local_rank=local_rank,
+            pipeline_group=pipeline_group,
+            data_group=data_group,
+        )
+        
+        current_iteration = run_variables['iteration']
+        dataset_position = run_variables['dataset_position']
+        
+        # Set resume position in dataset
+        if current_iteration > 0:
+            global_samples_processed = current_iteration * args.batch_size_per_gpu * dist.get_world_size()
+            trainset.set_resume_position(global_samples_processed)
+            print(f"Resuming from iteration {current_iteration}")
+    else:
+        print("\nNo checkpoint found, starting from scratch")
+        current_iteration = 0
+        dataset_position = 0
 
     # ============ Setup metric logger ============
     metric_logger = utils.IterationMetricLogger(total_iterations=args.total_iterations)
@@ -952,6 +972,7 @@ def _train_with_pipeline_parallelism(args):
         # ========== Get batch (same as standard) ==========
         try:
             batch_data = next(data_iterator)
+            dataset_position += 1
         except StopIteration:
             data_iterator = iter(train_loader)
             batch_data = next(data_iterator)
@@ -1108,13 +1129,25 @@ def _train_with_pipeline_parallelism(args):
                         num_samples=1
                     )
         
-        # ========== Save checkpoints (TODO: implement) ==========
+        # ========== Save checkpoints ==========
         if current_iteration % args.save_checkpoint_freq == 0:
-            # TODO: Implement pipeline checkpoint saving
-            if utils.is_main_process():
-                print(f"\n⚠️  Checkpoint saving at iteration {current_iteration} not yet implemented for pipeline mode")
-        
-        current_iteration += 1
+            save_pipeline_checkpoint(
+                student_stage=student_stage,
+                teacher_stage=teacher_stage,
+                prototype_bank=prototype_bank,
+                optimizer_student=optimizer_student,
+                optimizer_prototypes=optimizer_prototypes,
+                fp16_scaler=fp16_scaler,
+                loss_modules=loss_modules,
+                iteration=current_iteration,
+                dataset_position=dataset_position,
+                args=args,
+                output_dir=args.output_dir,
+                local_rank=local_rank,
+                pipeline_group=pipeline_group,
+                data_group=data_group,
+            )
+                current_iteration += 1
 
     # ========== Final log ==========
     if utils.is_main_process():

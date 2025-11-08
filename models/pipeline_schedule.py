@@ -465,11 +465,7 @@ class PipelineSchedule:
         """
         Complete backward pass matching trainer.py lines 645-690.
         
-        Includes:
-        - Gradient clipping
-        - Last layer freezing
-        - Mixed precision support
-        - Separate optimizer steps
+        ADDED: Data parallel gradient synchronization across nodes.
         """
         if not self.is_last_stage:
             # Non-last stages: backward happens automatically via autograd
@@ -488,24 +484,35 @@ class PipelineSchedule:
             losses['koleo_proto_loss']
         )
         
-        # ========== Backward for Prototypes (trainer.py lines 645-650) ==========
+        # ========== Backward for Prototypes ==========
         if scaler is None:
             prototype_loss_total.backward()
+            
+            # *** NEW: Sync gradients across data parallel group ***
+            self._sync_gradients_data_parallel(self.prototype_bank)
+            
             optimizer_prototypes.step()
         else:
             scaler.scale(prototype_loss_total).backward()
+            
+            # *** NEW: Sync gradients across data parallel group ***
+            self._sync_gradients_data_parallel(self.prototype_bank)
+            
             scaler.step(optimizer_prototypes)
         
-        # ========== Backward for Student (trainer.py lines 653-683) ==========
+        # ========== Backward for Student ==========
         if scaler is None:
             student_loss.backward()
             
-            # Gradient clipping (trainer.py line 655)
+            # *** NEW: Sync gradients across data parallel group ***
+            self._sync_gradients_data_parallel(self.student_stage)
+            
+            # Gradient clipping
             if args.clip_grad:
                 import utils
                 utils.clip_gradients(self.student_stage, args.clip_grad)
             
-            # Cancel last layer gradients (trainer.py lines 656-658)
+            # Cancel last layer gradients
             import utils
             if self.student_stage.module.has_heads:
                 utils.cancel_gradients_last_layer(
@@ -521,12 +528,15 @@ class PipelineSchedule:
             
             optimizer_student.step()
         else:
-            # Mixed precision path (trainer.py lines 660-683)
+            # Mixed precision path
             scaler.scale(student_loss).backward()
+            
+            # *** NEW: Sync gradients across data parallel group ***
+            scaler.unscale_(optimizer_student)
+            self._sync_gradients_data_parallel(self.student_stage)
             
             if args.clip_grad:
                 import utils
-                scaler.unscale_(optimizer_student)
                 utils.clip_gradients(self.student_stage, args.clip_grad)
             
             import utils
@@ -547,6 +557,64 @@ class PipelineSchedule:
         
         if self.debug:
             print(f"[Rank {self.local_rank}] Backward pass completed")
+        
+        if self.check_for_nans(losses=losses, check_gradients=True):
+            raise RuntimeError(f"[Rank {self.local_rank}] Training stopped due to NaN!")
+    
+
+    def _sync_gradients_data_parallel(self, model):
+        """
+        Synchronize gradients across data parallel group.
+        
+        CRITICAL: Without this, each node trains independently!
+        Each stage must sync its own parameters across corresponding stages on other nodes.
+        """
+        if not dist.is_initialized() or dist.get_world_size(self.data_group) == 1:
+            return
+        
+        for param in model.parameters():
+            if param.grad is not None:
+                # Average gradients across all replicas
+                dist.all_reduce(param.grad, group=self.data_group, op=dist.ReduceOp.AVG)
+        
+        if self.debug:
+            print(f"[Rank {self.local_rank}] Synced gradients across data parallel group")
+    
+    def check_for_nans(self, losses=None, check_gradients=False):
+        """
+        Check for NaN in losses and gradients.
+        
+        Args:
+            losses: Optional dict of loss values
+            check_gradients: Whether to check gradients
+            
+        Returns:
+            has_nan: Boolean indicating if NaN was found
+        """
+        has_nan = False
+        
+        # Check losses (only on last stage)
+        if losses is not None:
+            for key, value in losses.items():
+                if torch.isnan(value).any():
+                    print(f"[Rank {self.local_rank}] NaN detected in {key}!")
+                    has_nan = True
+        
+        # Check gradients
+        if check_gradients:
+            for name, param in self.student_stage.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    print(f"[Rank {self.local_rank}] NaN detected in gradient: {name}")
+                    has_nan = True
+                    break
+        
+        # Synchronize NaN detection across all ranks
+        if dist.is_initialized():
+            has_nan_tensor = torch.tensor([1.0 if has_nan else 0.0], device='cuda')
+            dist.all_reduce(has_nan_tensor, op=dist.ReduceOp.MAX)
+            has_nan = has_nan_tensor.item() > 0.5
+        
+        return has_nan
     
     def update_teacher_ema(self, momentum: float):
         """
