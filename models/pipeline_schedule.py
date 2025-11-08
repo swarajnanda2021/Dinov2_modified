@@ -608,106 +608,113 @@ class PipelineSchedule:
         scaler=None,
     ):
         """
-        Complete backward pass matching trainer.py lines 645-690.
+        Complete backward pass for ALL pipeline stages.
         
-        Do both backwards BEFORE stepping either optimizer.
+        Strategy:
+        1. Last stage: Compute loss and backward
+        2. All stages: Sync gradients within data parallel group
+        3. All stages: Step optimizers
         """
-        if not self.is_last_stage:
-            # Non-last stages: backward happens automatically via autograd
-            return
         
-        # Compute total losses (only on last stage)
-        student_loss = (
-            losses['dino_class_loss'] +
-            args.koleo_loss_weight * losses['koleo_loss'] +
-            args.ibot_loss_weight * losses['ibot_loss'] +
-            args.clustering_weight * losses['clustering_loss']
-        )
+        # ========== STEP 1: Compute and backward (ONLY last stage) ==========
+        if self.is_last_stage:
+            # Compute total losses
+            student_loss = (
+                losses['dino_class_loss'] +
+                args.koleo_loss_weight * losses['koleo_loss'] +
+                args.ibot_loss_weight * losses['ibot_loss'] +
+                args.clustering_weight * losses['clustering_loss']
+            )
+            
+            prototype_loss_total = (
+                losses['teacher_proto_loss'] +
+                losses['koleo_proto_loss']
+            )
+            
+            # Do BOTH backwards
+            if scaler is None:
+                prototype_loss_total.backward()
+                student_loss.backward()
+            else:
+                scaler.scale(prototype_loss_total).backward()
+                scaler.scale(student_loss).backward()
+            
+            if self.debug:
+                print(f"[Rank {self.local_rank}] Completed backward on last stage", 
+                    force=True, flush=True)
         
-        prototype_loss_total = (
-            losses['teacher_proto_loss'] +
-            losses['koleo_proto_loss']
-        )
-
-        # Get the underlying modules (handles both DDP and non-DDP)
-        student_module = get_module(self.student_stage)
+        # ========== BARRIER: Wait for backward to complete ==========
+        dist.barrier(group=self.pipeline_group)
         
-        # ========== Do BOTH backwards BEFORE any optimizer steps ==========
-        if scaler is None:
-            # Backward pass for prototypes
-            prototype_loss_total.backward()
-            
-            # Backward pass for student (BEFORE stepping prototype optimizer!)
-            student_loss.backward()
-            
-            # NOW we can safely step optimizers
-            # Step 1: Sync and update prototypes
-            self._sync_gradients_data_parallel(self.prototype_bank)
-            optimizer_prototypes.step()
-            
-            # Step 2: Sync and update student
-            self._sync_gradients_data_parallel(self.student_stage)
-            
-            # Gradient clipping
-            if args.clip_grad:
-                import utils
-                utils.clip_gradients(self.student_stage, args.clip_grad)
-            
-            # Cancel last layer gradients
-            import utils
-            if student_module.has_heads:
-                utils.cancel_gradients_last_layer(
-                    current_iteration,
-                    student_module.classhead,
-                    args.freeze_last_layer_iters
-                )
-                utils.cancel_gradients_last_layer(
-                    current_iteration,
-                    student_module.patchhead,
-                    args.freeze_last_layer_iters
-                )
-            
-            optimizer_student.step()
-            
-        else:
-            # Mixed precision: same logic
-            scaler.scale(prototype_loss_total).backward()
-            scaler.scale(student_loss).backward()  # Do BOTH backwards first
-            
-            # Unscale and sync prototypes
-            scaler.unscale_(optimizer_prototypes)
-            self._sync_gradients_data_parallel(self.prototype_bank)
-            scaler.step(optimizer_prototypes)
-            
-            # Unscale and sync student
+        # ========== STEP 2: Sync gradients (ALL stages) ==========
+        # All stages need to sync their portion of the model
+        if scaler is not None:
             scaler.unscale_(optimizer_student)
-            self._sync_gradients_data_parallel(self.student_stage)
-            
-            if args.clip_grad:
-                import utils
-                utils.clip_gradients(self.student_stage, args.clip_grad)
-            
-            import utils
-            if student_module.has_heads:
-                utils.cancel_gradients_last_layer(
-                    current_iteration,
-                    student_module.classhead,
-                    args.freeze_last_layer_iters
-                )
-                utils.cancel_gradients_last_layer(
-                    current_iteration,
-                    student_module.patchhead,
-                    args.freeze_last_layer_iters
-                )
-            
-            scaler.step(optimizer_student)
-            scaler.update()
+            if self.is_last_stage:
+                scaler.unscale_(optimizer_prototypes)
+        
+        # Sync student gradients across data parallel group
+        self._sync_gradients_data_parallel(self.student_stage)
+        
+        # Sync prototype gradients (only last stage has prototypes)
+        if self.is_last_stage and self.prototype_bank is not None:
+            self._sync_gradients_data_parallel(self.prototype_bank)
         
         if self.debug:
-            print(f"[Rank {self.local_rank}] Backward pass completed", force=True, flush=True)
+            print(f"[Rank {self.local_rank}] Synced gradients", force=True, flush=True)
         
-        if self.check_for_nans(losses=losses, check_gradients=True):
-            raise RuntimeError(f"[Rank {self.local_rank}] Training stopped due to NaN!")
+        # ========== STEP 3: Gradient clipping (ALL stages) ==========
+        if args.clip_grad:
+            import utils
+            utils.clip_gradients(self.student_stage, args.clip_grad)
+        
+        # ========== STEP 4: Cancel last layer gradients (ONLY last stage) ==========
+        if self.is_last_stage:
+            import utils
+            student_module = utils.get_module(self.student_stage)
+            if student_module.has_heads:
+                utils.cancel_gradients_last_layer(
+                    current_iteration,
+                    student_module.classhead,
+                    args.freeze_last_layer_iters
+                )
+                utils.cancel_gradients_last_layer(
+                    current_iteration,
+                    student_module.patchhead,
+                    args.freeze_last_layer_iters
+                )
+        
+        # ========== STEP 5: Optimizer steps (ALL stages) ==========
+        if scaler is None:
+            # Step student optimizer (all stages)
+            optimizer_student.step()
+            
+            # Step prototype optimizer (only last stage)
+            if self.is_last_stage:
+                optimizer_prototypes.step()
+        else:
+            # Step student optimizer (all stages)
+            scaler.step(optimizer_student)
+            
+            # Step prototype optimizer (only last stage)
+            if self.is_last_stage:
+                scaler.step(optimizer_prototypes)
+            
+            # Update scaler (only need to do once, let rank 0 do it)
+            if self.local_rank == 0:
+                scaler.update()
+        
+        if self.debug:
+            print(f"[Rank {self.local_rank}] Completed optimizer steps", 
+                force=True, flush=True)
+        
+        # ========== BARRIER: Ensure all ranks finish together ==========
+        dist.barrier(group=self.pipeline_group)
+        
+        # ========== Check for NaNs (only on last stage) ==========
+        if self.is_last_stage:
+            if self.check_for_nans(losses=losses, check_gradients=True):
+                raise RuntimeError(f"[Rank {self.local_rank}] Training stopped due to NaN!")
     
 
     def _sync_gradients_data_parallel(self, model):

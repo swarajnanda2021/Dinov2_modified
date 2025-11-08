@@ -1116,16 +1116,16 @@ def _train_with_pipeline_parallelism(args):
             # Not last stage - receive losses for logging
             losses = {}
             for key in ['dino_class_loss', 'koleo_loss', 'ibot_loss', 
-                       'clustering_loss', 'koleo_proto_loss', 'teacher_proto_loss']:
+                    'clustering_loss', 'koleo_proto_loss', 'teacher_proto_loss']:
                 loss_tensor = torch.zeros(1, device='cuda')
                 # Broadcast from last GPU in pipeline group
-                last_stage_rank = args.rank - (args.rank % args.gpus_per_node) + (args.gpus_per_node - 1)
+                last_stage_rank = (args.rank // args.gpus_per_node) * args.gpus_per_node + (args.gpus_per_node - 1)
                 dist.broadcast(loss_tensor, src=last_stage_rank, group=pipeline_group)
                 losses[key] = loss_tensor.item()
         else:
             # Last stage - broadcast losses to other stages
             for key in ['dino_class_loss', 'koleo_loss', 'ibot_loss', 
-                       'clustering_loss', 'koleo_proto_loss', 'teacher_proto_loss']:
+                    'clustering_loss', 'koleo_proto_loss', 'teacher_proto_loss']:
                 loss_tensor = torch.tensor([losses[key].item()], device='cuda')
                 dist.broadcast(loss_tensor, src=args.rank, group=pipeline_group)
         
@@ -1193,8 +1193,12 @@ def _train_with_pipeline_parallelism(args):
                 data_group=data_group,
             )
         
+        # Debug: Ensure all ranks finish iteration
         if dist.is_initialized():
-            dist.barrier() # Ensure all ranks finish iteration together
+            dist.barrier(group=pipeline_group)
+            if current_iteration % 10 == 0:
+                print(f"[Rank {args.rank}] Completed iteration {current_iteration}", 
+                      flush=True)
         
         current_iteration += 1
 
