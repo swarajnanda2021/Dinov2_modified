@@ -952,8 +952,8 @@ def _train_with_pipeline_parallelism(args):
         current_iteration = run_variables['iteration']
         dataset_position = run_variables['dataset_position']
         
-        # Set resume position in dataset
-        if current_iteration > 0:
+        # Set resume position in dataset (ONLY on first stage)
+        if current_iteration > 0 and local_rank == 0:
             global_samples_processed = current_iteration * args.batch_size_per_gpu * dist.get_world_size()
             trainset.set_resume_position(global_samples_processed)
             print(f"Resuming from iteration {current_iteration}")
@@ -966,7 +966,11 @@ def _train_with_pipeline_parallelism(args):
     metric_logger = utils.IterationMetricLogger(total_iterations=args.total_iterations)
     metric_logger.start_time = time.time()
     
-    data_iterator = iter(train_loader)
+    # Only create data_iterator on first stage (where train_loader exists)
+    if local_rank == 0:
+        data_iterator = iter(train_loader)
+    else:
+        data_iterator = None
     
     if utils.is_main_process():
         print(f"\nStarting pipeline parallel training at iteration {current_iteration}")
