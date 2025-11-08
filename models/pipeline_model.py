@@ -1,6 +1,12 @@
 """
-Pipeline parallelism wrapper for DINOv2.
-Supports 4-GPU and 8-GPU nodes with hybrid data+pipeline parallelism.
+Complete Pipeline Parallelism for DINOv2 with Projection Heads.
+
+Supports:
+- Multi-stage model partitioning across GPUs
+- Projection heads on last stage
+- Returns both projected outputs AND raw features
+- Gradient checkpointing
+- Sequence packing with attention bias
 """
 
 import torch
@@ -11,21 +17,13 @@ from copy import deepcopy
 
 
 def get_model_config(model_size: str):
-    """
-    Get ViT configuration for different model sizes.
-    
-    Args:
-        model_size: 'base', 'large', 'huge', 'giant', 'giant2b'
-    
-    Returns:
-        Dictionary with depth, embed_dim, num_heads
-    """
+    """Get ViT configuration for different model sizes."""
     configs = {
-        'base': {'depth': 12, 'embed_dim': 768, 'num_heads': 12},      # ~86M
-        'large': {'depth': 24, 'embed_dim': 1024, 'num_heads': 16},     # ~307M
-        'huge': {'depth': 32, 'embed_dim': 1280, 'num_heads': 16},      # ~632M
-        'giant': {'depth': 40, 'embed_dim': 1408, 'num_heads': 16},     # ~1.01B
-        'giant2b': {'depth': 48, 'embed_dim': 1664, 'num_heads': 16},   # ~2.04B
+        'base': {'depth': 12, 'embed_dim': 768, 'num_heads': 12},
+        'large': {'depth': 24, 'embed_dim': 1024, 'num_heads': 16},
+        'huge': {'depth': 32, 'embed_dim': 1280, 'num_heads': 16},
+        'giant': {'depth': 40, 'embed_dim': 1408, 'num_heads': 16},
+        'giant2b': {'depth': 48, 'embed_dim': 1664, 'num_heads': 16},
     }
     
     if model_size not in configs:
@@ -35,21 +33,11 @@ def get_model_config(model_size: str):
 
 
 def get_layer_split_points(depth: int, gpus_per_node: int):
-    """
-    Calculate layer split points for even distribution across GPUs.
-    
-    Args:
-        depth: Total number of transformer layers
-        gpus_per_node: Number of GPUs per node (4 or 8)
-    
-    Returns:
-        List of split indices (exclusive end points)
-    """
+    """Calculate layer split points for even distribution."""
     layers_per_gpu = depth // gpus_per_node
     
     if depth % gpus_per_node != 0:
         print(f"Warning: {depth} layers not evenly divisible by {gpus_per_node} GPUs")
-        print(f"Using {layers_per_gpu} layers per GPU with last GPU getting extra layers")
     
     split_points = []
     for i in range(1, gpus_per_node):
@@ -65,22 +53,17 @@ def create_pipeline_student_teacher(
     pipeline_group,
 ):
     """
-    Create pipeline-parallelized student and teacher models.
+    Create pipeline-parallelized student and teacher models with projection heads.
     
     Strategy:
     1. Create full model on device
-    2. Initialize weights properly
-    3. Delete layers we don't need
-    4. Create identical teacher via deepcopy
-    
-    Args:
-        args: Training arguments
-        local_rank: GPU rank within the node (0 to gpus_per_node-1)
-        device: CUDA device
-        pipeline_group: Process group for pipeline parallelism
+    2. Initialize weights
+    3. Partition: delete layers we don't need
+    4. Create projection heads on last stage only
+    5. Create identical teacher via deepcopy
     
     Returns:
-        student_stage, teacher_stage, prototype_bank (or None if not on last GPU)
+        student_stage, teacher_stage, prototype_bank (or None if not last GPU)
     """
     from models import ModernViT, DINOHead, LinearPrototypeBank
 
@@ -115,8 +98,7 @@ def create_pipeline_student_teacher(
     print(f"GPU {local_rank}: Layers [{layer_start}:{layer_end}], "
           f"patch_embed={has_patch_embed}, heads={has_heads}")
     
-    # ========== Create FULL model on device ==========
-    print("Creating full model on device...")
+    # ========== Create FULL model ==========
     full_student_encoder = ModernViT(
         img_size=224,
         patch_size=args.patch_size,
@@ -132,36 +114,34 @@ def create_pipeline_student_teacher(
         num_register_tokens=4,
     ).to(device)
     
-    # Initialize weights
-    print("Initializing weights...")
     full_student_encoder._init_weights()
     
-    # ========== Partition model: Delete what we don't need ==========
-    print("Partitioning model...")
-    
-    # 1. Handle patch embedding (only first stage keeps it)
+    # ========== Partition backbone ==========
+    # Keep only layers we need
     if not has_patch_embed:
         full_student_encoder.patch_embed = None
         full_student_encoder.cls_token = None
         full_student_encoder.register_tokens = None
         full_student_encoder.pos_embed = None
-        print("  Removed patch_embed, cls_token, register_tokens, pos_embed")
+        print("  Removed patch_embed")
     
-    # 2. Keep only our transformer blocks
+    # Keep only our transformer blocks
     blocks_to_keep = []
     for layer_idx in range(layer_start, layer_end):
         blocks_to_keep.append(full_student_encoder.blocks[layer_idx])
     
     full_student_encoder.blocks = nn.Sequential(*blocks_to_keep)
-    print(f"  Kept {len(blocks_to_keep)} transformer blocks [{layer_start}:{layer_end}]")
+    print(f"  Kept {len(blocks_to_keep)} blocks [{layer_start}:{layer_end}]")
     
-    # 3. Handle final norm and heads (only last stage keeps them)
+    # Keep or remove final norm
     if not has_heads:
         full_student_encoder.norm = None
         print("  Removed final norm")
     
-    # ========== Create projection heads (only on last GPU) ==========
+    # ========== Create projection heads (ONLY on last stage) ==========
     if has_heads:
+        print("  Creating projection heads on last stage")
+        
         full_student_classhead = DINOHead(
             embed_dim,
             args.out_dim,
@@ -176,12 +156,12 @@ def create_pipeline_student_teacher(
             norm_last_layer=args.norm_last_layer,
         ).to(device)
         
-        print("  Created projection heads")
+        print(f"  Created DINO heads: {embed_dim} -> {args.out_dim}")
     else:
         full_student_classhead = None
         full_student_patchhead = None
     
-    # ========== Create prototype bank (only on last GPU) ==========
+    # ========== Create prototype bank (ONLY on last stage) ==========
     if has_heads:
         full_prototype_bank = LinearPrototypeBank(
             num_prototypes=args.num_prototypes,
@@ -215,8 +195,9 @@ def create_pipeline_student_teacher(
 
 class PipelineStageWrapper(nn.Module):
     """
-    Wrapper for a single pipeline stage with gradient checkpointing support.
-    Handles partial model execution with send/recv between stages.
+    Wrapper for a single pipeline stage with heads support.
+    
+    Returns both projected outputs AND raw features for downstream losses.
     """
     def __init__(
         self,
@@ -239,22 +220,15 @@ class PipelineStageWrapper(nn.Module):
         self.has_heads = has_heads
         self.grad_checkpointing = grad_checkpointing
         
-        # For sequence packing: cache attention bias between forward calls
+        # Cache for attention bias
         self._cached_attn_bias = None
 
     def _apply_blocks_with_checkpointing(self, x, attn_bias=None):
-        """
-        Apply transformer blocks with optional gradient checkpointing.
-        
-        Gradient checkpointing is applied per-block to save memory during backward pass.
-        """
+        """Apply transformer blocks with optional gradient checkpointing."""
         if self.grad_checkpointing and self.training:
-            # Apply gradient checkpointing to each transformer block
             for block in self.backbone.blocks:
-                # Checkpoint each block individually
                 def create_forward_fn(module):
                     def forward_fn(*inputs):
-                        # Handle both (x,) and (x, attn_bias) signatures
                         if len(inputs) == 1:
                             return module(inputs[0], attn_bias=None)
                         else:
@@ -275,7 +249,6 @@ class PipelineStageWrapper(nn.Module):
                         use_reentrant=False
                     )
         else:
-            # No checkpointing: normal forward pass
             for block in self.backbone.blocks:
                 x = block(x, attn_bias=attn_bias)
         
@@ -285,32 +258,20 @@ class PipelineStageWrapper(nn.Module):
         """
         Forward through this pipeline stage.
         
-        Handles three cases:
-        1. First stage: Apply patch embed + blocks
-        2. Middle stages: Apply blocks only
-        3. Last stage: Apply blocks + norm + heads
-        
-        Args:
-            x: Input tensor(s) - can be list for multi-crop or single tensor
-            token_masks: Optional token masking for iBOT
-            attn_bias: Optional attention bias for sequence packing
-            
         Returns:
-            - First/middle stages: Processed features to send to next stage
-            - Last stage: Dict with clstoken, patchtokens, etc.
+        - First/middle stages: (processed_features, attn_bias) tuple
+        - Last stage: Dict or List[Dict] with BOTH projected AND raw features
         """
         is_multi_crop = isinstance(x, list)
         
-        # ========== FIRST STAGE: Patch Embedding + Initial Blocks ==========
+        # ========== FIRST STAGE ==========
         if self.local_rank == 0:
             if is_multi_crop:
-                # Multi-crop: pack sequences together
+                # Multi-crop: pack sequences
                 x_processed = []
                 
-                # Process each crop through patch embedding
                 for crop in x:
                     if token_masks is not None and isinstance(token_masks, list):
-                        # Find corresponding mask (if provided)
                         crop_idx = x.index(crop)
                         mask = token_masks[crop_idx] if crop_idx < len(token_masks) else None
                         tokens = self.backbone.prepare_tokens_with_masks(crop, mask)
@@ -321,14 +282,10 @@ class PipelineStageWrapper(nn.Module):
                 # Create attention bias for sequence packing
                 from models.vision_transformer.modern_vit import get_attn_bias_and_cat
                 attn_bias, x_cat = get_attn_bias_and_cat(x_processed)
-                
-                # Cache attention bias for backward pass
                 self._cached_attn_bias = attn_bias
                 
-                # Apply transformer blocks with gradient checkpointing
                 x_cat = self._apply_blocks_with_checkpointing(x_cat, attn_bias)
                 
-                # Return packed tensor and attention bias
                 return x_cat, attn_bias
                 
             else:
@@ -338,60 +295,62 @@ class PipelineStageWrapper(nn.Module):
                 else:
                     x_processed = self.backbone.prepare_tokens(x)
                 
-                # Apply transformer blocks with gradient checkpointing
                 x_processed = self._apply_blocks_with_checkpointing(x_processed, attn_bias=None)
                 
                 return x_processed, None
         
-        # ========== LAST STAGE: Final Blocks + Norm + Heads ==========
+        # ========== LAST STAGE ==========
         elif self.has_heads:
             if is_multi_crop or attn_bias is not None:
                 # Packed multi-crop case
-                # x is already concatenated: [1, total_tokens, D]
-                
-                # Apply transformer blocks with gradient checkpointing
                 x = self._apply_blocks_with_checkpointing(x, attn_bias)
-                
-                # Apply final norm
                 x = self.backbone.norm(x)
                 
-                # Unpack sequences using attention bias
+                # Unpack sequences
                 if attn_bias is not None:
                     outputs_list = attn_bias.split(x)
                 else:
-                    # If no attention bias, assume single sequence
                     outputs_list = [x]
                 
-                # Extract CLS and patch tokens for each crop
+                # Extract features and apply heads
                 results = []
                 for tokens in outputs_list:
+                    cls_token = tokens[:, 0]
+                    patch_tokens = tokens[:, 5:]  # Skip cls + 4 registers
+                    
+                    # Apply projection heads
+                    cls_output = self.classhead(cls_token)
+                    patch_output = self.patchhead(patch_tokens)
+                    
                     results.append({
-                        'clstoken': tokens[:, 0],
-                        'regtokens': tokens[:, 1:5],
-                        'patchtokens': tokens[:, 5:],
+                        'cls_output': cls_output,          # Projected [B, out_dim]
+                        'patch_output': patch_output,      # Projected [B, N, out_dim]
+                        'cls_features': cls_token,         # Raw [B, embed_dim]
+                        'patch_features': patch_tokens,    # Raw [B, N, embed_dim]
                     })
                 
                 return results
                 
             else:
                 # Single image case
-                # Apply transformer blocks with gradient checkpointing
                 x = self._apply_blocks_with_checkpointing(x, attn_bias=None)
-                
-                # Apply final norm
                 x = self.backbone.norm(x)
                 
+                cls_token = x[:, 0]
+                patch_tokens = x[:, 5:]
+                
+                # Apply projection heads
+                cls_output = self.classhead(cls_token)
+                patch_output = self.patchhead(patch_tokens)
+                
                 return {
-                    'clstoken': x[:, 0],
-                    'regtokens': x[:, 1:5],
-                    'patchtokens': x[:, 5:],
+                    'cls_output': cls_output,
+                    'patch_output': patch_output,
+                    'cls_features': cls_token,
+                    'patch_features': patch_tokens,
                 }
         
-        # ========== MIDDLE STAGE: Blocks Only ==========
+        # ========== MIDDLE STAGE ==========
         else:
-            # Apply transformer blocks with gradient checkpointing
             x = self._apply_blocks_with_checkpointing(x, attn_bias)
-            
-            # Return processed features (preserving attn_bias for next stage)
             return x, attn_bias
-
