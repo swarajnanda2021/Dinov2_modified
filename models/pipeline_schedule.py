@@ -205,6 +205,9 @@ class PipelineSchedule:
             print(f"[Rank {self.local_rank}] Forwarded student iBOT", force=True, flush=True)
         
         dist.barrier(group=self.pipeline_group)
+
+        # ========== Communicate token_masks from first to last stage ==========
+        token_masks = self._communicate_token_masks(token_masks)
         
         # ========== Compute losses (only last stage) ==========
         if self.is_last_stage:
@@ -436,6 +439,61 @@ class PipelineSchedule:
             attn_bias._batch_sizes = batch_sizes
         
         return attn_bias
+    
+    def _communicate_token_masks(self, token_masks):
+        """
+        Send token_masks from first stage to last stage.
+        
+        Args:
+            token_masks: [B, N] tensor on first stage, None on others
+            
+        Returns:
+            token_masks on last stage, None on others
+        """
+        if self.is_first_stage:
+            # First stage: send to last stage
+            if token_masks is not None:
+                # Send shape first
+                B, N = token_masks.shape
+                shape_tensor = torch.tensor([B, N], dtype=torch.int64, device='cuda')
+                last_stage_rank = self.local_rank + (self.gpus_per_node - 1)
+                dist.send(shape_tensor, dst=last_stage_rank, group=self.pipeline_group)
+                
+                # Send masks
+                dist.send(token_masks.contiguous(), dst=last_stage_rank, group=self.pipeline_group)
+                print(f"[Rank {self.local_rank}] Sent token_masks to last stage", force=True, flush=True)
+            else:
+                # Send empty signal
+                shape_tensor = torch.tensor([0, 0], dtype=torch.int64, device='cuda')
+                last_stage_rank = self.local_rank + (self.gpus_per_node - 1)
+                dist.send(shape_tensor, dst=last_stage_rank, group=self.pipeline_group)
+            
+            return None
+        
+        elif self.is_last_stage:
+            # Last stage: receive from first stage
+            first_stage_rank = self.local_rank - (self.gpus_per_node - 1)
+            
+            # Receive shape
+            shape_tensor = torch.empty(2, dtype=torch.int64, device='cuda')
+            dist.recv(shape_tensor, src=first_stage_rank, group=self.pipeline_group)
+            
+            B, N = shape_tensor.tolist()
+            
+            if B == 0 or N == 0:
+                print(f"[Rank {self.local_rank}] Received empty token_masks signal", force=True, flush=True)
+                return None
+            
+            # Receive masks
+            received_masks = torch.empty((B, N), dtype=torch.bool, device='cuda')
+            dist.recv(received_masks, src=first_stage_rank, group=self.pipeline_group)
+            print(f"[Rank {self.local_rank}] Received token_masks from first stage", force=True, flush=True)
+            
+            return received_masks
+        
+        else:
+            # Middle stages: do nothing
+            return None
     
     def _compute_losses(
         self,
