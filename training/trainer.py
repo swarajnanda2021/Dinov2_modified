@@ -867,20 +867,20 @@ def _train_with_pipeline_parallelism(args):
     # ============ Create optimizers ============
     # Student optimizer (only for this stage's parameters)
     optimizer_student = torch.optim.AdamW([
-        *utils.get_params_groups(student_stage.module.backbone),
+        *utils.get_params_groups(student_stage.backbone),
     ])
-    
+
     # Add heads if on last stage
-    if student_stage.module.has_heads:
+    if student_stage.has_heads:
         optimizer_student.add_param_group({
-            'params': list(student_stage.module.classhead.parameters()) + 
-                     list(student_stage.module.patchhead.parameters())
+            'params': list(student_stage.classhead.parameters()) + 
+                    list(student_stage.patchhead.parameters())
         })
-    
+
     # Prototypes optimizer (only on last stage)
     if prototype_bank is not None:
         optimizer_prototypes = torch.optim.AdamW(
-            prototype_bank.module.parameters(),
+            prototype_bank.parameters(),
             betas=(0.9, 0.95),
             weight_decay=0.0,
         )
