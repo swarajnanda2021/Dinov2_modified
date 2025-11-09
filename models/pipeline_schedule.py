@@ -102,24 +102,19 @@ class PipelineSchedule:
         token_masks: Optional[torch.Tensor] = None,
         iteration: int = 0,
     ) -> Optional[Dict[str, torch.Tensor]]:
-        """
-        Execute forward pass through pipeline.
-        Only first stage has actual crop data; other stages receive activations.
-        """
+        """Execute forward pass through pipeline."""
         
         print(f"[Rank {self.local_rank}] Iter {iteration}: Entering forward_pass", force=True, flush=True)
         dist.barrier(group=self.pipeline_group)
         print(f"[Rank {self.local_rank}] Iter {iteration}: Passed entry barrier", force=True, flush=True)
-        
 
         # Only first stage has actual data
         if not self.is_first_stage:
-            # Verify inputs are None for non-first stages
-            assert crops is None, "Non-first stage should not receive crops"
-            assert original_images is None, "Non-first stage should not receive images"
-            assert token_masks is None, "Non-first stage should not receive masks"
+            assert crops is None
+            assert original_images is None
+            assert token_masks is None
         
-        # Prepare inputs (only matters for first stage)
+        # Prepare inputs
         if self.is_first_stage:
             teacher_global_crops = crops[:2]
             student_all_crops = crops
@@ -127,46 +122,62 @@ class PipelineSchedule:
             teacher_global_crops = None
             student_all_crops = None
         
-        # All ranks participate in all communications
         if self.is_first_stage:
             print(f"[Rank {self.local_rank}] Iter {iteration}: Starting forward passes...", force=True, flush=True)
         
         # ========== Forward 1: Teacher global ==========
         with torch.no_grad():
             if self.is_first_stage:
-                teacher_output, teacher_attn_bias = self.teacher_stage(
-                    teacher_global_crops, token_masks=None
-                )
+                teacher_output, teacher_attn_bias = self.teacher_stage(teacher_global_crops, token_masks=None)
                 self._send_to_next_stage(teacher_output, teacher_attn_bias)
+                # CRITICAL: Clear immediately after send
+                del teacher_output
+                if teacher_attn_bias is not None:
+                    del teacher_attn_bias
+                torch.cuda.empty_cache()
                 print(f"[Rank {self.local_rank}] Sent teacher global to next stage", force=True, flush=True)
             elif self.is_last_stage:
                 teacher_input, teacher_attn_bias = self._recv_from_prev_stage()
                 teacher_features = self.teacher_stage(teacher_input, token_masks=None, attn_bias=teacher_attn_bias)
+                # CRITICAL: Clear input immediately
+                del teacher_input, teacher_attn_bias
+                torch.cuda.empty_cache()
                 print(f"[Rank {self.local_rank}] Computed teacher global features", force=True, flush=True)
             else:
                 teacher_input, teacher_attn_bias = self._recv_from_prev_stage()
-                teacher_output, teacher_attn_bias = self.teacher_stage(teacher_input, token_masks=None, attn_bias=teacher_attn_bias)
-                self._send_to_next_stage(teacher_output, teacher_attn_bias)
+                teacher_output, teacher_attn_bias_out = self.teacher_stage(teacher_input, token_masks=None, attn_bias=teacher_attn_bias)
+                self._send_to_next_stage(teacher_output, teacher_attn_bias_out)
+                # CRITICAL: Clear immediately after send
+                del teacher_input, teacher_attn_bias, teacher_output, teacher_attn_bias_out
+                torch.cuda.empty_cache()
                 print(f"[Rank {self.local_rank}] Forwarded teacher global", force=True, flush=True)
         
-        # **ADD BARRIER AFTER EACH PIPELINE STAGE**
         dist.barrier(group=self.pipeline_group)
         
         # ========== Forward 2: Student all crops ==========
         if self.is_first_stage:
-            student_output, student_attn_bias = self.student_stage(
-                student_all_crops, token_masks=None
-            )
+            student_output, student_attn_bias = self.student_stage(student_all_crops, token_masks=None)
             self._send_to_next_stage(student_output, student_attn_bias)
+            # CRITICAL: Clear immediately
+            del student_output
+            if student_attn_bias is not None:
+                del student_attn_bias
+            torch.cuda.empty_cache()
             print(f"[Rank {self.local_rank}] Sent student all crops to next stage", force=True, flush=True)
         elif self.is_last_stage:
             student_input, student_attn_bias = self._recv_from_prev_stage()
             student_features = self.student_stage(student_input, token_masks=None, attn_bias=student_attn_bias)
+            # CRITICAL: Clear input immediately
+            del student_input, student_attn_bias
+            torch.cuda.empty_cache()
             print(f"[Rank {self.local_rank}] Computed student all crops features", force=True, flush=True)
         else:
             student_input, student_attn_bias = self._recv_from_prev_stage()
-            student_output, student_attn_bias = self.student_stage(student_input, token_masks=None, attn_bias=student_attn_bias)
-            self._send_to_next_stage(student_output, student_attn_bias)
+            student_output, student_attn_bias_out = self.student_stage(student_input, token_masks=None, attn_bias=student_attn_bias)
+            self._send_to_next_stage(student_output, student_attn_bias_out)
+            # CRITICAL: Clear immediately
+            del student_input, student_attn_bias, student_output, student_attn_bias_out
+            torch.cuda.empty_cache()
             print(f"[Rank {self.local_rank}] Forwarded student all crops", force=True, flush=True)
         
         dist.barrier(group=self.pipeline_group)
@@ -174,43 +185,63 @@ class PipelineSchedule:
         # ========== Forward 3: Teacher iBOT ==========
         with torch.no_grad():
             if self.is_first_stage:
-                teacher_ibot_output, teacher_ibot_attn_bias = self.teacher_stage(
-                    original_images, token_masks=None
-                )
+                teacher_ibot_output, teacher_ibot_attn_bias = self.teacher_stage(original_images, token_masks=None)
                 self._send_to_next_stage(teacher_ibot_output, teacher_ibot_attn_bias)
+                # CRITICAL: Clear immediately
+                del teacher_ibot_output
+                if teacher_ibot_attn_bias is not None:
+                    del teacher_ibot_attn_bias
+                torch.cuda.empty_cache()
                 print(f"[Rank {self.local_rank}] Sent teacher iBOT to next stage", force=True, flush=True)
             elif self.is_last_stage:
                 teacher_ibot_input, teacher_ibot_attn_bias = self._recv_from_prev_stage()
                 teacher_ibot_features = self.teacher_stage(teacher_ibot_input, token_masks=None, attn_bias=teacher_ibot_attn_bias)
+                # CRITICAL: Clear input immediately
+                del teacher_ibot_input, teacher_ibot_attn_bias
+                torch.cuda.empty_cache()
                 print(f"[Rank {self.local_rank}] Computed teacher iBOT features", force=True, flush=True)
             else:
                 teacher_ibot_input, teacher_ibot_attn_bias = self._recv_from_prev_stage()
-                teacher_ibot_output, teacher_ibot_attn_bias = self.teacher_stage(teacher_ibot_input, token_masks=None, attn_bias=teacher_ibot_attn_bias)
-                self._send_to_next_stage(teacher_ibot_output, teacher_ibot_attn_bias)
+                teacher_ibot_output, teacher_ibot_attn_bias_out = self.teacher_stage(teacher_ibot_input, token_masks=None, attn_bias=teacher_ibot_attn_bias)
+                self._send_to_next_stage(teacher_ibot_output, teacher_ibot_attn_bias_out)
+                # CRITICAL: Clear immediately
+                del teacher_ibot_input, teacher_ibot_attn_bias, teacher_ibot_output, teacher_ibot_attn_bias_out
+                torch.cuda.empty_cache()
                 print(f"[Rank {self.local_rank}] Forwarded teacher iBOT", force=True, flush=True)
         
         dist.barrier(group=self.pipeline_group)
         
         # ========== Forward 4: Student iBOT ==========
         if self.is_first_stage:
-            student_ibot_output, student_ibot_attn_bias = self.student_stage(
-                original_images, token_masks=token_masks
-            )
+            student_ibot_output, student_ibot_attn_bias = self.student_stage(original_images, token_masks=token_masks)
             self._send_to_next_stage(student_ibot_output, student_ibot_attn_bias)
+            # CRITICAL: Clear immediately
+            del student_ibot_output
+            if student_ibot_attn_bias is not None:
+                del student_ibot_attn_bias
+            # Clear original images too - no longer needed
+            del original_images
+            torch.cuda.empty_cache()
             print(f"[Rank {self.local_rank}] Sent student iBOT to next stage", force=True, flush=True)
         elif self.is_last_stage:
             student_ibot_input, student_ibot_attn_bias = self._recv_from_prev_stage()
             student_ibot_features = self.student_stage(student_ibot_input, token_masks=None, attn_bias=student_ibot_attn_bias)
+            # CRITICAL: Clear input immediately
+            del student_ibot_input, student_ibot_attn_bias
+            torch.cuda.empty_cache()
             print(f"[Rank {self.local_rank}] Computed student iBOT features", force=True, flush=True)
         else:
             student_ibot_input, student_ibot_attn_bias = self._recv_from_prev_stage()
-            student_ibot_output, student_ibot_attn_bias = self.student_stage(student_ibot_input, token_masks=None, attn_bias=student_ibot_attn_bias)
-            self._send_to_next_stage(student_ibot_output, student_ibot_attn_bias)
+            student_ibot_output, student_ibot_attn_bias_out = self.student_stage(student_ibot_input, token_masks=None, attn_bias=student_ibot_attn_bias)
+            self._send_to_next_stage(student_ibot_output, student_ibot_attn_bias_out)
+            # CRITICAL: Clear immediately
+            del student_ibot_input, student_ibot_attn_bias, student_ibot_output, student_ibot_attn_bias_out
+            torch.cuda.empty_cache()
             print(f"[Rank {self.local_rank}] Forwarded student iBOT", force=True, flush=True)
         
         dist.barrier(group=self.pipeline_group)
 
-        # ========== Communicate token_masks from first to last stage ==========
+        # ========== Communicate token_masks ==========
         token_masks = self._communicate_token_masks(token_masks)
         
         # ========== Compute losses (only last stage) ==========
