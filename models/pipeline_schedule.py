@@ -84,8 +84,9 @@ class PipelineSchedule:
         self.is_middle_stage = not (self.is_first_stage or self.is_last_stage)
         
         # Communication setup
-        self.prev_rank = local_rank - 1 if local_rank > 0 else None
-        self.next_rank = local_rank + 1 if local_rank < gpus_per_node - 1 else None
+        global_rank = dist.get_rank()  # Get actual global rank
+        self.prev_rank = global_rank - 1 if local_rank > 0 else None
+        self.next_rank = global_rank + 1 if local_rank < gpus_per_node - 1 else None
         
         # Shape info for efficient communication
         self.num_tokens_per_image = 1 + num_registers + num_patches
@@ -457,7 +458,8 @@ class PipelineSchedule:
                 # Send shape first
                 B, N = token_masks.shape
                 shape_tensor = torch.tensor([B, N], dtype=torch.int64, device='cuda')
-                last_stage_rank = self.local_rank + (self.gpus_per_node - 1)
+                global_rank = dist.get_rank()
+                last_stage_rank = global_rank + (self.gpus_per_node - 1)
                 dist.send(shape_tensor, dst=last_stage_rank, group=self.pipeline_group)
                 
                 # Send masks
@@ -466,7 +468,8 @@ class PipelineSchedule:
             else:
                 # Send empty signal
                 shape_tensor = torch.tensor([0, 0], dtype=torch.int64, device='cuda')
-                last_stage_rank = self.local_rank + (self.gpus_per_node - 1)
+                global_rank = dist.get_rank()
+                last_stage_rank = global_rank + (self.gpus_per_node - 1)
                 dist.send(shape_tensor, dst=last_stage_rank, group=self.pipeline_group)
             
             return None
