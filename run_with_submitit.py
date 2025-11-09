@@ -232,7 +232,7 @@ def main():
         slurm_constraint=CONSTRAINT,
         slurm_setup=[
             f'export OMP_NUM_THREADS={CPUS_PER_TASK}',
-            f'export NCCL_DEBUG=INFO',
+            #f'export NCCL_DEBUG=INFO',
             f'export NCCL_SOCKET_IFNAME=ib,bond',
             f'export MASTER_PORT=23468',
             f'export WORLD_SIZE={NGPUS * NODES}',
@@ -287,8 +287,7 @@ def main():
     
     # Training config
     print(f"\nTraining:")
-    print(f"  Batch size per GPU: {BATCH_SIZE_PER_GPU}")
-    print(f"  Effective batch size: {BATCH_SIZE_PER_GPU * NGPUS * NODES}")
+    print(f"  Batch size per GPU/NODE: {BATCH_SIZE_PER_GPU}")
     print(f"  Total iterations: {TOTAL_ITERATIONS:,}")
     print(f"  Learning rate: {LR}")
     print(f"  Weight decay: {WEIGHT_DECAY} -> {WEIGHT_DECAY_END}")
