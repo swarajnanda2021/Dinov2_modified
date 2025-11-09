@@ -590,20 +590,20 @@ def _train_with_standard_ddp(args):
             optimizer_student.step()
         else:
             # Mixed precision: same logic
-            scaler.scale(prototype_loss).backward()
-            scaler.scale(student_loss).backward()
+            fp16_scaler.scale(prototype_loss).backward()
+            fp16_scaler.scale(student_loss).backward()
             
-            scaler.step(optimizer_prototypes)
+            fp16_scaler.step(optimizer_prototypes)
             
-            scaler.unscale_(optimizer_student)
+            fp16_scaler.unscale_(optimizer_student)
             if args.clip_grad:
                 utils.clip_gradients(student, args.clip_grad)
             
             utils.cancel_gradients_last_layer(current_iteration, student.module.classhead, args.freeze_last_layer_iters)
             utils.cancel_gradients_last_layer(current_iteration, student.module.patchhead, args.freeze_last_layer_iters)
             
-            scaler.step(optimizer_student)
-            scaler.update()
+            fp16_scaler.step(optimizer_student)
+            fp16_scaler.update()
         
         # ========== EMA update teacher ==========
         with torch.no_grad():
