@@ -146,7 +146,7 @@ class PipelineSchedule:
                 print(f"[Rank {self.local_rank}] Sent teacher global to next stage", force=True, flush=True)
             elif self.is_last_stage:
                 teacher_input, teacher_attn_bias = self._recv_from_prev_stage()
-                    teacher_features = self.teacher_stage(
+                teacher_features = self.teacher_stage(
                     teacher_input, 
                     token_masks=None, 
                     attn_bias=teacher_attn_bias,
