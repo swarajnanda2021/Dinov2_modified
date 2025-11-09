@@ -30,6 +30,9 @@ def get_args_parser():
                         help='Normalize last layer of projection head')
     parser.add_argument('--use_bn_in_head', default=False, type=utils.bool_flag,
                         help='Use batch normalization in projection head')
+    parser.add_argument('--use_sequence_packing', default=True, type=utils.bool_flag,
+                    help='Use sequence packing for efficient multi-crop processing. '
+                         'If False, processes crops sequentially (slower but uses less memory)')
 
     # ========== Flexible augmentation parameters ==========
     parser.add_argument('--global_views', default=2, type=int,

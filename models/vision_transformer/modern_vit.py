@@ -508,6 +508,48 @@ class VisionTransformer(nn.Module):
         x = self.norm(x)
         return x
 
+    def forward_features_list_unpacked(self, x, masks_list):
+        """
+        Process multiple crops WITHOUT sequence packing (sequential processing).
+        More memory efficient but slower than packed version.
+        
+        Args:
+            x: list of image tensors
+            masks_list: list of mask tensors (can be None)
+            
+        Returns:
+            List of output dictionaries, one per crop type
+        """
+        outputs = []
+        
+        for img, masks in zip(x, masks_list):
+            # Process each crop individually
+            if masks is not None:
+                x_prep = self.prepare_tokens_with_masks(img, masks)
+            else:
+                x_prep = self.prepare_tokens(img)
+            
+            x_prep = self.patch_drop(x_prep)
+            x_prep = self.norm_pre(x_prep)
+            
+            # Forward through blocks WITHOUT attention bias (regular attention)
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x_prep = checkpoint_seq(self.blocks, x_prep)
+            else:
+                for blk in self.blocks:
+                    x_prep = blk(x_prep, attn_bias=None)
+            
+            x_norm = self.norm(x_prep)
+            
+            outputs.append({
+                "clstoken": x_norm[:, 0],
+                "regtokens": x_norm[:, 1:self.numregisters+1],
+                "patchtokens": x_norm[:, self.numregisters+1:],
+                "masks": masks
+            })
+        
+        return outputs
+
     def forward_features_list(self, x, masks_list):
         """
         Process multiple crops using sequence packing.
@@ -556,13 +598,14 @@ class VisionTransformer(nn.Module):
 
         return outputs
 
-    def forward(self, x, token_masks=None):
+    def forward(self, x, token_masks=None, use_packing=True):
         """
         Forward with automatic detection of single vs multi-crop input.
         
         Args:
             x: Either single tensor [B, C, H, W] or list of tensors
             token_masks: Either None, single mask, or list of masks
+            use_packing: If True and x is list, use sequence packing. Otherwise sequential.
             
         Returns:
             - If list: List of dicts
@@ -574,9 +617,14 @@ class VisionTransformer(nn.Module):
             elif not isinstance(token_masks, list):
                 token_masks = [token_masks] + [None] * (len(x) - 1)
             
-            return self.forward_features_list(x, token_masks)
+            # Choose packed or unpacked path
+            if use_packing:
+                return self.forward_features_list(x, token_masks)
+            else:
+                return self.forward_features_list_unpacked(x, token_masks)
         
         else:
+            # Single image path unchanged
             if token_masks is not None:
                 x = self.prepare_tokens_with_masks(x, token_masks)
             else:

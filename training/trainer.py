@@ -465,11 +465,11 @@ def _train_with_standard_ddp(args):
             
             # Teacher forward (only global crops, no masking)
             with torch.no_grad():
-                teacher_output = teacher(teacher_global_crops, token_masks=None, mode='dino')
+                teacher_output = teacher(teacher_global_crops, token_masks=None, mode='dino', use_packing=args.use_sequence_packing)
                 teacher_cls_outputs = teacher_output['cls_outputs']  # [B*2, out_dim]
             
             # Student forward (all crops, packed together)
-            student_output = student(student_all_crops, token_masks=None, mode='dino')
+            student_output = student(student_all_crops, token_masks=None, mode='dino', use_packing=args.use_sequence_packing)
             student_cls_outputs = student_output['cls_outputs']  # [B*total_views, out_dim]
             
             # Debug shapes on first iteration
@@ -513,11 +513,11 @@ def _train_with_standard_ddp(args):
             
             # Teacher forward (no masking)
             with torch.no_grad():
-                teacher_ibot_output = teacher(original_images, token_masks=None, mode='ibot')
+                teacher_ibot_output = teacher(original_images, token_masks=None, mode='ibot', use_packing=args.use_sequence_packing)
                 teacher_patch_outputs = teacher_ibot_output['patch_outputs']  # [B, N, out_dim]
             
             # Student forward (with masking)
-            student_ibot_output = student(original_images, token_masks=random_token_masks, mode='ibot')
+            student_ibot_output = student(original_images, token_masks=random_token_masks, mode='ibot', use_packing=args.use_sequence_packing)
             student_patch_outputs = student_ibot_output['patch_outputs']  # [B, N, out_dim]
             
             # Debug shapes on first iteration
@@ -864,6 +864,7 @@ def _train_with_pipeline_parallelism(args):
         embed_dim=args.embeddingdim,
         num_patches=196,
         num_registers=4,
+        use_packing=args.use_sequence_packing,
         debug=False,
     )
     

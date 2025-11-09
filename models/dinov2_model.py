@@ -42,7 +42,8 @@ class CombinedModelDINO(nn.Module):
         else:
             print(f"⚠ Warning: Backbone does not support gradient checkpointing")
 
-    def forward(self, crops, token_masks=None, mode='dino'):
+        
+    def forward(self, crops, token_masks=None, mode='dino', use_packing=True):
         """
         Unified forward supporting both DINO and iBOT modes.
         
@@ -55,6 +56,7 @@ class CombinedModelDINO(nn.Module):
                 - Single mask tensor [B, N] for iBOT
                 - None for no masking
             mode: 'dino' or 'ibot' (mostly for clarity)
+            use_packing: Whether to use sequence packing for multi-crop
         
         Returns:
             Dictionary with keys depending on mode:
@@ -74,9 +76,8 @@ class CombinedModelDINO(nn.Module):
                 # Single mask provided, assume it's for first crop
                 token_masks = [token_masks] + [None] * (len(crops) - 1)
             
-            # Forward through backbone with packing
-            # backbone.forward() will detect list and call forward_features_list()
-            outputs_list = self.backbone(crops, token_masks=token_masks)
+            # Forward through backbone with optional packing
+            outputs_list = self.backbone(crops, token_masks=token_masks, use_packing=use_packing)
             # outputs_list: [{'clstoken': [B,D], 'patchtokens': [B,N,D], ...}, ...]
             
             # Collect all CLS tokens and apply head
@@ -99,8 +100,8 @@ class CombinedModelDINO(nn.Module):
             # ========== SINGLE IMAGE MODE (iBOT) ==========
             # crops is a single tensor [B, C, H, W]
             
-            # Forward through backbone
-            output_dict = self.backbone(crops, token_masks=token_masks)
+            # Forward through backbone (no packing needed for single image)
+            output_dict = self.backbone(crops, token_masks=token_masks, use_packing=False)
             # output_dict: {'clstoken': [B,D], 'patchtokens': [B,N,D], ...}
             
             # Apply heads

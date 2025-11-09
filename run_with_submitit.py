@@ -39,6 +39,7 @@ VIT_DEPTH = 12
 
 # --- Pipeline Parallel (alternative to standard DDP) ---
 USE_PIPELINE_PARALLEL = False
+USE_SEQUENCE_PACKING = True
 MODEL_SIZE = 'base'                # 'base', 'large', 'huge', 'giant', 'giant2b'
 GPUS_PER_NODE = NGPUS              # Must match NGPUS if using pipeline parallel
 NUM_NODES = NODES                  # Must match NODES if using pipeline parallel
@@ -160,6 +161,7 @@ def main():
     args.vitdepth = VIT_DEPTH
     
     args.use_pipeline_parallel = USE_PIPELINE_PARALLEL
+    args.use_sequence_packing = USE_SEQUENCE_PACKING
     args.model_size = MODEL_SIZE
     args.gpus_per_node = GPUS_PER_NODE if USE_PIPELINE_PARALLEL else NGPUS
     args.num_nodes = NUM_NODES if USE_PIPELINE_PARALLEL else NODES

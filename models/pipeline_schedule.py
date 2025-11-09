@@ -60,6 +60,7 @@ class PipelineSchedule:
         embed_dim: int = 768,
         num_patches: int = 196,
         num_registers: int = 4,
+        use_packing: bool = True, 
         debug: bool = False,
     ):
         self.student_stage = student_stage
@@ -94,6 +95,8 @@ class PipelineSchedule:
         if self.debug:
             print(f"[Rank {local_rank}] Pipeline schedule initialized", force=True, flush=True)
             print(f"  Tokens/image: {self.num_tokens_per_image}, embed_dim: {embed_dim}", force=True, flush=True)
+            print(f"  Using sequence packing: {use_packing}", force=True, flush=True)  
+
     
     def forward_pass(
         self,

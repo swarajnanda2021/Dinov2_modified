@@ -340,9 +340,15 @@ class PipelineStageWrapper(nn.Module):
         
         return x
 
-    def forward(self, x, token_masks=None, attn_bias=None):
+    def forward(self, x, token_masks=None, attn_bias=None, use_packing=True):
         """
         Forward through this pipeline stage.
+        
+        Args:
+            x: Input - either single tensor, list of tensors, or packed tensor
+            token_masks: Optional token masks
+            attn_bias: Attention bias for packed sequences (only used if use_packing=True)
+            use_packing: Whether sequence packing is being used
         
         Returns:
         - First/middle stages: (processed_features, attn_bias) tuple
@@ -353,7 +359,7 @@ class PipelineStageWrapper(nn.Module):
         # ========== FIRST STAGE ==========
         if self.local_rank == 0:
             if is_multi_crop:
-                # Multi-crop: pack sequences
+                # Multi-crop: prepare tokens for each crop
                 x_processed = []
                 
                 for crop in x:
@@ -365,14 +371,24 @@ class PipelineStageWrapper(nn.Module):
                         tokens = self.backbone.prepare_tokens(crop)
                     x_processed.append(tokens)
                 
-                # Create attention bias for sequence packing
-                from models.vision_transformer.modern_vit import get_attn_bias_and_cat
-                attn_bias, x_cat = get_attn_bias_and_cat(x_processed)
-                self._cached_attn_bias = attn_bias
-                
-                x_cat = self._apply_blocks_with_checkpointing(x_cat, attn_bias)
-                
-                return x_cat, attn_bias
+                if use_packing:
+                    # PACKED PATH: Concatenate and create attention bias
+                    from models.vision_transformer.modern_vit import get_attn_bias_and_cat
+                    attn_bias, x_cat = get_attn_bias_and_cat(x_processed)
+                    self._cached_attn_bias = attn_bias
+                    
+                    # Process packed sequence
+                    x_cat = self._apply_blocks_with_checkpointing(x_cat, attn_bias)
+                    
+                    return x_cat, attn_bias
+                else:
+                    # UNPACKED PATH: Process each crop sequentially
+                    x_outputs = []
+                    for x_prep in x_processed:
+                        x_out = self._apply_blocks_with_checkpointing(x_prep, attn_bias=None)
+                        x_outputs.append(x_out)
+                    
+                    return x_outputs, None  # No attn_bias for unpacked
                 
             else:
                 # Single image
@@ -388,15 +404,20 @@ class PipelineStageWrapper(nn.Module):
         # ========== LAST STAGE ==========
         elif self.has_heads:
             if is_multi_crop or attn_bias is not None:
-                # Packed multi-crop case
-                x = self._apply_blocks_with_checkpointing(x, attn_bias)
-                x = self.backbone.norm(x)
-                
-                # Unpack sequences
-                if attn_bias is not None:
+                if use_packing and attn_bias is not None:
+                    # PACKED PATH: x is a single packed tensor, need to unpack
+                    x = self._apply_blocks_with_checkpointing(x, attn_bias)
+                    x = self.backbone.norm(x)
+                    
+                    # Unpack sequences
                     outputs_list = attn_bias.split(x)
                 else:
-                    outputs_list = [x]
+                    # UNPACKED PATH: x is a list of tensors
+                    outputs_list = []
+                    for x_single in x:
+                        x_out = self._apply_blocks_with_checkpointing(x_single, attn_bias=None)
+                        x_out = self.backbone.norm(x_out)
+                        outputs_list.append(x_out)
                 
                 # Extract features and apply heads
                 results = []
@@ -438,5 +459,19 @@ class PipelineStageWrapper(nn.Module):
         
         # ========== MIDDLE STAGE ==========
         else:
-            x = self._apply_blocks_with_checkpointing(x, attn_bias)
-            return x, attn_bias
+            if is_multi_crop:
+                if use_packing and attn_bias is not None:
+                    # PACKED PATH: x is single packed tensor
+                    x = self._apply_blocks_with_checkpointing(x, attn_bias)
+                    return x, attn_bias
+                else:
+                    # UNPACKED PATH: x is list of tensors
+                    x_outputs = []
+                    for x_single in x:
+                        x_out = self._apply_blocks_with_checkpointing(x_single, attn_bias=None)
+                        x_outputs.append(x_out)
+                    return x_outputs, None
+            else:
+                # Single image
+                x = self._apply_blocks_with_checkpointing(x, attn_bias=None)
+                return x, None
