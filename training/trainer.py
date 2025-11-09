@@ -555,31 +555,41 @@ def train_dinov2(args):
                 koleo_proto_loss
             )
         
-        # ========== Backward for prototypes ==========
+        # ==========  Do BOTH backwards BEFORE any optimizer steps ==========
         if fp16_scaler is None:
+            # Backward for both losses first
             prototype_loss.backward()
-            optimizer_prototypes.step()
-        else:
-            fp16_scaler.scale(prototype_loss).backward()
-            fp16_scaler.step(optimizer_prototypes)
-        
-        # ========== Backward and optimize student ==========
-        if fp16_scaler is None:
             student_loss.backward()
+            
+            # Now step optimizers
+            optimizer_prototypes.step()
+            
+            # Gradient clipping
             if args.clip_grad:
                 utils.clip_gradients(student, args.clip_grad)
+            
+            # Cancel last layer gradients
             utils.cancel_gradients_last_layer(current_iteration, student.module.classhead, args.freeze_last_layer_iters)
             utils.cancel_gradients_last_layer(current_iteration, student.module.patchhead, args.freeze_last_layer_iters)
+            
             optimizer_student.step()
         else:
+            # Mixed precision: same logic
+            fp16_scaler.scale(prototype_loss).backward()
             fp16_scaler.scale(student_loss).backward()
+            
+            fp16_scaler.step(optimizer_prototypes)
+            
+            fp16_scaler.unscale_(optimizer_student)
             if args.clip_grad:
-                fp16_scaler.unscale_(optimizer_student)
                 utils.clip_gradients(student, args.clip_grad)
+            
             utils.cancel_gradients_last_layer(current_iteration, student.module.classhead, args.freeze_last_layer_iters)
             utils.cancel_gradients_last_layer(current_iteration, student.module.patchhead, args.freeze_last_layer_iters)
+            
             fp16_scaler.step(optimizer_student)
             fp16_scaler.update()
+        
         
         # ========== EMA update teacher ==========
         with torch.no_grad():
