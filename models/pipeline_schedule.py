@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 from utils import get_module
 
 try:
@@ -375,53 +375,84 @@ class PipelineSchedule:
     
     def _send_to_next_stage(
         self, 
-        tensor: torch.Tensor, 
+        data: Union[torch.Tensor, List[torch.Tensor]], 
         attn_bias: Optional[Any] = None
     ):
-        """Send tensor and attention bias to next stage."""
+        """
+        Send data and attention bias to next stage.
+        Handles both packed (single tensor) and unpacked (list of tensors) cases.
+        """
         if self.next_rank is None:
             return
         
-        print(f"[Rank {self.local_rank}] Attempting send to rank {self.next_rank}, tensor shape: {tensor.shape}", 
-          force=True, flush=True)
-
-        device = tensor.device
+        device = 'cuda'
         
-        # 1. Send tensor shape
-        shape_tensor = torch.tensor(list(tensor.shape), dtype=torch.int64, device=device)
-        dist.send(shape_tensor, dst=self.next_rank, group=self.pipeline_group)
+        # Determine if data is packed or unpacked
+        is_list = isinstance(data, list)
         
-        # 2. Send tensor
-        dist.send(tensor.contiguous(), dst=self.next_rank, group=self.pipeline_group)
+        # 1. Send whether data is a list
+        is_list_flag = torch.tensor([1 if is_list else 0], dtype=torch.int64, device=device)
+        dist.send(is_list_flag, dst=self.next_rank, group=self.pipeline_group)
         
-        # 3. Send attn_bias flag
-        has_attn_bias = 1 if attn_bias is not None else 0
-        flag_tensor = torch.tensor([has_attn_bias], dtype=torch.int64, device=device)
-        dist.send(flag_tensor, dst=self.next_rank, group=self.pipeline_group)
-        
-        # 4. Send attn_bias metadata if exists
-        if attn_bias is not None:
-            seqlens = self._extract_seqlens_from_attn_bias(attn_bias)
+        if is_list:
+            # UNPACKED CASE: Send multiple tensors
+            num_tensors = len(data)
+            num_tensors_tensor = torch.tensor([num_tensors], dtype=torch.int64, device=device)
+            dist.send(num_tensors_tensor, dst=self.next_rank, group=self.pipeline_group)
             
-            num_seqlens_tensor = torch.tensor([len(seqlens)], dtype=torch.int64, device=device)
-            dist.send(num_seqlens_tensor, dst=self.next_rank, group=self.pipeline_group)
-            
-            seqlens_tensor = torch.tensor(seqlens, dtype=torch.int64, device=device)
-            dist.send(seqlens_tensor, dst=self.next_rank, group=self.pipeline_group)
-            
-            batch_sizes = getattr(attn_bias, '_batch_sizes', None)
-            if batch_sizes is not None:
-                num_batch_sizes_tensor = torch.tensor([len(batch_sizes)], dtype=torch.int64, device=device)
-                dist.send(num_batch_sizes_tensor, dst=self.next_rank, group=self.pipeline_group)
+            # Send each tensor
+            for tensor in data:
+                # Send shape
+                shape_tensor = torch.tensor(list(tensor.shape), dtype=torch.int64, device=device)
+                dist.send(shape_tensor, dst=self.next_rank, group=self.pipeline_group)
                 
-                batch_sizes_tensor = torch.tensor(batch_sizes, dtype=torch.int64, device=device)
-                dist.send(batch_sizes_tensor, dst=self.next_rank, group=self.pipeline_group)
-            else:
-                num_batch_sizes_tensor = torch.tensor([0], dtype=torch.int64, device=device)
-                dist.send(num_batch_sizes_tensor, dst=self.next_rank, group=self.pipeline_group)
+                # Send tensor data
+                dist.send(tensor.contiguous(), dst=self.next_rank, group=self.pipeline_group)
+            
+            # attn_bias should be None for unpacked
+            has_attn_bias = 0
+            flag_tensor = torch.tensor([has_attn_bias], dtype=torch.int64, device=device)
+            dist.send(flag_tensor, dst=self.next_rank, group=self.pipeline_group)
+            
+        else:
+            # PACKED CASE: Send single tensor (original logic)
+            tensor = data
+            
+            # Send shape
+            shape_tensor = torch.tensor(list(tensor.shape), dtype=torch.int64, device=device)
+            dist.send(shape_tensor, dst=self.next_rank, group=self.pipeline_group)
+            
+            # Send tensor
+            dist.send(tensor.contiguous(), dst=self.next_rank, group=self.pipeline_group)
+            
+            # Send attn_bias metadata
+            has_attn_bias = 1 if attn_bias is not None else 0
+            flag_tensor = torch.tensor([has_attn_bias], dtype=torch.int64, device=device)
+            dist.send(flag_tensor, dst=self.next_rank, group=self.pipeline_group)
+            
+            if attn_bias is not None:
+                seqlens = self._extract_seqlens_from_attn_bias(attn_bias)
+                
+                num_seqlens_tensor = torch.tensor([len(seqlens)], dtype=torch.int64, device=device)
+                dist.send(num_seqlens_tensor, dst=self.next_rank, group=self.pipeline_group)
+                
+                seqlens_tensor = torch.tensor(seqlens, dtype=torch.int64, device=device)
+                dist.send(seqlens_tensor, dst=self.next_rank, group=self.pipeline_group)
+                
+                batch_sizes = getattr(attn_bias, '_batch_sizes', None)
+                if batch_sizes is not None:
+                    num_batch_sizes_tensor = torch.tensor([len(batch_sizes)], dtype=torch.int64, device=device)
+                    dist.send(num_batch_sizes_tensor, dst=self.next_rank, group=self.pipeline_group)
+                    
+                    batch_sizes_tensor = torch.tensor(batch_sizes, dtype=torch.int64, device=device)
+                    dist.send(batch_sizes_tensor, dst=self.next_rank, group=self.pipeline_group)
+                else:
+                    num_batch_sizes_tensor = torch.tensor([0], dtype=torch.int64, device=device)
+                    dist.send(num_batch_sizes_tensor, dst=self.next_rank, group=self.pipeline_group)
         
-        print(f"[Rank {self.local_rank}] Send complete to rank {self.next_rank}", force=True, flush=True)
-
+        if self.debug:
+            print(f"[Rank {self.local_rank}] Send complete to rank {self.next_rank}, is_list={is_list}", 
+                force=True, flush=True)
 
     def _send_all_outputs_to_next_stage(
         self,
@@ -457,57 +488,93 @@ class PipelineSchedule:
                 teacher_ibot_input, teacher_ibot_attn_bias,
                 student_ibot_input, student_ibot_attn_bias)
     
-    def _recv_from_prev_stage(self) -> Tuple[torch.Tensor, Optional[Any]]:
-        """Receive tensor and attention bias from previous stage."""
+    def _recv_from_prev_stage(self) -> Tuple[Union[torch.Tensor, List[torch.Tensor]], Optional[Any]]:
+        """
+        Receive data and attention bias from previous stage.
+        Handles both packed and unpacked cases.
+        """
         if self.prev_rank is None:
             raise RuntimeError("Cannot receive - no previous stage")
         
-        print(f"[Rank {self.local_rank}] Waiting to receive from rank {self.prev_rank}", 
-          force=True, flush=True)
-        
         device = torch.cuda.current_device()
         
-        # 1. Receive tensor shape
-        shape_tensor = torch.empty(3, dtype=torch.int64, device=device)
-        dist.recv(shape_tensor, src=self.prev_rank, group=self.pipeline_group)
-        tensor_shape = tuple(shape_tensor.tolist())
+        # 1. Receive whether data is a list
+        is_list_flag = torch.empty(1, dtype=torch.int64, device=device)
+        dist.recv(is_list_flag, src=self.prev_rank, group=self.pipeline_group)
+        is_list = (is_list_flag.item() == 1)
         
-        # 2. Receive tensor
-        tensor = torch.empty(tensor_shape, dtype=torch.float32, device=device)
-        dist.recv(tensor, src=self.prev_rank, group=self.pipeline_group)
-        
-        # 3. Receive attn_bias flag
-        flag_tensor = torch.empty(1, dtype=torch.int64, device=device)
-        dist.recv(flag_tensor, src=self.prev_rank, group=self.pipeline_group)
-        has_attn_bias = flag_tensor.item()
-        
-        # 4. Receive attn_bias metadata if exists
-        attn_bias = None
-        if has_attn_bias:
-            num_seqlens_tensor = torch.empty(1, dtype=torch.int64, device=device)
-            dist.recv(num_seqlens_tensor, src=self.prev_rank, group=self.pipeline_group)
-            num_seqlens = num_seqlens_tensor.item()
+        if is_list:
+            # UNPACKED CASE: Receive multiple tensors
+            num_tensors_tensor = torch.empty(1, dtype=torch.int64, device=device)
+            dist.recv(num_tensors_tensor, src=self.prev_rank, group=self.pipeline_group)
+            num_tensors = num_tensors_tensor.item()
             
-            seqlens_tensor = torch.empty(num_seqlens, dtype=torch.int64, device=device)
-            dist.recv(seqlens_tensor, src=self.prev_rank, group=self.pipeline_group)
-            seqlens = seqlens_tensor.tolist()
+            tensors = []
+            for _ in range(num_tensors):
+                # Receive shape
+                shape_tensor = torch.empty(3, dtype=torch.int64, device=device)
+                dist.recv(shape_tensor, src=self.prev_rank, group=self.pipeline_group)
+                tensor_shape = tuple(shape_tensor.tolist())
+                
+                # Receive tensor
+                tensor = torch.empty(tensor_shape, dtype=torch.float32, device=device)
+                dist.recv(tensor, src=self.prev_rank, group=self.pipeline_group)
+                tensors.append(tensor)
             
-            num_batch_sizes_tensor = torch.empty(1, dtype=torch.int64, device=device)
-            dist.recv(num_batch_sizes_tensor, src=self.prev_rank, group=self.pipeline_group)
-            num_batch_sizes = num_batch_sizes_tensor.item()
+            # Receive attn_bias flag (should be 0 for unpacked)
+            flag_tensor = torch.empty(1, dtype=torch.int64, device=device)
+            dist.recv(flag_tensor, src=self.prev_rank, group=self.pipeline_group)
             
-            batch_sizes = None
-            if num_batch_sizes > 0:
-                batch_sizes_tensor = torch.empty(num_batch_sizes, dtype=torch.int64, device=device)
-                dist.recv(batch_sizes_tensor, src=self.prev_rank, group=self.pipeline_group)
-                batch_sizes = batch_sizes_tensor.tolist()
+            if self.debug:
+                print(f"[Rank {self.local_rank}] Received {num_tensors} tensors (unpacked)", 
+                    force=True, flush=True)
             
-            attn_bias = self._reconstruct_attn_bias(seqlens, batch_sizes)
-        
-        print(f"[Rank {self.local_rank}] Receive complete from rank {self.prev_rank}, shape: {tensor_shape}", 
-          force=True, flush=True)
-        
-        return tensor, attn_bias
+            return tensors, None
+            
+        else:
+            # PACKED CASE: Receive single tensor (original logic)
+            # Receive tensor shape
+            shape_tensor = torch.empty(3, dtype=torch.int64, device=device)
+            dist.recv(shape_tensor, src=self.prev_rank, group=self.pipeline_group)
+            tensor_shape = tuple(shape_tensor.tolist())
+            
+            # Receive tensor
+            tensor = torch.empty(tensor_shape, dtype=torch.float32, device=device)
+            dist.recv(tensor, src=self.prev_rank, group=self.pipeline_group)
+            
+            # Receive attn_bias flag
+            flag_tensor = torch.empty(1, dtype=torch.int64, device=device)
+            dist.recv(flag_tensor, src=self.prev_rank, group=self.pipeline_group)
+            has_attn_bias = flag_tensor.item()
+            
+            # Receive attn_bias metadata if exists
+            attn_bias = None
+            if has_attn_bias:
+                num_seqlens_tensor = torch.empty(1, dtype=torch.int64, device=device)
+                dist.recv(num_seqlens_tensor, src=self.prev_rank, group=self.pipeline_group)
+                num_seqlens = num_seqlens_tensor.item()
+                
+                seqlens_tensor = torch.empty(num_seqlens, dtype=torch.int64, device=device)
+                dist.recv(seqlens_tensor, src=self.prev_rank, group=self.pipeline_group)
+                seqlens = seqlens_tensor.tolist()
+                
+                num_batch_sizes_tensor = torch.empty(1, dtype=torch.int64, device=device)
+                dist.recv(num_batch_sizes_tensor, src=self.prev_rank, group=self.pipeline_group)
+                num_batch_sizes = num_batch_sizes_tensor.item()
+                
+                batch_sizes = None
+                if num_batch_sizes > 0:
+                    batch_sizes_tensor = torch.empty(num_batch_sizes, dtype=torch.int64, device=device)
+                    dist.recv(batch_sizes_tensor, src=self.prev_rank, group=self.pipeline_group)
+                    batch_sizes = batch_sizes_tensor.tolist()
+                
+                attn_bias = self._reconstruct_attn_bias(seqlens, batch_sizes)
+            
+            if self.debug:
+                print(f"[Rank {self.local_rank}] Received single tensor (packed), shape: {tensor_shape}", 
+                    force=True, flush=True)
+            
+            return tensor, attn_bias
     
     def _extract_seqlens_from_attn_bias(self, attn_bias) -> List[int]:
         """Extract sequence lengths from BlockDiagonalMask."""
