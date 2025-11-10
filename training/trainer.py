@@ -182,7 +182,10 @@ def train_dinov2(args):
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
-    
+    teacher.load_state_dict(student.state_dict())  
+    for param in teacher.parameters():
+        param.requires_grad = False
+        
     # Apply FSDP2 wrapping (in-place modification)
     student, teacher = apply_fsdp_wrapping(student, teacher, args)
 
