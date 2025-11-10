@@ -586,36 +586,28 @@ def train_dinov2(args):
             m = momentum_schedule[current_iteration]
             
             # Build parameter lists once and cache them
-            if not hasattr(train_dinov2, '_ema_param_lists_backbone'):
-                student_backbone_params = list(student.backbone.parameters())
-                teacher_backbone_params = list(teacher.backbone.parameters())
+            if not hasattr(train_dinov2, '_ema_param_lists'):
+                student_param_list = []
+                teacher_param_list = []
                 
-                student_classhead_params = list(student.classhead.parameters())
-                teacher_classhead_params = list(teacher.classhead.parameters())
+                # Collect ALL parameters from all components
+                for k in ['backbone', 'classhead', 'patchhead']:
+                    for student_param, teacher_param in zip(
+                        getattr(student, k).parameters(),
+                        getattr(teacher, k).parameters()
+                    ):
+                        student_param_list.append(student_param)
+                        teacher_param_list.append(teacher_param)
                 
-                student_patchhead_params = list(student.patchhead.parameters())
-                teacher_patchhead_params = list(teacher.patchhead.parameters())
-                
-                # Cache for next iterations
-                train_dinov2._ema_param_lists_backbone = (student_backbone_params, teacher_backbone_params)
-                train_dinov2._ema_param_lists_classhead = (student_classhead_params, teacher_classhead_params)
-                train_dinov2._ema_param_lists_patchhead = (student_patchhead_params, teacher_patchhead_params)
+                # Cache for future iterations
+                train_dinov2._ema_param_lists = (student_param_list, teacher_param_list)
+                print(f"[Rank {dist.get_rank()}] Cached {len(student_param_list)} parameters for EMA")
             else:
-                student_backbone_params, teacher_backbone_params = train_dinov2._ema_param_lists_backbone
-                student_classhead_params, teacher_classhead_params = train_dinov2._ema_param_lists_classhead
-                student_patchhead_params, teacher_patchhead_params = train_dinov2._ema_param_lists_patchhead
+                student_param_list, teacher_param_list = train_dinov2._ema_param_lists
             
-            # Update backbone - FSDP2-compatible atomic update
-            for teacher_param, student_param in zip(teacher_backbone_params, student_backbone_params):
-                teacher_param.data.copy_(teacher_param.data * m + student_param.data * (1.0 - m))
-
-            # Update classhead
-            for teacher_param, student_param in zip(teacher_classhead_params, student_classhead_params):
-                teacher_param.data.copy_(teacher_param.data * m + student_param.data * (1.0 - m))
-
-            # Update patchhead
-            for teacher_param, student_param in zip(teacher_patchhead_params, student_patchhead_params):
-                teacher_param.data.copy_(teacher_param.data * m + student_param.data * (1.0 - m))
+            # Use vectorized operations that are FSDP2-compatible
+            torch._foreach_mul_(teacher_param_list, m)
+            torch._foreach_add_(teacher_param_list, student_param_list, alpha=1.0 - m)
         
         # ========== Clean cache periodically ==========
         if current_iteration % 100 == 0:
