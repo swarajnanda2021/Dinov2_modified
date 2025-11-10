@@ -28,65 +28,80 @@ def save_checkpoint_fsdp2(
     fp16_scaler=None,
 ):
     """
-    Save FSDP2 checkpoint using DCP.
-    
-    Args:
-        ckpt_dir: Directory to save checkpoint
-        iteration: Current iteration
-        student: FSDP2-wrapped student model
-        teacher: FSDP2-wrapped teacher model
-        prototype_bank: DDP-wrapped prototype bank
-        optimizer_student: Student optimizer
-        optimizer_prototypes: Prototype optimizer
-        args: Training arguments
-        dino_class_loss: DINO loss state
-        patch_prototype_loss: Prototype loss state
-        fp16_scaler: Optional gradient scaler
+    Save FSDP2 checkpoint using DCP with better error handling.
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
     
-    # Create temp directory
+    # Debug print
+    print(f"[Rank {rank}] Starting checkpoint save at iteration {iteration}")
+    
+    # Create checkpoint directory if it doesn't exist
     ckpt_dir = Path(ckpt_dir)
-    ckpt_dir.parent.mkdir(parents=True, exist_ok=True)
-    ckpt_dir_tmp = Path(tempfile.mkdtemp(dir=ckpt_dir.parent, prefix=f"{ckpt_dir.name}_"))
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
     
-    # Prepare state dict
-    to_save = {
-        "iteration": iteration,
-        "student": get_model_state_dict(student),
-        "teacher": get_model_state_dict(teacher),
-        "prototype_bank": prototype_bank.state_dict(),  # Regular DDP state dict
-        "optimizer_student": get_optimizer_state_dict(student, optimizer_student),
-        "optimizer_prototypes": optimizer_prototypes.state_dict(),
-        "args": args,
-    }
+    # Use iteration number in the checkpoint name to avoid overwrites
+    ckpt_path = ckpt_dir / f"iter_{iteration}"
     
-    # Add optional components
-    if dino_class_loss is not None:
-        to_save["dino_class_loss"] = dino_class_loss.state_dict()
-    if patch_prototype_loss is not None:
-        to_save["patch_prototype_loss"] = patch_prototype_loss.state_dict()
-    if fp16_scaler is not None:
-        to_save["fp16_scaler"] = fp16_scaler.state_dict()
+    try:
+        # Prepare state dict - handle FSDP2 and DDP models differently
+        print(f"[Rank {rank}] Preparing state dicts...")
+        
+        to_save = {
+            "iteration": iteration,
+            "args": vars(args) if hasattr(args, '__dict__') else args,
+        }
+        
+        # FSDP2 models - use DCP state dict functions
+        print(f"[Rank {rank}] Getting FSDP2 model states...")
+        to_save["student"] = get_model_state_dict(student)
+        to_save["teacher"] = get_model_state_dict(teacher)
+        
+        print(f"[Rank {rank}] Getting optimizer states...")
+        to_save["optimizer_student"] = get_optimizer_state_dict(student, optimizer_student)
+        
+        # DDP model - use regular state dict
+        print(f"[Rank {rank}] Getting prototype bank state...")
+        to_save["prototype_bank"] = prototype_bank.state_dict()
+        to_save["optimizer_prototypes"] = optimizer_prototypes.state_dict()
+        
+        # Optional components
+        if dino_class_loss is not None:
+            to_save["dino_class_loss"] = dino_class_loss.state_dict()
+        if patch_prototype_loss is not None:
+            to_save["patch_prototype_loss"] = patch_prototype_loss.state_dict()
+        if fp16_scaler is not None:
+            to_save["fp16_scaler"] = fp16_scaler.state_dict()
+        
+        # Save with DCP
+        print(f"[Rank {rank}] Calling DCP save to {ckpt_path}...")
+        dcp.save(
+            to_save,
+            storage_writer=FileSystemWriter(str(ckpt_path)),
+        )
+        
+        print(f"[Rank {rank}] DCP save completed")
+        
+        # Clean up old checkpoints (keep only last 3)
+        if rank == 0:
+            existing_checkpoints = sorted(ckpt_dir.glob("iter_*"))
+            if len(existing_checkpoints) > 3:
+                for old_ckpt in existing_checkpoints[:-3]:
+                    import shutil
+                    shutil.rmtree(old_ckpt)
+                    print(f"Removed old checkpoint: {old_ckpt}")
+        
+    except Exception as e:
+        print(f"[Rank {rank}] ERROR during checkpoint save: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
     
-    # Save with DCP
-    dcp.save(
-        to_save,
-        storage_writer=FileSystemWriter(ckpt_dir_tmp),
-    )
-    
-    # Atomically rename temp to final
-    if rank == 0:
-        if ckpt_dir.exists():
-            import shutil
-            shutil.rmtree(ckpt_dir)
-        ckpt_dir_tmp.rename(ckpt_dir)
-    
+    # Synchronize all ranks
     if dist.is_initialized():
+        print(f"[Rank {rank}] Waiting at barrier...")
         dist.barrier()
     
-    print(f"[Rank {rank}] Saved FSDP2 checkpoint at iteration {iteration}")
-
+    print(f"[Rank {rank}] Checkpoint save completed successfully")
 
 def load_checkpoint_fsdp2(
     ckpt_dir,

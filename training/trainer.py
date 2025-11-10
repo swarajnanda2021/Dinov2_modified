@@ -653,7 +653,11 @@ def train_dinov2(args):
                 f.write(json.dumps(log_stats) + "\n")
         
         # ========== Save checkpoints ==========
-        if current_iteration % args.save_checkpoint_freq == 0:
+        # Don't save at iteration 0, and add better logging
+        if current_iteration > 0 and current_iteration % args.save_checkpoint_freq == 0:
+            if utils.is_main_process():
+                print(f"Preparing to save checkpoint at iteration {current_iteration}...")
+            
             checkpoint_dir = os.path.join(args.output_dir, "checkpoint_fsdp2")
             save_checkpoint_fsdp2(
                 checkpoint_dir,
@@ -668,6 +672,9 @@ def train_dinov2(args):
                 patch_prototype_loss=patch_prototype_loss,
                 fp16_scaler=fp16_scaler,
             )
+            
+            if utils.is_main_process():
+                print(f"Checkpoint saved successfully at iteration {current_iteration}")
         
         current_iteration += 1
 
