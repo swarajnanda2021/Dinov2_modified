@@ -17,7 +17,6 @@ def get_mixed_precision_policy():
         reduce_dtype=torch.bfloat16,
     )
 
-
 def apply_fsdp_wrapping(student, teacher, args):
     """
     Apply FSDP2 wrapping to student and teacher models.
@@ -50,19 +49,23 @@ def apply_fsdp_wrapping(student, teacher, args):
     teacher_module = teacher.module
     
     # ========== STUDENT BACKBONE ==========
-    # Wrap each transformer block
+    # Wrap each transformer block with FSDP first
     blocks = list(student_module.backbone.blocks)
     for block_id in range(len(blocks)):
         blocks[block_id] = fully_shard(blocks[block_id], **fsdp_config)
-        if hasattr(args, 'grad_checkpointing') and args.grad_checkpointing:
-            # Apply activation checkpointing
-            from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
-            blocks[block_id] = checkpoint_wrapper(blocks[block_id])
     
-    # Set up prefetching between consecutive blocks
-    for prev_block, next_block in zip(blocks[:-1], blocks[1:]):
-        prev_block.set_modules_to_forward_prefetch([next_block])
-        next_block.set_modules_to_backward_prefetch([prev_block])
+    # Apply gradient checkpointing AFTER FSDP wrapping if enabled
+    if hasattr(args, 'grad_checkpointing') and args.grad_checkpointing:
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+        for block_id in range(len(blocks)):
+            blocks[block_id] = checkpoint_wrapper(blocks[block_id])
+        print(f"[Rank {dist.get_rank()}] Applied gradient checkpointing to student blocks")
+    else:
+        # Only set up prefetching if NOT using gradient checkpointing
+        # Prefetching doesn't work with checkpoint_wrapper
+        for prev_block, next_block in zip(blocks[:-1], blocks[1:]):
+            prev_block.set_modules_to_forward_prefetch([next_block])
+            next_block.set_modules_to_backward_prefetch([prev_block])
     
     # Wrap the entire backbone
     student_module.backbone = fully_shard(student_module.backbone, **fsdp_config)
@@ -79,10 +82,11 @@ def apply_fsdp_wrapping(student, teacher, args):
     for block_id in range(len(teacher_blocks)):
         teacher_blocks[block_id] = fully_shard(teacher_blocks[block_id], **fsdp_config)
     
-    # Set up prefetching
+    # Teacher doesn't need gradient checkpointing (no gradients)
+    # Only set up prefetching for teacher
     for prev_block, next_block in zip(teacher_blocks[:-1], teacher_blocks[1:]):
         prev_block.set_modules_to_forward_prefetch([next_block])
-        next_block.set_modules_to_backward_prefetch([prev_block])
+        # No backward prefetch for teacher (inference only)
     
     # Wrap the entire backbone
     teacher_module.backbone = fully_shard(teacher_module.backbone, **fsdp_config)
@@ -98,7 +102,7 @@ def apply_fsdp_wrapping(student, teacher, args):
     
     return student_module, teacher_module
 
-
+    
 def _enable_inference_mode_resharding(model):
     """Enable immediate resharding after forward for inference-only models."""
     from torch.distributed._composable.fsdp import FSDPModule
