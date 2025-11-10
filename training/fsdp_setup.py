@@ -57,8 +57,7 @@ def apply_fsdp_wrapping(student, teacher, args):
     for block_id in range(len(blocks)):
         blocks[block_id] = fully_shard(blocks[block_id], **fsdp_config)
     
-    # Set up prefetching (no gradient checkpointing for now to debug OOM)
-    # Gradient checkpointing can be added back later if needed
+    # Set up prefetching
     for prev_block, next_block in zip(blocks[:-1], blocks[1:]):
         prev_block.set_modules_to_forward_prefetch([next_block])
         next_block.set_modules_to_backward_prefetch([prev_block])
@@ -99,6 +98,19 @@ def apply_fsdp_wrapping(student, teacher, args):
     _enable_inference_only_resharding(teacher)
     
     print(f"[Rank {dist.get_rank()}] ✓ Teacher FSDP2 wrapping complete (inference-only)")
+    
+    # ========== ENABLE GRADIENT CHECKPOINTING ==========
+    if hasattr(args, 'grad_checkpointing') and args.grad_checkpointing:
+        print(f"[Rank {dist.get_rank()}] Enabling gradient checkpointing for student...")
+        
+        # Enable checkpointing in the student backbone
+        if hasattr(student.backbone, 'set_grad_checkpointing'):
+            student.backbone.set_grad_checkpointing(True)
+            print(f"[Rank {dist.get_rank()}] ✓ Gradient checkpointing enabled in student backbone")
+        else:
+            print(f"[Rank {dist.get_rank()}] ⚠ Warning: Student backbone does not support gradient checkpointing")
+    else:
+        print(f"[Rank {dist.get_rank()}] Gradient checkpointing disabled")
     
     # Move to CUDA after wrapping (like DINOv3)
     student.to_empty(device="cuda")

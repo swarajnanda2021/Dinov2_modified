@@ -88,8 +88,8 @@ class iBOTPatchLoss(nn.Module):
         return weighted_loss.mean()
 
     @torch.no_grad()
-    def sinkhorn_knopp_normalization(self, teacher_output, teacher_temp, n_iterations=None):
-        """Apply Sinkhorn-Knopp normalization to teacher outputs."""
+    def sinkhorn_knopp_normalization(self, teacher_output, teacher_temp, n_iterations=None, eps=1e-8):
+        """Apply Sinkhorn-Knopp normalization to teacher outputs with epsilon protection."""
         if n_iterations is None:
             n_iterations = self.n_iterations
             
@@ -105,16 +105,16 @@ class iBOTPatchLoss(nn.Module):
         sum_Q = torch.sum(Q)
         if dist.is_initialized():
             dist.all_reduce(sum_Q)
-        Q /= sum_Q
+        Q /= (sum_Q + eps)  # ADD EPSILON HERE
         
         for it in range(n_iterations):
             sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
             if dist.is_initialized():
                 dist.all_reduce(sum_of_rows)
-            Q /= sum_of_rows
+            Q /= (sum_of_rows + eps)  # ADD EPSILON HERE
             Q /= K
             
-            Q /= torch.sum(Q, dim=0, keepdim=True)
+            Q /= (torch.sum(Q, dim=0, keepdim=True) + eps)  # ADD EPSILON HERE
             Q /= B
         
         Q *= B
