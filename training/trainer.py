@@ -586,7 +586,7 @@ def train_dinov2(args):
             m = momentum_schedule[current_iteration]
             
             for param_q, param_k in zip(student.backbone.parameters(),
-                                    teacher_without_ddp.backbone.parameters()):
+                                    teacher.backbone.parameters()):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
             
             for param_q, param_k in zip(student.classhead.parameters(),
