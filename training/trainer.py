@@ -605,17 +605,20 @@ def train_dinov2(args):
                 student_classhead_params, teacher_classhead_params = train_dinov2._ema_param_lists_classhead
                 student_patchhead_params, teacher_patchhead_params = train_dinov2._ema_param_lists_patchhead
             
-            # Update backbone
-            torch._foreach_mul_(teacher_backbone_params, m)
-            torch._foreach_add_(teacher_backbone_params, student_backbone_params, alpha=1.0 - m)
+            # Update backbone - individual parameter updates for FSDP2 DTensor compatibility
+            for teacher_param, student_param in zip(teacher_backbone_params, student_backbone_params):
+                teacher_param.mul_(m)
+                teacher_param.add_(student_param, alpha=1.0 - m)
             
             # Update classhead
-            torch._foreach_mul_(teacher_classhead_params, m)
-            torch._foreach_add_(teacher_classhead_params, student_classhead_params, alpha=1.0 - m)
+            for teacher_param, student_param in zip(teacher_classhead_params, student_classhead_params):
+                teacher_param.mul_(m)
+                teacher_param.add_(student_param, alpha=1.0 - m)
             
             # Update patchhead
-            torch._foreach_mul_(teacher_patchhead_params, m)
-            torch._foreach_add_(teacher_patchhead_params, student_patchhead_params, alpha=1.0 - m)
+            for teacher_param, student_param in zip(teacher_patchhead_params, student_patchhead_params):
+                teacher_param.mul_(m)
+                teacher_param.add_(student_param, alpha=1.0 - m)
         
         # ========== Clean cache periodically ==========
         if current_iteration % 100 == 0:
