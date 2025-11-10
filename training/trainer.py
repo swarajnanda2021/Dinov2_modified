@@ -187,25 +187,21 @@ def train_dinov2(args):
     teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
 
     # Apply FSDP2 wrapping (in-place modification)
-    student_fsdp, teacher_fsdp = apply_fsdp_wrapping(student, teacher, args)
+    student, teacher = apply_fsdp_wrapping(student, teacher, args)
 
     # Prototype bank stays as regular DDP (Strategy A: replicated for KoLeo)
     prototype_bank = nn.parallel.DistributedDataParallel(prototype_bank, device_ids=[args.gpu])
 
-    # Reference to unwrapped teacher
-    teacher_without_ddp = teacher_fsdp
+    print("FSDP2 wrapping complete")
 
-    # Update references
-    student = type('FSDPWrapper', (), {'module': student_fsdp, '_set_static_graph': lambda: None})()
-    teacher = type('FSDPWrapper', (), {'module': teacher_fsdp})()
+    # Copy student weights to teacher
+    teacher.backbone.load_state_dict(student.backbone.state_dict())
+    teacher.classhead.load_state_dict(student.classhead.state_dict())
+    teacher.patchhead.load_state_dict(student.patchhead.state_dict())
 
-    #student._set_static_graph() #not needed with fsdp2
-    print("Set static graph for student model")
-
-    teacher_without_ddp.backbone.load_state_dict(student.module.backbone.state_dict())
-    teacher_without_ddp.classhead.load_state_dict(student.module.classhead.state_dict())
-    teacher_without_ddp.patchhead.load_state_dict(student.module.patchhead.state_dict())
-    teacher.requires_grad_(False)
+    # Disable gradients for teacher
+    for param in teacher.parameters():
+        param.requires_grad = False
 
     # ============ Initialize losses ============
     dino_class_loss = DINOLoss(
@@ -238,9 +234,9 @@ def train_dinov2(args):
 
     # ============ Create optimizers ============
     optimizer_student = torch.optim.AdamW([
-        *get_params_groups_fsdp2(student.module.backbone),
-        *get_params_groups_fsdp2(student.module.classhead),
-        *get_params_groups_fsdp2(student.module.patchhead),
+        *get_params_groups_fsdp2(student.backbone),
+        *get_params_groups_fsdp2(student.classhead),
+        *get_params_groups_fsdp2(student.patchhead),
     ])
 
     optimizer_prototypes = torch.optim.AdamW(
@@ -291,8 +287,8 @@ def train_dinov2(args):
     if os.path.exists(checkpoint_dir):
         current_iteration = load_checkpoint_fsdp2(
             checkpoint_dir,
-            student.module,
-            teacher.module,
+            student,
+            teacher,
             prototype_bank,
             optimizer_student,
             optimizer_prototypes,
@@ -563,8 +559,8 @@ def train_dinov2(args):
                 utils.clip_gradients(student, args.clip_grad)
             
             # Cancel last layer gradients
-            utils.cancel_gradients_last_layer(current_iteration, student.module.classhead, args.freeze_last_layer_iters)
-            utils.cancel_gradients_last_layer(current_iteration, student.module.patchhead, args.freeze_last_layer_iters)
+            utils.cancel_gradients_last_layer(current_iteration, student.classhead, args.freeze_last_layer_iters)
+            utils.cancel_gradients_last_layer(current_iteration, student.patchhead, args.freeze_last_layer_iters)   
             
             optimizer_student.step()
         else:
@@ -578,9 +574,9 @@ def train_dinov2(args):
             if args.clip_grad:
                 utils.clip_gradients(student, args.clip_grad)
             
-            utils.cancel_gradients_last_layer(current_iteration, student.module.classhead, args.freeze_last_layer_iters)
-            utils.cancel_gradients_last_layer(current_iteration, student.module.patchhead, args.freeze_last_layer_iters)
-            
+            utils.cancel_gradients_last_layer(current_iteration, student.classhead, args.freeze_last_layer_iters)
+            utils.cancel_gradients_last_layer(current_iteration, student.patchhead, args.freeze_last_layer_iters)
+
             fp16_scaler.step(optimizer_student)
             fp16_scaler.update()
         
@@ -589,15 +585,15 @@ def train_dinov2(args):
         with torch.no_grad():
             m = momentum_schedule[current_iteration]
             
-            for param_q, param_k in zip(student.module.backbone.parameters(),
+            for param_q, param_k in zip(student.backbone.parameters(),
                                     teacher_without_ddp.backbone.parameters()):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
             
-            for param_q, param_k in zip(student.module.classhead.parameters(),
+            for param_q, param_k in zip(student.classhead.parameters(),
                                     teacher_without_ddp.classhead.parameters()):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
             
-            for param_q, param_k in zip(student.module.patchhead.parameters(),
+            for param_q, param_k in zip(student.patchhead.parameters(),
                                     teacher_without_ddp.patchhead.parameters()):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
         
@@ -662,8 +658,8 @@ def train_dinov2(args):
             save_checkpoint_fsdp2(
                 checkpoint_dir,
                 current_iteration,
-                student.module,
-                teacher.module,
+                student,
+                teacher,
                 prototype_bank,
                 optimizer_student,
                 optimizer_prototypes,
