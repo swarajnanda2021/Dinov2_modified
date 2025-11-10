@@ -20,15 +20,15 @@ def get_mixed_precision_policy():
 def apply_fsdp_wrapping(student, teacher, args):
     """
     Apply FSDP2 wrapping to student and teacher models.
-    Prototype bank stays as regular DDP (Strategy A).
+    NO DDP WRAPPING - FSDP2 only (like DINOv3).
     
     Args:
-        student: DDP-wrapped student model
-        teacher: DDP-wrapped teacher model
+        student: Raw student model (NOT DDP-wrapped)
+        teacher: Raw teacher model (NOT DDP-wrapped)
         args: Training arguments
         
     Returns:
-        FSDP2-wrapped student and teacher (in-place modification)
+        FSDP2-wrapped student and teacher
     """
     # Initialize device mesh
     world_mesh = init_device_mesh("cuda", mesh_shape=(dist.get_world_size(),), mesh_dim_names=("dp",))
@@ -44,13 +44,9 @@ def apply_fsdp_wrapping(student, teacher, args):
     
     print(f"[Rank {dist.get_rank()}] Starting FSDP2 wrapping...")
     
-    # Unwrap DDP first
-    student_module = student.module
-    teacher_module = teacher.module
-    
     # ========== STUDENT BACKBONE ==========
     # Wrap each transformer block with FSDP first
-    blocks = list(student_module.backbone.blocks)
+    blocks = list(student.backbone.blocks)
     for block_id in range(len(blocks)):
         blocks[block_id] = fully_shard(blocks[block_id], **fsdp_config)
     
@@ -61,48 +57,41 @@ def apply_fsdp_wrapping(student, teacher, args):
             blocks[block_id] = checkpoint_wrapper(blocks[block_id])
         print(f"[Rank {dist.get_rank()}] Applied gradient checkpointing to student blocks")
     else:
-        # Only set up prefetching if NOT using gradient checkpointing
-        # Prefetching doesn't work with checkpoint_wrapper
+        # Set up prefetching only if NOT using gradient checkpointing
         for prev_block, next_block in zip(blocks[:-1], blocks[1:]):
             prev_block.set_modules_to_forward_prefetch([next_block])
             next_block.set_modules_to_backward_prefetch([prev_block])
     
     # Wrap the entire backbone
-    student_module.backbone = fully_shard(student_module.backbone, **fsdp_config)
+    student.backbone = fully_shard(student.backbone, **fsdp_config)
     
     # Wrap projection heads
-    student_module.classhead = fully_shard(student_module.classhead, **fsdp_config)
-    student_module.patchhead = fully_shard(student_module.patchhead, **fsdp_config)
+    student.classhead = fully_shard(student.classhead, **fsdp_config)
+    student.patchhead = fully_shard(student.patchhead, **fsdp_config)
     
     print(f"[Rank {dist.get_rank()}] ✓ Student FSDP2 wrapping complete")
     
     # ========== TEACHER BACKBONE (inference-only) ==========
     # Wrap each transformer block
-    teacher_blocks = list(teacher_module.backbone.blocks)
+    teacher_blocks = list(teacher.backbone.blocks)
     for block_id in range(len(teacher_blocks)):
         teacher_blocks[block_id] = fully_shard(teacher_blocks[block_id], **fsdp_config)
     
-    # Teacher doesn't need gradient checkpointing (no gradients)
-    # Only set up prefetching for teacher
+    # Set up prefetching for teacher (no backward)
     for prev_block, next_block in zip(teacher_blocks[:-1], teacher_blocks[1:]):
         prev_block.set_modules_to_forward_prefetch([next_block])
-        # No backward prefetch for teacher (inference only)
     
     # Wrap the entire backbone
-    teacher_module.backbone = fully_shard(teacher_module.backbone, **fsdp_config)
+    teacher.backbone = fully_shard(teacher.backbone, **fsdp_config)
     
     # Wrap projection heads
-    teacher_module.classhead = fully_shard(teacher_module.classhead, **fsdp_config)
-    teacher_module.patchhead = fully_shard(teacher_module.patchhead, **fsdp_config)
-    
-    # Enable immediate resharding for inference-only teacher
-    _enable_inference_mode_resharding(teacher_module)
+    teacher.classhead = fully_shard(teacher.classhead, **fsdp_config)
+    teacher.patchhead = fully_shard(teacher.patchhead, **fsdp_config)
     
     print(f"[Rank {dist.get_rank()}] ✓ Teacher FSDP2 wrapping complete (inference-only)")
     
-    return student_module, teacher_module
+    return student, teacher
 
-    
 def _enable_inference_mode_resharding(model):
     """Enable immediate resharding after forward for inference-only models."""
     from torch.distributed._composable.fsdp import FSDPModule

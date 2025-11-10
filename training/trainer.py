@@ -182,10 +182,7 @@ def train_dinov2(args):
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
-    # First wrap in DDP (required before FSDP2)
-    student = setup_ddp_model(student, args, find_unused=True)
-    teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
-
+    
     # Apply FSDP2 wrapping (in-place modification)
     student, teacher = apply_fsdp_wrapping(student, teacher, args)
 
@@ -580,32 +577,40 @@ def train_dinov2(args):
             fp16_scaler.step(optimizer_student)
             fp16_scaler.update()
         
+        # Check Dtensor type
+        if current_iteration == 0 and utils.is_main_process():
+            for name, param in student.named_parameters():
+                print(f"{name}: {type(param)}") 
         
         # ========== EMA update teacher ==========
         with torch.no_grad():
             m = momentum_schedule[current_iteration]
             
-            # Build parameter lists once and cache them
+            # Build parameter lists once and cache them (like DINOv3)
             if not hasattr(train_dinov2, '_ema_param_lists'):
                 student_param_list = []
                 teacher_param_list = []
                 
-                # Collect ALL parameters from all components
-                for k in ['backbone', 'classhead', 'patchhead']:
+                # Collect parameters from FSDP2-wrapped modules
+                # student and teacher are now FSDP2-wrapped, not DDP-wrapped
+                for student_module, teacher_module in [
+                    (student.backbone, teacher.backbone),
+                    (student.classhead, teacher.classhead),
+                    (student.patchhead, teacher.patchhead),
+                ]:
                     for student_param, teacher_param in zip(
-                        getattr(student, k).parameters(),
-                        getattr(teacher, k).parameters()
+                        student_module.parameters(),
+                        teacher_module.parameters()
                     ):
                         student_param_list.append(student_param)
                         teacher_param_list.append(teacher_param)
                 
-                # Cache for future iterations
                 train_dinov2._ema_param_lists = (student_param_list, teacher_param_list)
                 print(f"[Rank {dist.get_rank()}] Cached {len(student_param_list)} parameters for EMA")
             else:
                 student_param_list, teacher_param_list = train_dinov2._ema_param_lists
             
-            # Use vectorized operations that are FSDP2-compatible
+            # FSDP2-compatible vectorized operations
             torch._foreach_mul_(teacher_param_list, m)
             torch._foreach_add_(teacher_param_list, student_param_list, alpha=1.0 - m)
         
