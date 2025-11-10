@@ -33,6 +33,10 @@ from .helpers import (
     setup_ddp_model,
 )
 
+from .fsdp_setup import apply_fsdp_wrapping
+from .checkpoint_fsdp2 import save_checkpoint_fsdp2, load_checkpoint_fsdp2
+from .param_groups_fsdp2 import get_params_groups_fsdp2
+
 
 def train_dinov2(args):
     """
@@ -172,18 +176,28 @@ def train_dinov2(args):
 
     student = student.cuda()
     teacher = teacher.cuda()
+    prototype_bank = prototype_bank.cuda()
 
     if utils.has_batchnorms(student):
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
+    # First wrap in DDP (required before FSDP2)
     student = setup_ddp_model(student, args, find_unused=True)
     teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
-    
-    # Wrap prototype bank with DDP
+
+    # Apply FSDP2 wrapping (in-place modification)
+    student_fsdp, teacher_fsdp = apply_fsdp_wrapping(student, teacher, args)
+
+    # Prototype bank stays as regular DDP (Strategy A: replicated for KoLeo)
     prototype_bank = nn.parallel.DistributedDataParallel(prototype_bank, device_ids=[args.gpu])
-    
-    teacher_without_ddp = teacher.module
+
+    # Reference to unwrapped teacher
+    teacher_without_ddp = teacher_fsdp
+
+    # Update references
+    student = type('FSDPWrapper', (), {'module': student_fsdp, '_set_static_graph': lambda: None})()
+    teacher = type('FSDPWrapper', (), {'module': teacher_fsdp})()
 
     student._set_static_graph()
     print("Set static graph for student model")
@@ -224,11 +238,11 @@ def train_dinov2(args):
 
     # ============ Create optimizers ============
     optimizer_student = torch.optim.AdamW([
-        *utils.get_params_groups(student.module.backbone),
-        *utils.get_params_groups(student.module.classhead),
-        *utils.get_params_groups(student.module.patchhead),
+        *get_params_groups_fsdp2(student.module.backbone),
+        *get_params_groups_fsdp2(student.module.classhead),
+        *get_params_groups_fsdp2(student.module.patchhead),
     ])
-    
+
     optimizer_prototypes = torch.optim.AdamW(
         prototype_bank.module.parameters(),
         betas=(0.9, 0.95),
@@ -272,31 +286,25 @@ def train_dinov2(args):
 
     # ============ Load checkpoint ============
     to_restore = {"iteration": 0, "dataset_position": 0}
-    
-    checkpoint_path = os.path.join(args.output_dir, "checkpoint.pth")
-    loaded_checkpoint = None
-    if os.path.exists(checkpoint_path):
-        try:
-            loaded_checkpoint = torch.load(checkpoint_path, map_location='cpu')
-            print(f"Pre-loaded checkpoint from iteration {loaded_checkpoint.get('iteration', 'N/A')}.")
-        except Exception as e:
-            print(f"Could not pre-load checkpoint. Starting fresh. Error: {e}")
-            loaded_checkpoint = None
 
-    utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth"),
-        run_variables=to_restore,
-        student=student,
-        teacher=teacher,
-        prototype_bank=prototype_bank,
-        optimizer_student=optimizer_student,
-        optimizer_prototypes=optimizer_prototypes,
-        fp16_scaler=fp16_scaler,
-        dino_class_loss=dino_class_loss,
-        patch_prototype_loss=patch_prototype_loss,
-    )
+    checkpoint_dir = os.path.join(args.output_dir, "checkpoint_fsdp2")
+    if os.path.exists(checkpoint_dir):
+        current_iteration = load_checkpoint_fsdp2(
+            checkpoint_dir,
+            student.module,
+            teacher.module,
+            prototype_bank,
+            optimizer_student,
+            optimizer_prototypes,
+            args,
+            dino_class_loss=dino_class_loss,
+            patch_prototype_loss=patch_prototype_loss,
+            fp16_scaler=fp16_scaler,
+        )
+        to_restore["iteration"] = current_iteration
+    else:
+        current_iteration = 0
 
-    current_iteration = to_restore["iteration"]
     dataset_position = to_restore.get("dataset_position", 0)
 
     # ============ Set resume position in dataset ============
@@ -306,23 +314,9 @@ def train_dinov2(args):
         print(f"Resuming from iteration {current_iteration}")
 
     # ============ Restore RNGs ============
-    if loaded_checkpoint and 'torch_rng_state' in loaded_checkpoint:
-        try:
-            print("Restoring RNG states from checkpoint...")
-            torch.set_rng_state(loaded_checkpoint['torch_rng_state'])
-            torch.cuda.set_rng_state_all(loaded_checkpoint['cuda_rng_state'])
-            np.random.set_state(loaded_checkpoint['numpy_rng_state'])
-            random.setstate(loaded_checkpoint['random_rng_state'])
-            print(f"Successfully restored all RNG states to iteration {current_iteration}.")
-        except Exception as e:
-            print(f"WARNING: Failed to restore RNG states. Re-seeding. Error: {e}")
-            utils.fix_random_seeds(args.seed + utils.get_rank())
-    else:
-        if current_iteration == 0:
-            print("Starting from scratch. Fixing random seeds.")
-        else:
-            print(f"WARNING: Checkpoint found but no RNG state. Re-seeding.")
-        utils.fix_random_seeds(args.seed + utils.get_rank())
+    utils.fix_random_seeds(args.seed + utils.get_rank())
+    if current_iteration > 0:
+        print(f"Resuming from iteration {current_iteration} with reseeded RNGs")
     
     # ============ Verify checkpoint ============
     if utils.is_main_process() and current_iteration > 0:
@@ -672,27 +666,20 @@ def train_dinov2(args):
         
         # ========== Save checkpoints ==========
         if current_iteration % args.save_checkpoint_freq == 0:
-            save_dict = {
-                'student': student.state_dict(),
-                'teacher': teacher.state_dict(),
-                'prototype_bank': prototype_bank.state_dict(),
-                'dino_class_loss': dino_class_loss.state_dict(),
-                'patch_prototype_loss': patch_prototype_loss.state_dict(),
-                'optimizer_student': optimizer_student.state_dict(),
-                'optimizer_prototypes': optimizer_prototypes.state_dict(),
-                'iteration': current_iteration,
-                'dataset_position': dataset_position,
-                'args': args,
-                'torch_rng_state': torch.get_rng_state(),
-                'cuda_rng_state': torch.cuda.get_rng_state_all(),
-                'numpy_rng_state': np.random.get_state(),
-                'random_rng_state': random.getstate(),
-            }
-            if fp16_scaler is not None:
-                save_dict['fp16_scaler'] = fp16_scaler.state_dict()
-            
-            utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint_iter_{current_iteration:08d}.pth'))
-            utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
+            checkpoint_dir = os.path.join(args.output_dir, "checkpoint_fsdp2")
+            save_checkpoint_fsdp2(
+                checkpoint_dir,
+                current_iteration,
+                student.module,
+                teacher.module,
+                prototype_bank,
+                optimizer_student,
+                optimizer_prototypes,
+                args,
+                dino_class_loss=dino_class_loss,
+                patch_prototype_loss=patch_prototype_loss,
+                fp16_scaler=fp16_scaler,
+            )
         
         current_iteration += 1
 
