@@ -88,7 +88,7 @@ class iBOTPatchLoss(nn.Module):
         return weighted_loss.mean()
 
     @torch.no_grad()
-    def sinkhorn_knopp_normalization(self, teacher_output, teacher_temp, n_iterations=None, eps=1e-8):
+    def sinkhorn_knopp_normalization(self, teacher_output, teacher_temp, n_iterations=None, eps=1e-4):
         """Apply Sinkhorn-Knopp normalization to teacher outputs with epsilon protection."""
         if n_iterations is None:
             n_iterations = self.n_iterations
