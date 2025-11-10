@@ -590,11 +590,11 @@ def train_dinov2(args):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
             
             for param_q, param_k in zip(student.classhead.parameters(),
-                                    teacher_without_ddp.classhead.parameters()):
+                                    teacher.classhead.parameters()):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
             
             for param_q, param_k in zip(student.patchhead.parameters(),
-                                    teacher_without_ddp.patchhead.parameters()):
+                                    teacher.patchhead.parameters()):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
         
         # ========== Clean cache periodically ==========
