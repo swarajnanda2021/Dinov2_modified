@@ -587,15 +587,15 @@ def train_dinov2(args):
             
             for param_q, param_k in zip(student.backbone.parameters(),
                                     teacher.backbone.parameters()):
-                param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+                param_k.mul_(m).add_(param_q.detach(), alpha=(1 - m))
             
             for param_q, param_k in zip(student.classhead.parameters(),
                                     teacher.classhead.parameters()):
-                param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+                param_k.mul_(m).add_(param_q.detach(), alpha=(1 - m))
             
             for param_q, param_k in zip(student.patchhead.parameters(),
                                     teacher.patchhead.parameters()):
-                param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+                param_k.mul_(m).add_(param_q.detach(), alpha=(1 - m))
         
         # ========== Clean cache periodically ==========
         if current_iteration % 100 == 0:
