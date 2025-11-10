@@ -199,7 +199,7 @@ def train_dinov2(args):
     student = type('FSDPWrapper', (), {'module': student_fsdp, '_set_static_graph': lambda: None})()
     teacher = type('FSDPWrapper', (), {'module': teacher_fsdp})()
 
-    student._set_static_graph()
+    #student._set_static_graph() #not needed with fsdp2
     print("Set static graph for student model")
 
     teacher_without_ddp.backbone.load_state_dict(student.module.backbone.state_dict())
