@@ -605,20 +605,17 @@ def train_dinov2(args):
                 student_classhead_params, teacher_classhead_params = train_dinov2._ema_param_lists_classhead
                 student_patchhead_params, teacher_patchhead_params = train_dinov2._ema_param_lists_patchhead
             
-            # Update backbone - individual parameter updates for FSDP2 DTensor compatibility
+            # Update backbone - FSDP2-compatible atomic update
             for teacher_param, student_param in zip(teacher_backbone_params, student_backbone_params):
-                teacher_param.mul_(m)
-                teacher_param.add_(student_param, alpha=1.0 - m)
-            
+                teacher_param.data.copy_(teacher_param.data * m + student_param.data * (1.0 - m))
+
             # Update classhead
             for teacher_param, student_param in zip(teacher_classhead_params, student_classhead_params):
-                teacher_param.mul_(m)
-                teacher_param.add_(student_param, alpha=1.0 - m)
-            
+                teacher_param.data.copy_(teacher_param.data * m + student_param.data * (1.0 - m))
+
             # Update patchhead
             for teacher_param, student_param in zip(teacher_patchhead_params, student_patchhead_params):
-                teacher_param.mul_(m)
-                teacher_param.add_(student_param, alpha=1.0 - m)
+                teacher_param.data.copy_(teacher_param.data * m + student_param.data * (1.0 - m))
         
         # ========== Clean cache periodically ==========
         if current_iteration % 100 == 0:
