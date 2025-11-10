@@ -585,20 +585,37 @@ def train_dinov2(args):
         with torch.no_grad():
             m = momentum_schedule[current_iteration]
             
-            for param_q, param_k in zip(student.backbone.parameters(),
-                                    teacher.backbone.parameters()):
-                # lerp_(end, weight) = start * (1 - weight) + end * weight
-                # We want: param_k * m + param_q * (1 - m)
-                # So: param_k.lerp_(param_q, 1 - m)
-                param_k.lerp_(param_q, 1.0 - m)
+            # Build parameter lists once and cache them
+            if not hasattr(train_dinov2, '_ema_param_lists_backbone'):
+                student_backbone_params = list(student.backbone.parameters())
+                teacher_backbone_params = list(teacher.backbone.parameters())
+                
+                student_classhead_params = list(student.classhead.parameters())
+                teacher_classhead_params = list(teacher.classhead.parameters())
+                
+                student_patchhead_params = list(student.patchhead.parameters())
+                teacher_patchhead_params = list(teacher.patchhead.parameters())
+                
+                # Cache for next iterations
+                train_dinov2._ema_param_lists_backbone = (student_backbone_params, teacher_backbone_params)
+                train_dinov2._ema_param_lists_classhead = (student_classhead_params, teacher_classhead_params)
+                train_dinov2._ema_param_lists_patchhead = (student_patchhead_params, teacher_patchhead_params)
+            else:
+                student_backbone_params, teacher_backbone_params = train_dinov2._ema_param_lists_backbone
+                student_classhead_params, teacher_classhead_params = train_dinov2._ema_param_lists_classhead
+                student_patchhead_params, teacher_patchhead_params = train_dinov2._ema_param_lists_patchhead
             
-            for param_q, param_k in zip(student.classhead.parameters(),
-                                    teacher.classhead.parameters()):
-                param_k.lerp_(param_q, 1.0 - m)
+            # Update backbone
+            torch._foreach_mul_(teacher_backbone_params, m)
+            torch._foreach_add_(teacher_backbone_params, student_backbone_params, alpha=1.0 - m)
             
-            for param_q, param_k in zip(student.patchhead.parameters(),
-                                    teacher.patchhead.parameters()):
-                param_k.lerp_(param_q, 1.0 - m)
+            # Update classhead
+            torch._foreach_mul_(teacher_classhead_params, m)
+            torch._foreach_add_(teacher_classhead_params, student_classhead_params, alpha=1.0 - m)
+            
+            # Update patchhead
+            torch._foreach_mul_(teacher_patchhead_params, m)
+            torch._foreach_add_(teacher_patchhead_params, student_patchhead_params, alpha=1.0 - m)
         
         # ========== Clean cache periodically ==========
         if current_iteration % 100 == 0:
