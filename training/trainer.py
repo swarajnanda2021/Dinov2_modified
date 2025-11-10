@@ -604,19 +604,7 @@ def train_dinov2(args):
         # ========== Clean cache periodically ==========
         if current_iteration % 100 == 0:
             torch.cuda.empty_cache()
-        
-        # ========== Visualize masks ==========
-        if current_iteration % args.visualization_freq == 0 and current_iteration < 5000 and args.num_masks > 0:
-            sample_image = original_images[:1]
-            with torch.no_grad():
-                vis_masks = mask_model_frozen(sample_image)['masks']
-                save_iteration_masks_efficient(
-                    sample_image,
-                    vis_masks,
-                    current_iteration,
-                    os.path.join(args.output_dir, 'mask_visualizations'),
-                    num_samples=1
-                )
+ 
         
         # ========== Logging ==========
         metric_logger.update(student_loss=student_loss.item())
