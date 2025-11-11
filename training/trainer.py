@@ -545,39 +545,44 @@ def train_dinov2(args):
                 koleo_proto_loss
             )
         
-        # ==========  Do BOTH backwards BEFORE any optimizer steps ==========
+        # ==========  Backward and optimizer steps ==========
         if fp16_scaler is None:
-            # Backward for both losses first
-            prototype_loss.backward()
-            student_loss.backward()
+            student_loss.backward()  # Grads to student AND prototypes
+            optimizer_student.step()
+            optimizer_student.zero_grad()  # Only clear student grads
             
-            # Now step optimizers
+            # Prototypes still have their gradients from step 1
+            prototype_loss.backward()  # ACCUMULATES additional grads to prototypes
             optimizer_prototypes.step()
+            optimizer_prototypes.zero_grad()
             
             # Gradient clipping
             if args.clip_grad:
                 utils.clip_gradients(student, args.clip_grad)
             
             # Cancel last layer gradients
-            utils.cancel_gradients_last_layer(current_iteration, student.classhead, args.freeze_last_layer_iters)
-            utils.cancel_gradients_last_layer(current_iteration, student.patchhead, args.freeze_last_layer_iters)   
+            utils.cancel_gradients_last_layer(current_iteration, student.module.classhead, args.freeze_last_layer_iters)
+            utils.cancel_gradients_last_layer(current_iteration, student.module.patchhead, args.freeze_last_layer_iters)
             
-            optimizer_student.step()
         else:
             # Mixed precision: same logic
-            fp16_scaler.scale(prototype_loss).backward()
             fp16_scaler.scale(student_loss).backward()
-            
+            fp16_scaler.step(optimizer_student)
+            optimizer_student.zero_grad()  # Only clear student grads
+
+            # Prototypes still have their gradients from step 1
+            fp16_scaler.scale(prototype_loss).backward() # ACCUMULATES additional grads to prototypes
             fp16_scaler.step(optimizer_prototypes)
+            optimizer_prototypes.zero_grad()
             
             fp16_scaler.unscale_(optimizer_student)
             if args.clip_grad:
                 utils.clip_gradients(student, args.clip_grad)
             
-            utils.cancel_gradients_last_layer(current_iteration, student.classhead, args.freeze_last_layer_iters)
-            utils.cancel_gradients_last_layer(current_iteration, student.patchhead, args.freeze_last_layer_iters)
-
-            fp16_scaler.step(optimizer_student)
+            utils.cancel_gradients_last_layer(current_iteration, student.module.classhead, args.freeze_last_layer_iters)
+            utils.cancel_gradients_last_layer(current_iteration, student.module.patchhead, args.freeze_last_layer_iters)
+            
+            
             fp16_scaler.update()
         
         # Check Dtensor type
