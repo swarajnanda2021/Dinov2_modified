@@ -406,17 +406,7 @@ def train_dinov2(args):
                 # Add masked local crops to student views
                 student_all_crops.extend(masked_local_crops_all)
         
-        # ========== Debug: Print shapes on first iteration ==========
-        if current_iteration == 0 and utils.is_main_process():
-            print("\n=== Crop Organization (First Iteration) ===")
-            print(f"Teacher global crops: {len(teacher_global_crops)} crops")
-            for i, crop in enumerate(teacher_global_crops):
-                print(f"  Teacher crop {i}: {crop.shape}")
-            print(f"Student total crops: {len(student_all_crops)} crops")
-            for i, crop in enumerate(student_all_crops):
-                print(f"  Student crop {i}: {crop.shape}")
-            print(f"Original images: {original_images.shape}")
-            print("="*50 + "\n")
+
         
         # ========== Update learning rates ==========
         for i, param_group in enumerate(optimizer_student.param_groups):
@@ -443,15 +433,6 @@ def train_dinov2(args):
             student_output = student(student_all_crops, token_masks=None, mode='dino')
             student_cls_outputs = student_output['cls_outputs']  # [B*total_views, out_dim]
             
-            # Debug shapes on first iteration
-            if current_iteration == 0 and utils.is_main_process():
-                print("\n=== DINO Forward Shapes ===")
-                print(f"Teacher CLS outputs: {teacher_cls_outputs.shape}")
-                print(f"Student CLS outputs: {student_cls_outputs.shape}")
-                print(f"Features list length: {len(student_output['features_list'])}")
-                for i, feat in enumerate(student_output['features_list'][:3]):  # Show first 3
-                    print(f"  Crop {i}: cls={feat['clstoken'].shape}, patches={feat['patchtokens'].shape}")
-                print("="*50 + "\n")
             
             # Compute DINO loss
             dino_class_loss_val = dino_class_loss(
@@ -498,52 +479,6 @@ def train_dinov2(args):
             student_ibot_output = student(original_images, token_masks=random_token_masks, mode='ibot')
             student_patch_outputs = student_ibot_output['patch_outputs']  # [B, N, out_dim]
             
-            # DEBUG: Comprehensive NaN check
-            if torch.isnan(student_patch_outputs).any():
-                print(f"\n{'='*60}")
-                print(f"[Rank {dist.get_rank()}] [Iter {current_iteration}] NaN DETECTED!")
-                print(f"{'='*60}")
-                
-                # 1. Check inputs
-                print(f"Input images: min={original_images.min():.4f}, max={original_images.max():.4f}, has_nan={torch.isnan(original_images).any()}")
-                
-                # 2. Check raw features (before projection head)
-                raw_features = student_ibot_output['features']['patchtokens']
-                print(f"Raw patch features: shape={raw_features.shape}")
-                print(f"  has_nan={torch.isnan(raw_features).any()}")
-                if not torch.isnan(raw_features).any():
-                    print(f"  min={raw_features.min():.4f}, max={raw_features.max():.4f}, mean={raw_features.mean():.4f}")
-                else:
-                    print(f"  NaN count in raw features: {torch.isnan(raw_features).sum().item()}")
-                
-                # 3. Check projection head outputs
-                print(f"Projection head outputs: shape={student_patch_outputs.shape}")
-                print(f"  NaN count: {torch.isnan(student_patch_outputs).sum().item()} / {student_patch_outputs.numel()}")
-                print(f"  Percentage NaN: {100.0 * torch.isnan(student_patch_outputs).sum().item() / student_patch_outputs.numel():.2f}%")
-                
-                # 4. Check if teacher has same issue
-                print(f"\nTeacher outputs: has_nan={torch.isnan(teacher_patch_outputs).any()}")
-                if not torch.isnan(teacher_patch_outputs).any():
-                    print(f"  Teacher is clean: min={teacher_patch_outputs.min():.4f}, max={teacher_patch_outputs.max():.4f}")
-                
-                # 5. Check patchhead weights
-                print(f"\nPatchhead weight stats:")
-                for name, param in student.patchhead.named_parameters():
-                    has_nan = torch.isnan(param).any()
-                    print(f"  {name}: shape={param.shape}, has_nan={has_nan}, dtype={param.dtype}, device={param.device}")
-                    if not has_nan and param.numel() > 0:
-                        print(f"    min={param.min():.4f}, max={param.max():.4f}")
-                
-                print(f"{'='*60}\n")
-
-            # Debug shapes on first iteration
-            if current_iteration == 0 and utils.is_main_process():
-                print("\n=== iBOT Forward Shapes ===")
-                print(f"Random token masks: {random_token_masks.shape}")
-                print(f"Teacher patch outputs: {teacher_patch_outputs.shape}")
-                print(f"Student patch outputs: {student_patch_outputs.shape}")
-                print(f"Number of masked tokens: {random_token_masks.sum().item()}")
-                print("="*50 + "\n")
             
             # Compute iBOT loss
             ibot_loss_val = ibot_patch_loss.forward_masked(
@@ -559,12 +494,6 @@ def train_dinov2(args):
             teacher_patch_features = teacher_ibot_output['features']['patchtokens']  # [B, N, 768]
             student_patch_features = student_ibot_output['features']['patchtokens']  # [B, N, 768]
             
-            # Debug shapes on first iteration
-            if current_iteration == 0 and utils.is_main_process():
-                print("\n=== Clustering Forward Shapes ===")
-                print(f"Teacher patch features: {teacher_patch_features.shape}")
-                print(f"Student patch features: {student_patch_features.shape}")
-                print("="*50 + "\n")
             
             # Compute clustering loss
             clustering_loss, koleo_proto_loss, teacher_proto_loss = patch_prototype_loss(
