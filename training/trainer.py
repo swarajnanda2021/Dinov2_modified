@@ -472,7 +472,7 @@ def train_dinov2(args):
             optimizer_prototypes.zero_grad()
                 
         # ========== Forward passes and loss computation ==========
-        with torch.cuda.amp.auto`cast(dtype=torch.bfloat16, enabled=args.use_fp16):
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
             # ========== DINO Loss with Sequence Packing ==========
             
             # Teacher forward (only global crops, no masking)
