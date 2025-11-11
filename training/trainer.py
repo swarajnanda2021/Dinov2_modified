@@ -182,7 +182,7 @@ def train_dinov2(args):
 
     student = student.cuda()
     teacher = teacher.cuda()
-    prototype_bank = prototype_bank.cuda()
+
 
     if utils.has_batchnorms(student):
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
