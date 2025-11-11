@@ -31,98 +31,80 @@ class iBOTPatchLoss(nn.Module):
         teacher_temp=0.07
     ):
         """
-        Cross-entropy between teacher and student on masked patches.
-        
         Args:
-            student_patch_tokens_masked: [B, N, D] student patch tokens
-            teacher_patch_tokens_masked: [B, N, D] teacher patch tokens
-            student_masks_flat: [B, N] boolean mask (True = masked)
-            n_masked_patches: Optional number of masked patches
-            masks_weight: Optional per-token weights
-            teacher_temp: Teacher temperature
-            
-        Returns:
-            Loss value
+            student_patch_tokens_masked: [B, N, D]
+            teacher_patch_tokens_masked: [B, N, D]
+            student_masks_flat: [B, N] boolean mask
         """
         B, N, D = student_patch_tokens_masked.shape
         
-        all_student_tokens = []
-        all_teacher_tokens = []
-        all_weights = []
+        # Flatten everything - no loops!
+        student_flat = student_patch_tokens_masked.reshape(B * N, D)  # [B*N, D]
+        teacher_flat = teacher_patch_tokens_masked.reshape(B * N, D)  # [B*N, D]
+        masks_flat = student_masks_flat.reshape(B * N)  # [B*N]
         
-        if masks_weight is None:
-            masks_weight = (
-                (1 / student_masks_flat.sum(-1).clamp(min=1.0))
-                .unsqueeze(-1)
-                .expand_as(student_masks_flat)
-            )
+        # Vectorized extraction of masked tokens
+        student_masked = student_flat[masks_flat]  # [M, D] where M = number of True values
+        teacher_masked = teacher_flat[masks_flat]  # [M, D]
         
-        for b in range(B):
-            mask_indices = student_masks_flat[b]
-            num_masked = mask_indices.sum().item()
-            
-            if num_masked > 0:
-                student_tokens = student_patch_tokens_masked[b][mask_indices]
-                teacher_tokens = teacher_patch_tokens_masked[b][mask_indices]
-                weights = masks_weight[b][mask_indices]
-                
-                all_student_tokens.append(student_tokens)
-                all_teacher_tokens.append(teacher_tokens)
-                all_weights.append(weights)
-        
-        if len(all_student_tokens) == 0:
+        if student_masked.shape[0] == 0:
             return torch.tensor(0.0, device=student_patch_tokens_masked.device)
         
-        all_student_tokens = torch.cat(all_student_tokens, dim=0)
-        all_teacher_tokens = torch.cat(all_teacher_tokens, dim=0)
-        all_weights = torch.cat(all_weights, dim=0)
+        # Compute weights
+        if masks_weight is None:
+            # Count masked tokens per sample
+            n_masked_per_sample = student_masks_flat.sum(dim=-1).clamp(min=1.0)  # [B]
+            per_sample_weight = 1.0 / n_masked_per_sample  # [B]
+            # Expand to match masked tokens
+            masks_weight = per_sample_weight.unsqueeze(-1).expand_as(student_masks_flat)  # [B, N]
+            masks_weight = masks_weight.reshape(B * N)[masks_flat]  # [M]
+        else:
+            masks_weight = masks_weight.reshape(B * N)[masks_flat]  # [M]
         
-        teacher_normalized = self.sinkhorn_knopp_normalization(all_teacher_tokens, teacher_temp)
+        # Normalize teacher (happens inside, which is fine!)
+        teacher_normalized = self.sinkhorn_knopp_normalization(teacher_masked, teacher_temp)
         
-        student_log_probs = F.log_softmax(all_student_tokens / self.student_temp, dim=-1)
-        
+        # Compute loss
+        student_log_probs = F.log_softmax(student_masked / self.student_temp, dim=-1)
         loss_per_token = -torch.sum(teacher_normalized * student_log_probs, dim=-1)
+        weighted_loss = loss_per_token * masks_weight
         
-        weighted_loss = loss_per_token * all_weights
-
         return weighted_loss.mean()
 
     @torch.no_grad()
     def sinkhorn_knopp_normalization(self, teacher_output, teacher_temp, n_iterations=3):
         """
-        FSDP2-compatible Sinkhorn-Knopp for masked patches only.
-        
         Args:
-            teacher_output: [M_local, K] - masked patches from this rank
-            teacher_temp: Temperature
+            teacher_output: [M_local, K] where M_local = masked tokens on this rank
         """
         teacher_output = teacher_output.float()
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         
         Q = torch.exp(teacher_output / teacher_temp).t()  # [K, M_local]
-        K, M_local = Q.shape
+        K = Q.shape[0]  # number of prototypes
+        M_local = Q.shape[1]  # local masked tokens
         
-        # Total number of masked patches across all ranks
-        M_total = torch.tensor(M_local, device=Q.device, dtype=torch.int64)
+        # Total masked tokens across all ranks
+        M_total_tensor = torch.tensor(M_local, device=Q.device, dtype=torch.long)
         if dist.is_initialized():
-            dist.all_reduce(M_total)
-        M_total = M_total.item()
+            dist.all_reduce(M_total_tensor)
+        M_total = M_total_tensor.item()  # Total across all ranks
         
-        # Global normalization
+        # Normalize
         sum_Q = torch.sum(Q)
         if dist.is_initialized():
             dist.all_reduce(sum_Q)
         Q /= (sum_Q + 1e-8)
         
         for _ in range(n_iterations):
-            # Normalize rows (prototypes)
+            # Rows (prototypes)
             sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
             if dist.is_initialized():
                 dist.all_reduce(sum_of_rows)
             Q /= (sum_of_rows + 1e-8)
             Q /= K
             
-            # Normalize columns (samples)
+            # Columns (samples)
             Q /= (torch.sum(Q, dim=0, keepdim=True) + 1e-8)
             Q /= M_total
         
