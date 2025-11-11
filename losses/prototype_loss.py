@@ -139,9 +139,7 @@ class PatchPrototypeLoss(nn.Module):
     def sinkhorn_knopp(self, teacher_output, teacher_temp, n_iterations=3, eps=1e-8):
         """
         CAPI-inspired doubly stochastic Sinkhorn-Knopp.
-        
-        Enforces both dimensions sum to 1 (doubly stochastic matrix).
-        This eliminates positional bias while maintaining global processing.
+        Matches the official CAPI implementation exactly.
         
         Args:
             teacher_output: [M, K] logits where M = B*N tokens
@@ -165,21 +163,17 @@ class PatchPrototypeLoss(nn.Module):
         # Transpose for easier iteration: [K, M]
         Q = torch.exp(M).t()
         
-        # Global normalization (optional, helps convergence)
-        sum_Q = torch.sum(Q)
-        if dist.is_initialized():
-            dist.all_reduce(sum_Q)
-        Q /= (sum_Q + eps)
-        
-        # Doubly stochastic iterations
+        # Doubly stochastic iterations (matches CAPI exactly)
         for _ in range(n_iterations):
             # Normalize over samples (each prototype distribution sums to 1)
+            # All-reduce needed because samples are distributed across GPUs
             sum_over_samples = torch.sum(Q, dim=1, keepdim=True)
             if dist.is_initialized():
                 dist.all_reduce(sum_over_samples)
             Q /= (sum_over_samples + eps)
             
             # Normalize over prototypes (each sample distribution sums to 1)
+            # No all-reduce needed because prototypes are replicated
             sum_over_prototypes = torch.sum(Q, dim=0, keepdim=True)
             Q /= (sum_over_prototypes + eps)
         
