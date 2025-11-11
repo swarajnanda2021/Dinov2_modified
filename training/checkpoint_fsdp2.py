@@ -125,17 +125,29 @@ def load_checkpoint_fsdp2(
         iteration: Loaded iteration number, or 0 if checkpoint doesn't exist
     """
     ckpt_dir = Path(ckpt_dir)
+    
+    # Find the latest checkpoint subdirectory
     if not ckpt_dir.exists():
-        print(f"No checkpoint found at {ckpt_dir}")
+        print(f"No checkpoint directory found at {ckpt_dir}")
         return 0
+    
+    # Look for iter_* subdirectories
+    checkpoint_subdirs = sorted(ckpt_dir.glob("iter_*"))
+    if not checkpoint_subdirs:
+        print(f"No checkpoint subdirectories found in {ckpt_dir}")
+        return 0
+    
+    # Use the latest checkpoint
+    latest_ckpt = checkpoint_subdirs[-1]
+    print(f"Loading checkpoint from {latest_ckpt}")
     
     rank = dist.get_rank() if dist.is_initialized() else 0
     
     to_load = {
-    "iteration": 0,
-    "student": get_model_state_dict(student),
-    "teacher": get_model_state_dict(teacher),
-    "optimizer_student": get_optimizer_state_dict(student, optimizer_student),
+        "iteration": 0,
+        "student": get_model_state_dict(student),
+        "teacher": get_model_state_dict(teacher),
+        "optimizer_student": get_optimizer_state_dict(student, optimizer_student),
     }
 
     if prototype_bank is not None:
@@ -151,19 +163,29 @@ def load_checkpoint_fsdp2(
     if fp16_scaler is not None:
         to_load["fp16_scaler"] = fp16_scaler.state_dict()
     
-    # Load with DCP
-    dcp.load(
-        to_load,
-        storage_reader=FileSystemReader(ckpt_dir),
-    )
+    # Load with DCP from the specific subdirectory
+    try:
+        dcp.load(
+            to_load,
+            storage_reader=FileSystemReader(str(latest_ckpt)),
+        )
+    except Exception as e:
+        print(f"[Rank {rank}] ERROR loading checkpoint: {e}")
+        print(f"[Rank {rank}] Starting training from scratch")
+        return 0
     
     # Set loaded states
     iteration = to_load["iteration"]
     set_model_state_dict(student, to_load["student"])
     set_model_state_dict(teacher, to_load["teacher"])
-    prototype_bank.load_state_dict(to_load["prototype_bank"])
+    
+    if prototype_bank is not None:
+        prototype_bank.load_state_dict(to_load["prototype_bank"])
+    
     set_optimizer_state_dict(student, optimizer_student, to_load["optimizer_student"])
-    optimizer_prototypes.load_state_dict(to_load["optimizer_prototypes"])
+    
+    if optimizer_prototypes is not None:
+        optimizer_prototypes.load_state_dict(to_load["optimizer_prototypes"])
     
     # Load optional components
     if dino_class_loss is not None and "dino_class_loss" in to_load:
@@ -173,6 +195,6 @@ def load_checkpoint_fsdp2(
     if fp16_scaler is not None and "fp16_scaler" in to_load:
         fp16_scaler.load_state_dict(to_load["fp16_scaler"])
     
-    print(f"[Rank {rank}] Loaded FSDP2 checkpoint from iteration {iteration}")
+    print(f"[Rank {rank}] Successfully loaded FSDP2 checkpoint from iteration {iteration}")
     
     return iteration
