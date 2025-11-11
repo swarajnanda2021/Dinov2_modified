@@ -107,7 +107,7 @@ def main():
         slurm_constraint='h100',
         slurm_setup=[
             f'export OMP_NUM_THREADS=8',
-            f'export NCCL_DEBUG=INFO',
+            #f'export NCCL_DEBUG=INFO',
             f'export NCCL_SOCKET_IFNAME=ib,bond',
             f'export MASTER_PORT=23468',
             f'export WORLD_SIZE={num_gpus_per_node * nodes}',
