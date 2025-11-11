@@ -88,34 +88,43 @@ class iBOTPatchLoss(nn.Module):
         return weighted_loss.mean()
 
     @torch.no_grad()
-    def sinkhorn_knopp_normalization(self, teacher_output, teacher_temp, n_iterations=None):
-        """Apply Sinkhorn-Knopp normalization to teacher outputs."""
-        if n_iterations is None:
-            n_iterations = self.n_iterations
-            
+    def sinkhorn_knopp_normalization(self, teacher_output, teacher_temp, n_iterations=3):
+        """
+        FSDP2-compatible Sinkhorn-Knopp for masked patches only.
+        
+        Args:
+            teacher_output: [M_local, K] - masked patches from this rank
+            teacher_temp: Temperature
+        """
         teacher_output = teacher_output.float()
-        
-        Q = torch.exp(teacher_output / teacher_temp).t()
-        
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         
-        B = Q.shape[1] * world_size
-        K = Q.shape[0]
+        Q = torch.exp(teacher_output / teacher_temp).t()  # [K, M_local]
+        K, M_local = Q.shape
         
+        # Total number of masked patches across all ranks
+        M_total = torch.tensor(M_local, device=Q.device, dtype=torch.int64)
+        if dist.is_initialized():
+            dist.all_reduce(M_total)
+        M_total = M_total.item()
+        
+        # Global normalization
         sum_Q = torch.sum(Q)
         if dist.is_initialized():
             dist.all_reduce(sum_Q)
-        Q /= sum_Q
+        Q /= (sum_Q + 1e-8)
         
-        for it in range(n_iterations):
+        for _ in range(n_iterations):
+            # Normalize rows (prototypes)
             sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
             if dist.is_initialized():
                 dist.all_reduce(sum_of_rows)
-            Q /= sum_of_rows
+            Q /= (sum_of_rows + 1e-8)
             Q /= K
             
-            Q /= torch.sum(Q, dim=0, keepdim=True)
-            Q /= B
+            # Normalize columns (samples)
+            Q /= (torch.sum(Q, dim=0, keepdim=True) + 1e-8)
+            Q /= M_total
         
-        Q *= B
-        return Q.t()
+        Q *= M_total
+        return Q.t()  # [M_local, K]

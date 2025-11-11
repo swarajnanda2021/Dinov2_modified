@@ -537,7 +537,7 @@ def train_dinov2(args):
                 dino_class_loss_val +
                 args.koleo_loss_weight * koleo_loss_val +
                 args.ibot_loss_weight * ibot_loss_val +
-                args.clustering_weight * clustering_loss
+                args.clustering_weight * clustering_loss.detach()
             )
             
             prototype_loss = (
