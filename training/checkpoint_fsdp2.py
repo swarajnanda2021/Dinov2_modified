@@ -1,17 +1,19 @@
 """
-DCP-based checkpointing for FSDP2 models.
+Checkpointing for FSDP2 models - saves consolidated .pth files.
 """
 
 import os
-import tempfile
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter
-from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict
-from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict, set_optimizer_state_dict
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict, 
+    set_model_state_dict,
+    get_optimizer_state_dict, 
+    set_optimizer_state_dict,
+    StateDictOptions
+)
 
 
 def save_checkpoint_fsdp2(
@@ -28,83 +30,97 @@ def save_checkpoint_fsdp2(
     fp16_scaler=None,
 ):
     """
-    Save FSDP2 checkpoint using DCP with better error handling.
-    Handles optional prototype_bank and optimizer_prototypes (can be None).
+    Save FSDP2 checkpoint as consolidated .pth file (rank 0 only).
+    Creates both numbered and 'latest' checkpoints.
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
     
-    # Debug print
+    # Only rank 0 saves the checkpoint
+    if rank != 0:
+        if dist.is_initialized():
+            dist.barrier()  # Sync with rank 0
+        return
+    
     print(f"[Rank {rank}] Starting checkpoint save at iteration {iteration}")
     
-    # Create checkpoint directory if it doesn't exist
+    # Create checkpoint directory
     ckpt_dir = Path(ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     
-    # Use iteration number in the checkpoint name to avoid overwrites
-    ckpt_path = ckpt_dir / f"iter_{iteration}"
-    
     try:
-        # Prepare state dict - handle FSDP2 and DDP models differently
-        print(f"[Rank {rank}] Preparing state dicts...")
+        # Get full state dicts (gathered on rank 0)
+        print(f"[Rank {rank}] Gathering full model state dicts...")
         
-        to_save = {
+        student_state = get_model_state_dict(
+            student,
+            options=StateDictOptions(full_state_dict=True)
+        )
+        
+        teacher_state = get_model_state_dict(
+            teacher,
+            options=StateDictOptions(full_state_dict=True)
+        )
+        
+        print(f"[Rank {rank}] Gathering optimizer state dicts...")
+        
+        optimizer_student_state = get_optimizer_state_dict(
+            student,
+            optimizer_student,
+            options=StateDictOptions(full_state_dict=True)
+        )
+        
+        # Build checkpoint dictionary
+        checkpoint = {
             "iteration": iteration,
+            "student": student_state,
+            "teacher": teacher_state,
+            "optimizer_student": optimizer_student_state,
             "args": vars(args) if hasattr(args, '__dict__') else args,
         }
         
-        # FSDP2 models - use DCP state dict functions
-        print(f"[Rank {rank}] Getting FSDP2 model states...")
-        to_save["student"] = get_model_state_dict(student)
-        to_save["teacher"] = get_model_state_dict(teacher)
-        
-        print(f"[Rank {rank}] Getting optimizer states...")
-        to_save["optimizer_student"] = get_optimizer_state_dict(student, optimizer_student)
-        
-        # DDP model - use regular state dict
-        print(f"[Rank {rank}] Getting prototype bank state...")
+        # DDP models - regular state dict
         if prototype_bank is not None:
-            to_save["prototype_bank"] = prototype_bank.state_dict()
+            checkpoint["prototype_bank"] = prototype_bank.state_dict()
         if optimizer_prototypes is not None:
-            to_save["optimizer_prototypes"] = optimizer_prototypes.state_dict()
-                
+            checkpoint["optimizer_prototypes"] = optimizer_prototypes.state_dict()
+        
         # Optional components
         if dino_class_loss is not None:
-            to_save["dino_class_loss"] = dino_class_loss.state_dict()
+            checkpoint["dino_class_loss"] = dino_class_loss.state_dict()
         if patch_prototype_loss is not None:
-            to_save["patch_prototype_loss"] = patch_prototype_loss.state_dict()
+            checkpoint["patch_prototype_loss"] = patch_prototype_loss.state_dict()
         if fp16_scaler is not None:
-            to_save["fp16_scaler"] = fp16_scaler.state_dict()
+            checkpoint["fp16_scaler"] = fp16_scaler.state_dict()
         
-        # Save with DCP
-        print(f"[Rank {rank}] Calling DCP save to {ckpt_path}...")
-        dcp.save(
-            to_save,
-            storage_writer=FileSystemWriter(str(ckpt_path)),
-        )
+        # Save numbered checkpoint
+        numbered_path = ckpt_dir / f"checkpoint_iter_{iteration:08d}.pth"
+        print(f"[Rank {rank}] Saving checkpoint to {numbered_path}")
+        torch.save(checkpoint, numbered_path)
         
-        print(f"[Rank {rank}] DCP save completed")
+        # Save as latest checkpoint
+        latest_path = ckpt_dir / "checkpoint.pth"
+        print(f"[Rank {rank}] Saving latest checkpoint to {latest_path}")
+        torch.save(checkpoint, latest_path)
         
-        # Clean up old checkpoints (keep only last 3)
-        if rank == 0:
-            existing_checkpoints = sorted(ckpt_dir.glob("iter_*"))
-            if len(existing_checkpoints) > 3:
-                for old_ckpt in existing_checkpoints[:-3]:
-                    import shutil
-                    shutil.rmtree(old_ckpt)
-                    print(f"Removed old checkpoint: {old_ckpt}")
+        print(f"[Rank {rank}] Checkpoint save completed successfully")
+        
+        # Clean up old checkpoints (keep only last 3 numbered checkpoints)
+        existing_checkpoints = sorted(ckpt_dir.glob("checkpoint_iter_*.pth"))
+        if len(existing_checkpoints) > 3:
+            for old_ckpt in existing_checkpoints[:-3]:
+                os.remove(old_ckpt)
+                print(f"[Rank {rank}] Removed old checkpoint: {old_ckpt}")
         
     except Exception as e:
         print(f"[Rank {rank}] ERROR during checkpoint save: {e}")
         import traceback
         traceback.print_exc()
         raise
-    
-    # Synchronize all ranks
-    if dist.is_initialized():
-        print(f"[Rank {rank}] Waiting at barrier...")
-        dist.barrier()
-    
-    print(f"[Rank {rank}] Checkpoint save completed successfully")
+    finally:
+        # Synchronize all ranks
+        if dist.is_initialized():
+            dist.barrier()
+
 
 def load_checkpoint_fsdp2(
     ckpt_dir,
@@ -119,82 +135,91 @@ def load_checkpoint_fsdp2(
     fp16_scaler=None,
 ):
     """
-    Load FSDP2 checkpoint using DCP.
+    Load FSDP2 checkpoint from consolidated .pth file.
+    Tries 'checkpoint.pth' first, then looks for latest numbered checkpoint.
     
     Returns:
         iteration: Loaded iteration number, or 0 if checkpoint doesn't exist
     """
     ckpt_dir = Path(ckpt_dir)
     
-    # Find the latest checkpoint subdirectory
     if not ckpt_dir.exists():
         print(f"No checkpoint directory found at {ckpt_dir}")
         return 0
     
-    # Look for iter_* subdirectories
-    checkpoint_subdirs = sorted(ckpt_dir.glob("iter_*"))
-    if not checkpoint_subdirs:
-        print(f"No checkpoint subdirectories found in {ckpt_dir}")
-        return 0
-    
-    # Use the latest checkpoint
-    latest_ckpt = checkpoint_subdirs[-1]
-    print(f"Loading checkpoint from {latest_ckpt}")
-    
     rank = dist.get_rank() if dist.is_initialized() else 0
     
-    to_load = {
-        "iteration": 0,
-        "student": get_model_state_dict(student),
-        "teacher": get_model_state_dict(teacher),
-        "optimizer_student": get_optimizer_state_dict(student, optimizer_student),
-    }
-
-    if prototype_bank is not None:
-        to_load["prototype_bank"] = prototype_bank.state_dict()
-    if optimizer_prototypes is not None:
-        to_load["optimizer_prototypes"] = optimizer_prototypes.state_dict()
-        
-    # Add optional components
-    if dino_class_loss is not None:
-        to_load["dino_class_loss"] = dino_class_loss.state_dict()
-    if patch_prototype_loss is not None:
-        to_load["patch_prototype_loss"] = patch_prototype_loss.state_dict()
-    if fp16_scaler is not None:
-        to_load["fp16_scaler"] = fp16_scaler.state_dict()
+    # Find checkpoint file
+    latest_path = ckpt_dir / "checkpoint.pth"
     
-    # Load with DCP from the specific subdirectory
+    if latest_path.exists():
+        ckpt_path = latest_path
+        print(f"[Rank {rank}] Loading from latest checkpoint: {ckpt_path}")
+    else:
+        # Look for numbered checkpoints
+        checkpoint_files = sorted(ckpt_dir.glob("checkpoint_iter_*.pth"))
+        if not checkpoint_files:
+            print(f"[Rank {rank}] No checkpoint files found in {ckpt_dir}")
+            return 0
+        
+        ckpt_path = checkpoint_files[-1]  # Get most recent
+        print(f"[Rank {rank}] Loading from numbered checkpoint: {ckpt_path}")
+    
     try:
-        dcp.load(
-            to_load,
-            storage_reader=FileSystemReader(str(latest_ckpt)),
+        # Load checkpoint (all ranks load the same file)
+        print(f"[Rank {rank}] Loading checkpoint file...")
+        checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        
+        iteration = checkpoint.get("iteration", 0)
+        
+        # Prepare state dicts for loading
+        print(f"[Rank {rank}] Setting model state dicts...")
+        
+        # Set FSDP2 model states
+        set_model_state_dict(
+            student,
+            model_state_dict=checkpoint["student"],
+            options=StateDictOptions(strict=True)
         )
+        
+        set_model_state_dict(
+            teacher,
+            model_state_dict=checkpoint["teacher"],
+            options=StateDictOptions(strict=True)
+        )
+        
+        # Set optimizer state
+        set_optimizer_state_dict(
+            student,
+            optimizer_student,
+            optim_state_dict=checkpoint["optimizer_student"],
+            options=StateDictOptions(strict=True)
+        )
+        
+        # Load DDP model states
+        if prototype_bank is not None and "prototype_bank" in checkpoint:
+            prototype_bank.load_state_dict(checkpoint["prototype_bank"])
+        
+        if optimizer_prototypes is not None and "optimizer_prototypes" in checkpoint:
+            optimizer_prototypes.load_state_dict(checkpoint["optimizer_prototypes"])
+        
+        # Load optional components
+        if dino_class_loss is not None and "dino_class_loss" in checkpoint:
+            dino_class_loss.load_state_dict(checkpoint["dino_class_loss"])
+        
+        if patch_prototype_loss is not None and "patch_prototype_loss" in checkpoint:
+            patch_prototype_loss.load_state_dict(checkpoint["patch_prototype_loss"])
+        
+        if fp16_scaler is not None and "fp16_scaler" in checkpoint:
+            fp16_scaler.load_state_dict(checkpoint["fp16_scaler"])
+        
+        print(f"[Rank {rank}] Successfully loaded checkpoint from iteration {iteration}")
+        
+        return iteration
+        
     except Exception as e:
         print(f"[Rank {rank}] ERROR loading checkpoint: {e}")
+        import traceback
+        traceback.print_exc()
         print(f"[Rank {rank}] Starting training from scratch")
         return 0
-    
-    # Set loaded states
-    iteration = to_load["iteration"]
-    set_model_state_dict(student, to_load["student"])
-    set_model_state_dict(teacher, to_load["teacher"])
-    
-    if prototype_bank is not None:
-        prototype_bank.load_state_dict(to_load["prototype_bank"])
-    
-    set_optimizer_state_dict(student, optimizer_student, to_load["optimizer_student"])
-    
-    if optimizer_prototypes is not None:
-        optimizer_prototypes.load_state_dict(to_load["optimizer_prototypes"])
-    
-    # Load optional components
-    if dino_class_loss is not None and "dino_class_loss" in to_load:
-        dino_class_loss.load_state_dict(to_load["dino_class_loss"])
-    if patch_prototype_loss is not None and "patch_prototype_loss" in to_load:
-        patch_prototype_loss.load_state_dict(to_load["patch_prototype_loss"])
-    if fp16_scaler is not None and "fp16_scaler" in to_load:
-        fp16_scaler.load_state_dict(to_load["fp16_scaler"])
-    
-    print(f"[Rank {rank}] Successfully loaded FSDP2 checkpoint from iteration {iteration}")
-    
-    return iteration
