@@ -680,7 +680,7 @@ def train_dinov2(args):
         
         # ========== Save checkpoints ==========
         # Don't save at iteration 0, and add better logging
-        if current_iteration > 0 and current_iteration % args.save_checkpoint_freq == 0:
+        if current_iteration % args.save_checkpoint_freq == 0:
             if utils.is_main_process():
                 print(f"Preparing to save checkpoint at iteration {current_iteration}...")
             
