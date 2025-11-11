@@ -64,6 +64,8 @@ def get_args_parser():
                         help='Ratio of tokens to mask for iBOT')
     
     # ========== Patch Prototype Clustering parameters ==========
+    parser.add_argument('--use_prototype_clustering', default=True, type=utils.bool_flag,
+                    help='Enable patch prototype clustering loss')
     parser.add_argument('--num_prototypes', default=8192, type=int,
                         help='Number of prototypes for clustering')
     parser.add_argument('--clustering_weight', default=1.0, type=float,
