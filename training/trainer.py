@@ -493,11 +493,32 @@ def train_dinov2(args):
             with torch.no_grad():
                 teacher_ibot_output = teacher(original_images, token_masks=None, mode='ibot')
                 teacher_patch_outputs = teacher_ibot_output['patch_outputs']  # [B, N, out_dim]
+
+                # DEBUG: Verify teacher is clean
+                if torch.isnan(teacher_patch_outputs).any():
+                    print(f"[Rank {dist.get_rank()}] WARNING: NaN in TEACHER outputs!")
             
             # Student forward (with masking)
             student_ibot_output = student(original_images, token_masks=random_token_masks, mode='ibot')
             student_patch_outputs = student_ibot_output['patch_outputs']  # [B, N, out_dim]
             
+            # DEBUG: Check for NaN immediately after forward
+            if torch.isnan(student_patch_outputs).any():
+                print(f"[Rank {dist.get_rank()}] [Iter {current_iteration}] NaN detected in student_patch_outputs!")
+                print(f"  Shape: {student_patch_outputs.shape}")
+                print(f"  NaN count: {torch.isnan(student_patch_outputs).sum().item()}")
+                print(f"  Min: {student_patch_outputs[~torch.isnan(student_patch_outputs)].min().item() if (~torch.isnan(student_patch_outputs)).any() else 'all NaN'}")
+                print(f"  Max: {student_patch_outputs[~torch.isnan(student_patch_outputs)].max().item() if (~torch.isnan(student_patch_outputs)).any() else 'all NaN'}")
+                
+                # Check the raw features before projection
+                if 'features' in student_ibot_output and 'patchtokens' in student_ibot_output['features']:
+                    raw_features = student_ibot_output['features']['patchtokens']
+                    if torch.isnan(raw_features).any():
+                        print(f"  NaN in raw patch features (before head): {torch.isnan(raw_features).sum().item()}")
+                    else:
+                        print(f"  Raw features OK: min={raw_features.min():.4f}, max={raw_features.max():.4f}")
+
+
             # Debug shapes on first iteration
             if current_iteration == 0 and utils.is_main_process():
                 print("\n=== iBOT Forward Shapes ===")
