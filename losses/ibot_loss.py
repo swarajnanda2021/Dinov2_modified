@@ -112,7 +112,7 @@ class iBOTPatchLoss(nn.Module):
             print(f"  weighted_loss sum={weighted_loss.sum()}")
             print(f"  denominator={student_masks_flat.shape[0]}")
         
-        return weighted_loss.sum() / student_masks_flat.shape[0]
+        return weighted_loss.mean() 
 
 
 class SinkhornKnoppTeacher(nn.Module):
