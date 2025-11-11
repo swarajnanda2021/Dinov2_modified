@@ -238,11 +238,16 @@ def train_dinov2(args):
         *utils.get_params_groups(student.module.patchhead),
     ])
     
-    optimizer_prototypes = torch.optim.AdamW(
-        prototype_bank.module.parameters(),
-        betas=(0.9, 0.95),
-        weight_decay=0.0,
-    )
+    optimizer_prototypes = None
+    if args.use_prototype_clustering:
+        optimizer_prototypes = torch.optim.AdamW(
+            prototype_bank.module.parameters(),
+            betas=(0.9, 0.95),
+            weight_decay=0.0,
+        )
+        print(f"Created optimizers (including prototype optimizer)")
+    else:
+        print(f"Created optimizer (student only)")
 
     print(f"Created optimizers")
 
@@ -294,17 +299,25 @@ def train_dinov2(args):
             print(f"Could not pre-load checkpoint. Starting fresh. Error: {e}")
             loaded_checkpoint = None
 
+    # Build checkpoint loading kwargs conditionally
+    checkpoint_kwargs = {
+        'student': student,
+        'teacher': teacher,
+        'optimizer_student': optimizer_student,
+        'fp16_scaler': fp16_scaler,
+        'dino_class_loss': dino_class_loss,
+    }
+
+    # Add prototype-related modules only if enabled
+    if args.use_prototype_clustering:
+        checkpoint_kwargs['prototype_bank'] = prototype_bank
+        checkpoint_kwargs['optimizer_prototypes'] = optimizer_prototypes
+        checkpoint_kwargs['patch_prototype_loss'] = patch_prototype_loss
+
     utils.restart_from_checkpoint(
         os.path.join(args.output_dir, "checkpoint.pth"),
         run_variables=to_restore,
-        student=student,
-        teacher=teacher,
-        prototype_bank=prototype_bank, # Can be None
-        optimizer_student=optimizer_student,
-        optimizer_prototypes=optimizer_prototypes, # Can be None
-        fp16_scaler=fp16_scaler,
-        dino_class_loss=dino_class_loss,
-        patch_prototype_loss=patch_prototype_loss, # Can be None
+        **checkpoint_kwargs
     )
 
     current_iteration = to_restore["iteration"]
@@ -450,12 +463,12 @@ def train_dinov2(args):
             if i == 0:
                 param_group["weight_decay"] = wd_schedule[current_iteration]
 
-        if args.use_prototype_clustering:
+        if args.use_prototype_clustering and optimizer_prototypes is not None:
             for param_group in optimizer_prototypes.param_groups:
                 param_group["lr"] = proto_lr_schedule[current_iteration]
 
         optimizer_student.zero_grad()
-        if args.use_prototype_clustering:
+        if args.use_prototype_clustering and optimizer_prototypes is not None:
             optimizer_prototypes.zero_grad()
                 
         # ========== Forward passes and loss computation ==========
@@ -546,6 +559,13 @@ def train_dinov2(args):
                 teacher_patch_features = teacher_ibot_output['features']['patchtokens']  # [B, N, 768]
                 student_patch_features = student_ibot_output['features']['patchtokens']  # [B, N, 768]
                 
+                # Debug shapes on first iteration
+                if current_iteration == 0 and utils.is_main_process():
+                    print("\n=== Clustering Forward Shapes ===")
+                    print(f"Teacher patch features: {teacher_patch_features.shape}")
+                    print(f"Student patch features: {student_patch_features.shape}")
+                    print("="*50 + "\n")
+                
                 # Compute clustering loss
                 clustering_loss, koleo_proto_loss, teacher_proto_loss = patch_prototype_loss(
                     teacher_patch_features,
@@ -561,13 +581,6 @@ def train_dinov2(args):
                 print(f"Student patch features: {student_patch_features.shape}")
                 print("="*50 + "\n")
             
-            # Compute clustering loss
-            clustering_loss, koleo_proto_loss, teacher_proto_loss = patch_prototype_loss(
-                teacher_patch_features,
-                student_patch_features,
-                random_token_masks,
-                prototype_bank
-            )
             
             # ========== Total Losses ==========
             student_loss = (
@@ -598,7 +611,7 @@ def train_dinov2(args):
             optimizer_student.zero_grad()
             
             # ===== Prototype backward + step (optional) =====
-            if args.use_prototype_clustering:
+            if args.use_prototype_clustering and optimizer_prototypes is not None and prototype_loss is not None:
                 prototype_loss.backward()
                 optimizer_prototypes.step()
                 optimizer_prototypes.zero_grad()
@@ -621,10 +634,10 @@ def train_dinov2(args):
             fp16_scaler.step(optimizer_student)
             optimizer_student.zero_grad()
             
-            # Prototype backward + step (optional)
-            if args.use_prototype_clustering:
-                fp16_scaler.scale(prototype_loss).backward()
-                fp16_scaler.step(optimizer_prototypes)
+            # ===== Prototype backward + step (optional) =====
+            if args.use_prototype_clustering and optimizer_prototypes is not None and prototype_loss is not None:
+                prototype_loss.backward()
+                optimizer_prototypes.step()
                 optimizer_prototypes.zero_grad()
             
             # Update scaler ONCE at the end
@@ -718,11 +731,8 @@ def train_dinov2(args):
             save_dict = {
                 'student': student.state_dict(),
                 'teacher': teacher.state_dict(),
-                'prototype_bank': prototype_bank.state_dict(),
                 'dino_class_loss': dino_class_loss.state_dict(),
-                'patch_prototype_loss': patch_prototype_loss.state_dict(),
                 'optimizer_student': optimizer_student.state_dict(),
-                'optimizer_prototypes': optimizer_prototypes.state_dict(),
                 'iteration': current_iteration,
                 'dataset_position': dataset_position,
                 'args': args,
@@ -731,6 +741,16 @@ def train_dinov2(args):
                 'numpy_rng_state': np.random.get_state(),
                 'random_rng_state': random.getstate(),
             }
+
+            # Add prototype-related state only if enabled
+            if args.use_prototype_clustering:
+                if prototype_bank is not None:
+                    save_dict['prototype_bank'] = prototype_bank.state_dict()
+                if patch_prototype_loss is not None:
+                    save_dict['patch_prototype_loss'] = patch_prototype_loss.state_dict()
+                if optimizer_prototypes is not None:
+                    save_dict['optimizer_prototypes'] = optimizer_prototypes.state_dict()
+
             if fp16_scaler is not None:
                 save_dict['fp16_scaler'] = fp16_scaler.state_dict()
             
