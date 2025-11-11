@@ -472,27 +472,17 @@ def train_dinov2(args):
             optimizer_prototypes.zero_grad()
                 
         # ========== Forward passes and loss computation ==========
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+        with torch.cuda.amp.auto`cast(dtype=torch.bfloat16, enabled=args.use_fp16):
             # ========== DINO Loss with Sequence Packing ==========
             
             # Teacher forward (only global crops, no masking)
             with torch.no_grad():
                 teacher_output = teacher(teacher_global_crops, token_masks=None, mode='dino')
-                teacher_cls_outputs = teacher_output['cls_outputs']  # [B*2, out_dim]
+                teacher_cls_outputs = teacher_output['cls_outputs']
             
             # Student forward (all crops, packed together)
             student_output = student(student_all_crops, token_masks=None, mode='dino')
-            student_cls_outputs = student_output['cls_outputs']  # [B*total_views, out_dim]
-            
-            # Debug shapes on first iteration
-            if current_iteration == 0 and utils.is_main_process():
-                print("\n=== DINO Forward Shapes ===")
-                print(f"Teacher CLS outputs: {teacher_cls_outputs.shape}")
-                print(f"Student CLS outputs: {student_cls_outputs.shape}")
-                print(f"Features list length: {len(student_output['features_list'])}")
-                for i, feat in enumerate(student_output['features_list'][:3]):  # Show first 3
-                    print(f"  Crop {i}: cls={feat['clstoken'].shape}, patches={feat['patchtokens'].shape}")
-                print("="*50 + "\n")
+            student_cls_outputs = student_output['cls_outputs']
             
             # Compute DINO loss
             dino_class_loss_val = dino_class_loss(
@@ -502,10 +492,8 @@ def train_dinov2(args):
             )
             
             # ========== KoLeo Loss on Global CLS Tokens ==========
-            # Extract features for global crops only
             num_global_total = args.global_views + args.num_masks
             global_features_list = student_output['features_list'][:num_global_total]
-            
             global_cls_tokens = [feat_dict['clstoken'] for feat_dict in global_features_list]
             
             koleo_loss_val = torch.tensor(0.0).cuda()
@@ -515,7 +503,6 @@ def train_dinov2(args):
             # ========== iBOT Loss (Canonical) ==========
             batch_size = original_images.shape[0]
             n_patches_h = n_patches_w = 224 // args.patch_size
-            n_patches = n_patches_h * n_patches_w
             
             # Generate random token masks
             random_token_masks = generate_random_token_masks(
@@ -526,20 +513,11 @@ def train_dinov2(args):
             # Teacher forward (no masking)
             with torch.no_grad():
                 teacher_ibot_output = teacher(original_images, token_masks=None, mode='ibot')
-                teacher_patch_outputs = teacher_ibot_output['patch_outputs']  # [B, N, out_dim]
+                teacher_patch_outputs = teacher_ibot_output['patch_outputs']
             
             # Student forward (with masking)
             student_ibot_output = student(original_images, token_masks=random_token_masks, mode='ibot')
-            student_patch_outputs = student_ibot_output['patch_outputs']  # [B, N, out_dim]
-            
-            # Debug shapes on first iteration
-            if current_iteration == 0 and utils.is_main_process():
-                print("\n=== iBOT Forward Shapes ===")
-                print(f"Random token masks: {random_token_masks.shape}")
-                print(f"Teacher patch outputs: {teacher_patch_outputs.shape}")
-                print(f"Student patch outputs: {student_patch_outputs.shape}")
-                print(f"Number of masked tokens: {random_token_masks.sum().item()}")
-                print("="*50 + "\n")
+            student_patch_outputs = student_ibot_output['patch_outputs']
             
             # Compute iBOT loss
             ibot_loss_val = ibot_patch_loss.forward_masked(
@@ -548,81 +526,123 @@ def train_dinov2(args):
                 random_token_masks,
                 teacher_temp=dino_class_loss.teacher_temp_schedule(current_iteration)
             )
-            
-            # ========== Patch Prototype Clustering Loss (Optional) ==========
-            clustering_loss = torch.tensor(0.0).cuda()
-            koleo_proto_loss = torch.tensor(0.0).cuda()
-            teacher_proto_loss = torch.tensor(0.0).cuda()
 
-            if args.use_prototype_clustering:
-                # Get raw patch features (before projection head)
-                teacher_patch_features = teacher_ibot_output['features']['patchtokens']  # [B, N, 768]
-                student_patch_features = student_ibot_output['features']['patchtokens']  # [B, N, 768]
+        # ========== Patch Prototype Clustering (Separate from student loss) ==========
+        if args.use_prototype_clustering:
+            # TEACHER PATH: Generate targets with gradients for prototype bank
+            # This runs OUTSIDE the student's autocast context
+            teacher_patch_features = teacher_ibot_output['features']['patchtokens']
+            
+            # Compute targets with grad enabled for prototype bank
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+                teacher_patch_features_norm = F.normalize(teacher_patch_features, p=2, dim=-1)
+                teacher_logits_all = prototype_bank(teacher_patch_features_norm)
                 
-                # Debug shapes on first iteration
-                if current_iteration == 0 and utils.is_main_process():
-                    print("\n=== Clustering Forward Shapes ===")
-                    print(f"Teacher patch features: {teacher_patch_features.shape}")
-                    print(f"Student patch features: {student_patch_features.shape}")
-                    print("="*50 + "\n")
+                B, N, K = teacher_logits_all.shape
+                teacher_logits_flat = teacher_logits_all.reshape(B * N, -1)
                 
-                # Compute clustering loss
-                clustering_loss, koleo_proto_loss, teacher_proto_loss = patch_prototype_loss(
-                    teacher_patch_features,
-                    student_patch_features,
-                    random_token_masks,
-                    prototype_bank
+                # Sinkhorn-Knopp to get targets (no_grad inside the function)
+                Q_tilde_flat = patch_prototype_loss.sinkhorn_knopp(
+                    teacher_logits_flat, 
+                    args.clustering_teacher_temp
                 )
-
-            # Debug shapes on first iteration
-            if current_iteration == 0 and utils.is_main_process():
-                print("\n=== Clustering Forward Shapes ===")
-                print(f"Teacher patch features: {teacher_patch_features.shape}")
-                print(f"Student patch features: {student_patch_features.shape}")
-                print("="*50 + "\n")
+                Q_tilde_all = Q_tilde_flat.reshape(B, N, -1)
+                
+                # Arrangement Loss: KL(Q̃ || Q) - only trains prototype bank
+                teacher_log_probs_all = F.log_softmax(
+                    teacher_logits_all / args.clustering_teacher_temp, 
+                    dim=-1
+                )
+                teacher_proto_loss = -torch.sum(Q_tilde_all.detach() * teacher_log_probs_all) / (B * N)
+                
+                # KoLeo on prototype weights
+                weight_normalized = F.normalize(prototype_bank.module.proto_layer.weight, p=2, dim=1)
+                koleo_proto_loss = patch_prototype_loss.koleo_loss(weight_normalized)
             
+            # ========== CRITICAL: Detach targets before student uses them ==========
+            Q_tilde_masked = Q_tilde_all[random_token_masks].detach()  # ← DETACH HERE
             
-            # ========== Total Losses ==========
-            student_loss = (
-                dino_class_loss_val +
-                args.koleo_loss_weight * koleo_loss_val +
-                args.ibot_loss_weight * ibot_loss_val
-            )
+            # STUDENT PATH: Prediction loss (only trains student)
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+                student_patch_features = student_ibot_output['features']['patchtokens']
+                student_norm_masked = F.normalize(student_patch_features[random_token_masks], p=2, dim=-1)
+                
+                if student_norm_masked.shape[0] > 0:
+                    student_logits_masked = prototype_bank(student_norm_masked)
+                    student_log_probs_masked = F.log_softmax(
+                        student_logits_masked / args.clustering_student_temp, 
+                        dim=-1
+                    )
+                    clustering_loss = -torch.sum(Q_tilde_masked * student_log_probs_masked) / student_norm_masked.shape[0]
+                else:
+                    clustering_loss = torch.tensor(0.0, device=original_images.device)
+            
+            # Update metrics
+            with torch.no_grad():
+                student_probs = torch.exp(student_log_probs_masked) if student_norm_masked.shape[0] > 0 else None
+                if student_probs is not None:
+                    entropy = -(student_probs * student_log_probs_masked).sum(dim=-1).mean()
+                    patch_prototype_loss.last_entropy = (entropy / math.log(args.num_prototypes)).item()
+                    
+                    assignments = torch.argmax(Q_tilde_masked, dim=-1)
+                    usage = torch.bincount(assignments, minlength=args.num_prototypes).float()
+                    if dist.is_initialized():
+                        dist.all_reduce(usage)
+                    patch_prototype_loss.last_usage_std = (usage.std() / (usage.mean() + 1e-6)).item()
+                
+                patch_prototype_loss.last_prediction_loss = clustering_loss.item()
+                patch_prototype_loss.last_arrangement_loss = teacher_proto_loss.item()
+                patch_prototype_loss.last_koleo_loss = koleo_proto_loss.item()
+        else:
+            clustering_loss = torch.tensor(0.0).cuda()
+            teacher_proto_loss = torch.tensor(0.0).cuda()
+            koleo_proto_loss = torch.tensor(0.0).cuda()
 
-            if args.use_prototype_clustering:
-                student_loss += args.clustering_weight * clustering_loss
+        # ========== Compute Total Losses ==========
+        # Student loss: DINO + KoLeo + iBOT + Clustering prediction
+        student_loss = (
+            dino_class_loss_val +
+            args.koleo_loss_weight * koleo_loss_val +
+            args.ibot_loss_weight * ibot_loss_val +
+            args.clustering_weight * clustering_loss
+        )
 
-            prototype_loss = None
-            if args.use_prototype_clustering:
-                prototype_loss = teacher_proto_loss + koleo_proto_loss
-        
+        # Prototype loss: Arrangement + KoLeo (separate backward)
+        prototype_loss = teacher_proto_loss + koleo_proto_loss
+
         # ========== Backward and optimizer steps ==========
         if fp16_scaler is None:
-            # ===== Student backward + step =====
+            # ===== NON-MIXED PRECISION =====
+            
+            # 1. Prototype backward (if enabled)
+            if args.use_prototype_clustering and optimizer_prototypes is not None:
+                optimizer_prototypes.zero_grad()
+                prototype_loss.backward()
+                optimizer_prototypes.step()
+            
+            # 2. Student backward
+            optimizer_student.zero_grad()
             student_loss.backward()
             
-            # Clip and cancel BEFORE stepping
             if args.clip_grad:
                 utils.clip_gradients(student, args.clip_grad)
             utils.cancel_gradients_last_layer(current_iteration, student.module.classhead, args.freeze_last_layer_iters)
             utils.cancel_gradients_last_layer(current_iteration, student.module.patchhead, args.freeze_last_layer_iters)
             
             optimizer_student.step()
-            optimizer_student.zero_grad()
-            
-            # ===== Prototype backward + step (optional) =====
-            if args.use_prototype_clustering and optimizer_prototypes is not None and prototype_loss is not None:
-                prototype_loss.backward()
-                optimizer_prototypes.step()
-                optimizer_prototypes.zero_grad()
             
         else:
-            # ===== Mixed precision =====
+            # ===== MIXED PRECISION =====
             
-            # Student backward
+            # 1. Prototype backward (NO scaler - uses bfloat16 directly)
+            if args.use_prototype_clustering and optimizer_prototypes is not None:
+                optimizer_prototypes.zero_grad()
+                prototype_loss.backward()
+                optimizer_prototypes.step()
+            
+            # 2. Student backward (WITH scaler)
+            optimizer_student.zero_grad()
             fp16_scaler.scale(student_loss).backward()
-            
-            # Unscale BEFORE clipping/canceling/stepping
             fp16_scaler.unscale_(optimizer_student)
             
             if args.clip_grad:
@@ -630,20 +650,10 @@ def train_dinov2(args):
             utils.cancel_gradients_last_layer(current_iteration, student.module.classhead, args.freeze_last_layer_iters)
             utils.cancel_gradients_last_layer(current_iteration, student.module.patchhead, args.freeze_last_layer_iters)
             
-            # Now step
             fp16_scaler.step(optimizer_student)
-            optimizer_student.zero_grad()
-            
-            # ===== Prototype backward + step (optional) =====
-            if args.use_prototype_clustering and optimizer_prototypes is not None and prototype_loss is not None:
-                prototype_loss.backward()
-                optimizer_prototypes.step()
-                optimizer_prototypes.zero_grad()
-            
-            # Update scaler ONCE at the end
             fp16_scaler.update()
-        
-        
+
+
         # ========== EMA update teacher ==========
         with torch.no_grad():
             m = momentum_schedule[current_iteration]
