@@ -29,6 +29,7 @@ def save_checkpoint_fsdp2(
 ):
     """
     Save FSDP2 checkpoint using DCP with better error handling.
+    Handles optional prototype_bank and optimizer_prototypes (can be None).
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
     
@@ -61,9 +62,11 @@ def save_checkpoint_fsdp2(
         
         # DDP model - use regular state dict
         print(f"[Rank {rank}] Getting prototype bank state...")
-        to_save["prototype_bank"] = prototype_bank.state_dict()
-        to_save["optimizer_prototypes"] = optimizer_prototypes.state_dict()
-        
+        if prototype_bank is not None:
+            to_save["prototype_bank"] = prototype_bank.state_dict()
+        if optimizer_prototypes is not None:
+            to_save["optimizer_prototypes"] = optimizer_prototypes.state_dict()
+                
         # Optional components
         if dino_class_loss is not None:
             to_save["dino_class_loss"] = dino_class_loss.state_dict()
@@ -128,16 +131,18 @@ def load_checkpoint_fsdp2(
     
     rank = dist.get_rank() if dist.is_initialized() else 0
     
-    # Prepare state dict
     to_load = {
-        "iteration": 0,
-        "student": get_model_state_dict(student),
-        "teacher": get_model_state_dict(teacher),
-        "prototype_bank": prototype_bank.state_dict(),
-        "optimizer_student": get_optimizer_state_dict(student, optimizer_student),
-        "optimizer_prototypes": optimizer_prototypes.state_dict(),
+    "iteration": 0,
+    "student": get_model_state_dict(student),
+    "teacher": get_model_state_dict(teacher),
+    "optimizer_student": get_optimizer_state_dict(student, optimizer_student),
     }
-    
+
+    if prototype_bank is not None:
+        to_load["prototype_bank"] = prototype_bank.state_dict()
+    if optimizer_prototypes is not None:
+        to_load["optimizer_prototypes"] = optimizer_prototypes.state_dict()
+        
     # Add optional components
     if dino_class_loss is not None:
         to_load["dino_class_loss"] = dino_class_loss.state_dict()
