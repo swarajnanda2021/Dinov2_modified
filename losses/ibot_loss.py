@@ -107,7 +107,7 @@ class iBOTPatchLoss(nn.Module):
         weighted_loss = loss_per_token * masks_weight
 
         # DEBUG: Check final
-        if torch.isnan(final_loss):
+        if torch.isnan(weighted_loss):
             print(f"[Rank {dist.get_rank()}] NaN in final_loss")
             print(f"  weighted_loss sum={weighted_loss.sum()}")
             print(f"  denominator={student_masks_flat.shape[0]}")
