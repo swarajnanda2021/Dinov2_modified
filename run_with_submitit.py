@@ -146,6 +146,7 @@ def main():
     args.token_mask_ratio = 0.4
     
     # Prototype clustering
+    args.use_prototype_clustering = True
     args.num_prototypes = 4096
     args.clustering_weight = 1.0
     args.clustering_teacher_temp = 0.07
