@@ -537,7 +537,7 @@ def train_dinov2(args):
                 dino_class_loss_val +
                 args.koleo_loss_weight * koleo_loss_val +
                 args.ibot_loss_weight * ibot_loss_val +
-                args.clustering_weight * clustering_loss.detach()
+                args.clustering_weight * clustering_loss
             )
             
             prototype_loss = (
@@ -545,44 +545,49 @@ def train_dinov2(args):
                 koleo_proto_loss
             )
         
-        # ==========  Backward and optimizer steps ==========
+        # ========== Backward and optimizer steps ==========
         if fp16_scaler is None:
-            student_loss.backward()  # Grads to student AND prototypes
-            optimizer_student.step()
-            optimizer_student.zero_grad()  # Only clear student grads
+            # ===== Student backward + step =====
+            student_loss.backward()
             
-            # Prototypes still have their gradients from step 1
-            prototype_loss.backward()  # ACCUMULATES additional grads to prototypes
+            # Clip and cancel BEFORE stepping
+            if args.clip_grad:
+                utils.clip_gradients(student, args.clip_grad)
+            utils.cancel_gradients_last_layer(current_iteration, student.classhead, args.freeze_last_layer_iters)
+            utils.cancel_gradients_last_layer(current_iteration, student.patchhead, args.freeze_last_layer_iters)
+            
+            optimizer_student.step()
+            optimizer_student.zero_grad()
+            
+            # ===== Prototype backward + step =====
+            prototype_loss.backward()
             optimizer_prototypes.step()
             optimizer_prototypes.zero_grad()
             
-            # Gradient clipping
+        else:
+            # ===== Mixed precision =====
+            
+            # Student backward
+            fp16_scaler.scale(student_loss).backward()
+            
+            # Unscale BEFORE clipping/canceling/stepping
+            fp16_scaler.unscale_(optimizer_student)
+            
             if args.clip_grad:
                 utils.clip_gradients(student, args.clip_grad)
+            utils.cancel_gradients_last_layer(current_iteration, student.classhead, args.freeze_last_layer_iters)
+            utils.cancel_gradients_last_layer(current_iteration, student.patchhead, args.freeze_last_layer_iters)
             
-            # Cancel last layer gradients
-            utils.cancel_gradients_last_layer(current_iteration, student.module.classhead, args.freeze_last_layer_iters)
-            utils.cancel_gradients_last_layer(current_iteration, student.module.patchhead, args.freeze_last_layer_iters)
-            
-        else:
-            # Mixed precision: same logic
-            fp16_scaler.scale(student_loss).backward()
+            # Now step
             fp16_scaler.step(optimizer_student)
-            optimizer_student.zero_grad()  # Only clear student grads
-
-            # Prototypes still have their gradients from step 1
-            fp16_scaler.scale(prototype_loss).backward() # ACCUMULATES additional grads to prototypes
+            optimizer_student.zero_grad()
+            
+            # Prototype backward + step
+            fp16_scaler.scale(prototype_loss).backward()
             fp16_scaler.step(optimizer_prototypes)
             optimizer_prototypes.zero_grad()
             
-            fp16_scaler.unscale_(optimizer_student)
-            if args.clip_grad:
-                utils.clip_gradients(student, args.clip_grad)
-            
-            utils.cancel_gradients_last_layer(current_iteration, student.module.classhead, args.freeze_last_layer_iters)
-            utils.cancel_gradients_last_layer(current_iteration, student.module.patchhead, args.freeze_last_layer_iters)
-            
-            
+            # Update scaler ONCE at the end
             fp16_scaler.update()
         
         # Check Dtensor type
