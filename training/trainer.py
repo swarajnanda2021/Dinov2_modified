@@ -485,6 +485,13 @@ def train_dinov2(args):
                 batch_size, n_patches_h, n_patches_w,
                 args.token_mask_ratio, original_images.device
             )
+
+            # Compute n_masked_patches as a TENSOR (not scalar)
+            n_masked_patches_tensor = torch.tensor(
+                random_token_masks.sum().item(),
+                device=original_images.device,
+                dtype=torch.long
+            )
             
             # Teacher forward (no masking)
             with torch.no_grad():
@@ -509,6 +516,7 @@ def train_dinov2(args):
                 student_patch_outputs,
                 teacher_patch_outputs,
                 random_token_masks,
+                n_masked_patches_tensor=n_masked_patches_tensor,
                 teacher_temp=dino_class_loss.teacher_temp_schedule(current_iteration)
             )
             

@@ -9,104 +9,99 @@ import torch.distributed as dist
 
 
 class iBOTPatchLoss(nn.Module):
-    """
-    Canonical iBOT patch loss implementation.
-    
-    Args:
-        student_temp: Student temperature
-        n_iterations: Sinkhorn-Knopp iterations
-    """
     def __init__(self, student_temp=0.1, n_iterations=3):
         super().__init__()
         self.student_temp = student_temp
         self.n_iterations = n_iterations
+        # Separate Sinkhorn-Knopp as a module
+        self.sinkhorn_knopp_teacher = SinkhornKnoppTeacher()
 
     def forward_masked(
         self,
         student_patch_tokens_masked,
         teacher_patch_tokens_masked,
         student_masks_flat,
-        n_masked_patches=None,
+        n_masked_patches_tensor,  # ADD THIS PARAMETER
         masks_weight=None,
         teacher_temp=0.07
     ):
         """
         Args:
-            student_patch_tokens_masked: [B, N, D]
-            teacher_patch_tokens_masked: [B, N, D]
-            student_masks_flat: [B, N] boolean mask
+            n_masked_patches_tensor: Tensor containing count of masked patches (for distributed reduction)
         """
         B, N, D = student_patch_tokens_masked.shape
         
-        # Flatten everything - no loops!
-        student_flat = student_patch_tokens_masked.reshape(B * N, D)  # [B*N, D]
-        teacher_flat = teacher_patch_tokens_masked.reshape(B * N, D)  # [B*N, D]
-        masks_flat = student_masks_flat.reshape(B * N)  # [B*N]
+        student_flat = student_patch_tokens_masked.reshape(B * N, D)
+        teacher_flat = teacher_patch_tokens_masked.reshape(B * N, D)
+        masks_flat = student_masks_flat.reshape(B * N)
         
-        # Vectorized extraction of masked tokens
-        student_masked = student_flat[masks_flat]  # [M, D] where M = number of True values
-        teacher_masked = teacher_flat[masks_flat]  # [M, D]
+        student_masked = student_flat[masks_flat]
+        teacher_masked = teacher_flat[masks_flat]
         
         if student_masked.shape[0] == 0:
             return torch.tensor(0.0, device=student_patch_tokens_masked.device)
         
-        # Compute weights
         if masks_weight is None:
-            # Count masked tokens per sample
-            n_masked_per_sample = student_masks_flat.sum(dim=-1).clamp(min=1.0)  # [B]
-            per_sample_weight = 1.0 / n_masked_per_sample  # [B]
-            # Expand to match masked tokens
-            masks_weight = per_sample_weight.unsqueeze(-1).expand_as(student_masks_flat)  # [B, N]
-            masks_weight = masks_weight.reshape(B * N)[masks_flat]  # [M]
+            n_masked_per_sample = student_masks_flat.sum(dim=-1).clamp(min=1.0)
+            per_sample_weight = 1.0 / n_masked_per_sample
+            masks_weight = per_sample_weight.unsqueeze(-1).expand_as(student_masks_flat)
+            masks_weight = masks_weight.reshape(B * N)[masks_flat]
         else:
-            masks_weight = masks_weight.reshape(B * N)[masks_flat]  # [M]
+            masks_weight = masks_weight.reshape(B * N)[masks_flat]
         
-        # Normalize teacher (happens inside, which is fine!)
-        teacher_normalized = self.sinkhorn_knopp_normalization(teacher_masked, teacher_temp)
+        # Use the module's Sinkhorn-Knopp with proper n_masked_patches_tensor
+        teacher_normalized = self.sinkhorn_knopp_teacher(
+            teacher_masked, 
+            teacher_temp,
+            n_masked_patches_tensor  # Pass as parameter
+        )
         
-        # Compute loss
         student_log_probs = F.log_softmax(student_masked / self.student_temp, dim=-1)
         loss_per_token = -torch.sum(teacher_normalized * student_log_probs, dim=-1)
         weighted_loss = loss_per_token * masks_weight
         
-        return weighted_loss.mean()
+        return weighted_loss.sum() / student_masks_flat.shape[0]
 
+
+class SinkhornKnoppTeacher(nn.Module):
+    """Separate module for Sinkhorn-Knopp (can be compiled)"""
+    
     @torch.no_grad()
-    def sinkhorn_knopp_normalization(self, teacher_output, teacher_temp, n_iterations=3):
+    def forward(self, teacher_output, teacher_temp, n_masked_patches_tensor, n_iterations=3):
         """
         Args:
             teacher_output: [M_local, K] where M_local = masked tokens on this rank
+            teacher_temp: Temperature
+            n_masked_patches_tensor: TENSOR (not scalar) with local count
         """
         teacher_output = teacher_output.float()
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
         
         Q = torch.exp(teacher_output / teacher_temp).t()  # [K, M_local]
-        K = Q.shape[0]  # number of prototypes
-        M_local = Q.shape[1]  # local masked tokens
+        K = Q.shape[0]
         
-        # Total masked tokens across all ranks
-        M_total_tensor = torch.tensor(M_local, device=Q.device, dtype=torch.long)
+        # Get total masked patches by reducing the tensor directly
+        B = n_masked_patches_tensor.clone()  # Clone to avoid modifying input
         if dist.is_initialized():
-            dist.all_reduce(M_total_tensor)
-        M_total = M_total_tensor.item()  # Total across all ranks
+            dist.all_reduce(B)
         
-        # Normalize
+        # Initial normalization
         sum_Q = torch.sum(Q)
         if dist.is_initialized():
             dist.all_reduce(sum_Q)
-        Q /= (sum_Q + 1e-8)
+        Q /= sum_Q  # No epsilon here
         
+        # Sinkhorn-Knopp iterations
         for _ in range(n_iterations):
-            # Rows (prototypes)
+            # Normalize rows (prototypes)
             sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
             if dist.is_initialized():
                 dist.all_reduce(sum_of_rows)
-            Q /= (sum_of_rows + 1e-8)
+            Q /= sum_of_rows
             Q /= K
             
-            # Columns (samples)
-            Q /= (torch.sum(Q, dim=0, keepdim=True) + 1e-8)
-            Q /= M_total
+            # Normalize columns (samples)
+            Q /= torch.sum(Q, dim=0, keepdim=True)
+            Q /= B
         
-        Q *= M_total
+        Q *= B
         return Q.t()  # [M_local, K]
