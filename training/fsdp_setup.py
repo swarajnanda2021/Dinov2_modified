@@ -13,7 +13,7 @@ def get_mixed_precision_policy():
     """Configure bf16 mixed precision for H100."""
     return MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
     )
 
 
