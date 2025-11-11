@@ -72,8 +72,8 @@ class PatchPrototypeLoss(nn.Module):
         B, N, D = teacher_patch_tokens.shape
         
         # Normalize features
-        teacher_norm = F.normalize(teacher_patch_tokens, p=2, dim=-1).float()
-        student_norm = F.normalize(student_patch_tokens, p=2, dim=-1).float()
+        teacher_norm = F.normalize(teacher_patch_tokens, p=2, dim=-1)
+        student_norm = F.normalize(student_patch_tokens, p=2, dim=-1)
         
         # ========== TEACHER PATH: ALL PATCHES ==========
         teacher_logits_all = prototype_bank(teacher_norm)  # [B, N, K]
@@ -101,7 +101,7 @@ class PatchPrototypeLoss(nn.Module):
                    torch.tensor(0.0, device=teacher_patch_tokens.device)
         
         # Student predictions at masked positions
-        student_logits_masked = prototype_bank(student_norm_masked).float()  # [M_total, K]
+        student_logits_masked = prototype_bank(student_norm_masked)  # [M_total, K]
         student_log_probs_masked = F.log_softmax(student_logits_masked / self.student_temp, dim=-1)
         
         # Prediction Loss
