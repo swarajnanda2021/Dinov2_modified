@@ -494,30 +494,47 @@ def train_dinov2(args):
                 teacher_ibot_output = teacher(original_images, token_masks=None, mode='ibot')
                 teacher_patch_outputs = teacher_ibot_output['patch_outputs']  # [B, N, out_dim]
 
-                # DEBUG: Verify teacher is clean
-                if torch.isnan(teacher_patch_outputs).any():
-                    print(f"[Rank {dist.get_rank()}] WARNING: NaN in TEACHER outputs!")
-            
             # Student forward (with masking)
             student_ibot_output = student(original_images, token_masks=random_token_masks, mode='ibot')
             student_patch_outputs = student_ibot_output['patch_outputs']  # [B, N, out_dim]
             
-            # DEBUG: Check for NaN immediately after forward
+            # DEBUG: Comprehensive NaN check
             if torch.isnan(student_patch_outputs).any():
-                print(f"[Rank {dist.get_rank()}] [Iter {current_iteration}] NaN detected in student_patch_outputs!")
-                print(f"  Shape: {student_patch_outputs.shape}")
-                print(f"  NaN count: {torch.isnan(student_patch_outputs).sum().item()}")
-                print(f"  Min: {student_patch_outputs[~torch.isnan(student_patch_outputs)].min().item() if (~torch.isnan(student_patch_outputs)).any() else 'all NaN'}")
-                print(f"  Max: {student_patch_outputs[~torch.isnan(student_patch_outputs)].max().item() if (~torch.isnan(student_patch_outputs)).any() else 'all NaN'}")
+                print(f"\n{'='*60}")
+                print(f"[Rank {dist.get_rank()}] [Iter {current_iteration}] NaN DETECTED!")
+                print(f"{'='*60}")
                 
-                # Check the raw features before projection
-                if 'features' in student_ibot_output and 'patchtokens' in student_ibot_output['features']:
-                    raw_features = student_ibot_output['features']['patchtokens']
-                    if torch.isnan(raw_features).any():
-                        print(f"  NaN in raw patch features (before head): {torch.isnan(raw_features).sum().item()}")
-                    else:
-                        print(f"  Raw features OK: min={raw_features.min():.4f}, max={raw_features.max():.4f}")
-
+                # 1. Check inputs
+                print(f"Input images: min={original_images.min():.4f}, max={original_images.max():.4f}, has_nan={torch.isnan(original_images).any()}")
+                
+                # 2. Check raw features (before projection head)
+                raw_features = student_ibot_output['features']['patchtokens']
+                print(f"Raw patch features: shape={raw_features.shape}")
+                print(f"  has_nan={torch.isnan(raw_features).any()}")
+                if not torch.isnan(raw_features).any():
+                    print(f"  min={raw_features.min():.4f}, max={raw_features.max():.4f}, mean={raw_features.mean():.4f}")
+                else:
+                    print(f"  NaN count in raw features: {torch.isnan(raw_features).sum().item()}")
+                
+                # 3. Check projection head outputs
+                print(f"Projection head outputs: shape={student_patch_outputs.shape}")
+                print(f"  NaN count: {torch.isnan(student_patch_outputs).sum().item()} / {student_patch_outputs.numel()}")
+                print(f"  Percentage NaN: {100.0 * torch.isnan(student_patch_outputs).sum().item() / student_patch_outputs.numel():.2f}%")
+                
+                # 4. Check if teacher has same issue
+                print(f"\nTeacher outputs: has_nan={torch.isnan(teacher_patch_outputs).any()}")
+                if not torch.isnan(teacher_patch_outputs).any():
+                    print(f"  Teacher is clean: min={teacher_patch_outputs.min():.4f}, max={teacher_patch_outputs.max():.4f}")
+                
+                # 5. Check patchhead weights
+                print(f"\nPatchhead weight stats:")
+                for name, param in student.patchhead.named_parameters():
+                    has_nan = torch.isnan(param).any()
+                    print(f"  {name}: shape={param.shape}, has_nan={has_nan}, dtype={param.dtype}, device={param.device}")
+                    if not has_nan and param.numel() > 0:
+                        print(f"    min={param.min():.4f}, max={param.max():.4f}")
+                
+                print(f"{'='*60}\n")
 
             # Debug shapes on first iteration
             if current_iteration == 0 and utils.is_main_process():
