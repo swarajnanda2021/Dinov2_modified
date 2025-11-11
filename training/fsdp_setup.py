@@ -112,9 +112,6 @@ def apply_fsdp_wrapping(student, teacher, args):
     else:
         print(f"[Rank {dist.get_rank()}] Gradient checkpointing disabled")
     
-    # Move to CUDA after wrapping (like DINOv3)
-    student.to_empty(device="cuda")
-    teacher.to_empty(device="cuda")
     
     return student, teacher
 
