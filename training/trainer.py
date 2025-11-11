@@ -194,10 +194,6 @@ def train_dinov2(args):
 
     print("FSDP2 wrapping complete")
 
-    # Copy student weights to teacher
-    teacher.backbone.load_state_dict(student.backbone.state_dict())
-    teacher.classhead.load_state_dict(student.classhead.state_dict())
-    teacher.patchhead.load_state_dict(student.patchhead.state_dict())
 
     # Disable gradients for teacher
     for param in teacher.parameters():
