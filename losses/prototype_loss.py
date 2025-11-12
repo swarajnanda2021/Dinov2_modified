@@ -54,20 +54,19 @@ class PatchPrototypeLoss(nn.Module):
         self.last_usage_std = 0.0
         self.last_num_masked = 0
     
-    def forward(self, teacher_patch_tokens, student_patch_tokens, token_masks, prototype_bank):
+    def forward(self, teacher_patch_tokens, student_patch_tokens, token_masks, prototype_bank, teacher_temp):
         """
-        Compute prototype clustering loss.
+        Compute prototype clustering loss - now actually computes everything.
         
         Args:
-            teacher_patch_tokens: [B, N, 768] - ALL patches
-            student_patch_tokens: [B, N, 768] - has masked patches
-            token_masks: [B, N] boolean where True = masked
-            prototype_bank: LinearPrototypeBank module
+            teacher_patch_tokens: Teacher patch features
+            student_patch_tokens: Student patch features  
+            token_masks: Boolean mask for tokens
+            prototype_bank: DDP-wrapped prototype bank
+            teacher_temp: Current teacher temperature (from DINO schedule)
             
         Returns:
-            prediction_loss: Student prediction loss
-            koleo_loss: KoLeo loss on prototype weights
-            arrangement_loss: Teacher arrangement loss
+            tuple: (clustering_loss, teacher_proto_loss, koleo_proto_loss)
         """
         B, N, D = teacher_patch_tokens.shape
         
@@ -75,65 +74,58 @@ class PatchPrototypeLoss(nn.Module):
         teacher_norm = F.normalize(teacher_patch_tokens, p=2, dim=-1)
         student_norm = F.normalize(student_patch_tokens, p=2, dim=-1)
         
-        # ========== TEACHER PATH: ALL PATCHES ==========
+        # ========== Teacher path: Generate targets and arrangement loss ==========
         teacher_logits_all = prototype_bank(teacher_norm)  # [B, N, K]
+        teacher_logits_flat = teacher_logits_all.reshape(B * N, -1)
         
-        # Reshape for global Sinkhorn-Knopp
-        teacher_logits_flat = teacher_logits_all.reshape(B * N, -1)  # [B*N, K]
+        # Get assignments (no grad)
+        with torch.no_grad():
+            Q_tilde_flat = self.sinkhorn_knopp(teacher_logits_flat, teacher_temp)
+            Q_tilde_all = Q_tilde_flat.reshape(B, N, -1)
         
-        # CAPI-inspired doubly stochastic optimal transport
-        Q_tilde_flat = self.sinkhorn_knopp(teacher_logits_flat, self.teacher_temp)
-        Q_tilde_all = Q_tilde_flat.reshape(B, N, -1)
+        # Arrangement loss (trains prototype bank)
+        teacher_log_probs_all = F.log_softmax(teacher_logits_all / teacher_temp, dim=-1)
+        teacher_proto_loss = -torch.sum(Q_tilde_all.detach() * teacher_log_probs_all) / (B * N)
         
-        # Teacher's natural predictions (for arrangement loss)
-        teacher_log_probs_all = F.log_softmax(teacher_logits_all / self.teacher_temp, dim=-1)
+        # KoLeo on prototypes
+        weight_normalized = F.normalize(prototype_bank.module.proto_layer.weight, p=2, dim=1)
+        koleo_proto_loss = self.koleo_loss(weight_normalized)
         
-        # Arrangement Loss: KL(Q̃ || Q) over ALL patches
-        arrangement_loss = -torch.sum(Q_tilde_all.detach() * teacher_log_probs_all) / (B * N)
-        
-        # ========== STUDENT PATH: MASKED PATCHES ONLY ==========
-        Q_tilde_masked = Q_tilde_all[token_masks]  # [M_total, K]
-        student_norm_masked = student_norm[token_masks]  # [M_total, 768]
+        # ========== Student path: Prediction loss ==========
+        Q_tilde_masked = Q_tilde_all[token_masks].detach()
+        student_norm_masked = student_norm[token_masks]
         
         if student_norm_masked.shape[0] == 0:
             return torch.tensor(0.0, device=teacher_patch_tokens.device), \
-                   torch.tensor(0.0, device=teacher_patch_tokens.device), \
-                   torch.tensor(0.0, device=teacher_patch_tokens.device)
+                torch.tensor(0.0, device=teacher_patch_tokens.device), \
+                torch.tensor(0.0, device=teacher_patch_tokens.device)
         
-        # Student predictions at masked positions
-        student_logits_masked = prototype_bank(student_norm_masked)  # [M_total, K]
+        # Student predictions
+        student_logits_masked = prototype_bank(student_norm_masked)
         student_log_probs_masked = F.log_softmax(student_logits_masked / self.student_temp, dim=-1)
         
-        # Prediction Loss
+        # Clustering loss (trains student)
         M_total = student_norm_masked.shape[0]
-        prediction_loss = -torch.sum(Q_tilde_masked.detach() * student_log_probs_masked) / M_total
+        clustering_loss = -torch.sum(Q_tilde_masked * student_log_probs_masked) / M_total
         
-        # ========== KOLEO LOSS ON WEIGHTS ==========
-        weight_normalized = F.normalize(prototype_bank.module.proto_layer.weight, p=2, dim=1)
-        koleo_loss = self.koleo_loss(weight_normalized)
-        
-        # ========== METRICS ==========
+        # Update metrics
         with torch.no_grad():
-            # Entropy of student predictions
             student_probs = torch.exp(student_log_probs_masked)
             entropy = -(student_probs * student_log_probs_masked).sum(dim=-1).mean()
-            normalized_entropy = entropy / math.log(self.k)
+            self.last_entropy = (entropy / math.log(self.k)).item()
             
-            # Prototype usage statistics
             assignments = torch.argmax(Q_tilde_masked, dim=-1)
             usage = torch.bincount(assignments, minlength=self.k).float()
             if dist.is_initialized():
                 dist.all_reduce(usage)
-            usage_std = usage.std() / (usage.mean() + 1e-6)
+            self.last_usage_std = (usage.std() / (usage.mean() + 1e-6)).item()
             
-            self.last_prediction_loss = prediction_loss.item()
-            self.last_arrangement_loss = arrangement_loss.item()
-            self.last_koleo_loss = koleo_loss.item()
-            self.last_entropy = normalized_entropy.item()
-            self.last_usage_std = usage_std.item()
+            self.last_prediction_loss = clustering_loss.item()
+            self.last_arrangement_loss = teacher_proto_loss.item()
+            self.last_koleo_loss = koleo_proto_loss.item()
             self.last_num_masked = M_total
         
-        return prediction_loss, koleo_loss, arrangement_loss
+        return clustering_loss, teacher_proto_loss, koleo_proto_loss
 
     @torch.no_grad()
     def sinkhorn_knopp(self, teacher_output, teacher_temp, n_iterations=3, eps=1e-8):
