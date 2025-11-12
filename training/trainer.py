@@ -529,76 +529,33 @@ def train_dinov2(args):
                 teacher_temp=dino_class_loss.teacher_temp_schedule(current_iteration)
             )
 
-        # ========== Patch Prototype Clustering (Separate from student loss) ==========
+        # ========== Patch Prototype Clustering ==========
         if args.use_prototype_clustering:
-            # TEACHER PATH: Generate targets with gradients for prototype bank
-            # This runs OUTSIDE the student's autocast context
+            # Get features from iBOT outputs
             teacher_patch_features = teacher_ibot_output['features']['patchtokens']
+            student_patch_features = student_ibot_output['features']['patchtokens']
             
-            # Compute targets with grad enabled for prototype bank
+            # Get current temperature (using DINO schedule for consistency)
+            current_teacher_temp = dino_class_loss.teacher_temp_schedule(current_iteration)
+            
+            # Forward pass - now everything happens inside the loss class
             with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
-                teacher_patch_features_norm = F.normalize(teacher_patch_features, p=2, dim=-1)
-                teacher_logits_all = prototype_bank(teacher_patch_features_norm)
-                
-                B, N, K = teacher_logits_all.shape
-                teacher_logits_flat = teacher_logits_all.reshape(B * N, -1)
-                
-                # Sinkhorn-Knopp to get targets (no_grad inside the function)
-                Q_tilde_flat = patch_prototype_loss.sinkhorn_knopp(
-                    teacher_logits_flat, 
-                    args.clustering_teacher_temp
+                clustering_loss, teacher_proto_loss, koleo_proto_loss = patch_prototype_loss(
+                    teacher_patch_features,
+                    student_patch_features,
+                    random_token_masks,
+                    prototype_bank,
+                    current_iteration,
+                    current_teacher_temp
                 )
-                Q_tilde_all = Q_tilde_flat.reshape(B, N, -1)
-                
-                # Arrangement Loss: KL(Q̃ || Q) - only trains prototype bank
-                teacher_log_probs_all = F.log_softmax(
-                    teacher_logits_all / args.clustering_teacher_temp, 
-                    dim=-1
-                )
-                teacher_proto_loss = -torch.sum(Q_tilde_all.detach() * teacher_log_probs_all) / (B * N)
-                
-                # KoLeo on prototype weights
-                weight_normalized = F.normalize(prototype_bank.module.proto_layer.weight, p=2, dim=1)
-                koleo_proto_loss = patch_prototype_loss.koleo_loss(weight_normalized)
             
-            # ========== CRITICAL: Detach targets before student uses them ==========
-            Q_tilde_masked = Q_tilde_all[random_token_masks].detach()  # ← DETACH HERE
-            
-            # STUDENT PATH: Prediction loss (only trains student)
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
-                student_patch_features = student_ibot_output['features']['patchtokens']
-                student_norm_masked = F.normalize(student_patch_features[random_token_masks], p=2, dim=-1)
-                
-                if student_norm_masked.shape[0] > 0:
-                    student_logits_masked = prototype_bank(student_norm_masked)
-                    student_log_probs_masked = F.log_softmax(
-                        student_logits_masked / args.clustering_student_temp, 
-                        dim=-1
-                    )
-                    clustering_loss = -torch.sum(Q_tilde_masked * student_log_probs_masked) / student_norm_masked.shape[0]
-                else:
-                    clustering_loss = torch.tensor(0.0, device=original_images.device)
-            
-            # Update metrics
-            with torch.no_grad():
-                student_probs = torch.exp(student_log_probs_masked) if student_norm_masked.shape[0] > 0 else None
-                if student_probs is not None:
-                    entropy = -(student_probs * student_log_probs_masked).sum(dim=-1).mean()
-                    patch_prototype_loss.last_entropy = (entropy / math.log(args.num_prototypes)).item()
-                    
-                    assignments = torch.argmax(Q_tilde_masked, dim=-1)
-                    usage = torch.bincount(assignments, minlength=args.num_prototypes).float()
-                    if dist.is_initialized():
-                        dist.all_reduce(usage)
-                    patch_prototype_loss.last_usage_std = (usage.std() / (usage.mean() + 1e-6)).item()
-                
-                patch_prototype_loss.last_prediction_loss = clustering_loss.item()
-                patch_prototype_loss.last_arrangement_loss = teacher_proto_loss.item()
-                patch_prototype_loss.last_koleo_loss = koleo_proto_loss.item()
+            # Combine prototype losses
+            prototype_loss = teacher_proto_loss + koleo_proto_loss
         else:
             clustering_loss = torch.tensor(0.0).cuda()
             teacher_proto_loss = torch.tensor(0.0).cuda()
             koleo_proto_loss = torch.tensor(0.0).cuda()
+            prototype_loss = torch.tensor(0.0).cuda()
 
         # ========== Compute Total Losses ==========
         # Student loss: DINO + KoLeo + iBOT + Clustering prediction
