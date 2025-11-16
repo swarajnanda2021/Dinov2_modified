@@ -531,29 +531,68 @@ def train_dinov2(args):
 
         # ========== Patch Prototype Clustering ==========
         if args.use_prototype_clustering:
-            # Get features from iBOT outputs
-            teacher_patch_features = teacher_ibot_output['features']['patchtokens']
-            student_patch_features = student_ibot_output['features']['patchtokens']
-
-            # random_token_masks: [B, N] where True = masked, False = visible
-            visible_mask = ~random_token_masks  # [B, N] boolean
-            
-            # Get current temperature (using DINO schedule for consistency)
+            # Get current temperature (shared across all modes)
             current_teacher_temp = dino_class_loss.teacher_temp_schedule(current_iteration)
             
-            # Forward pass - now everything happens inside the loss class
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
-                clustering_loss, teacher_proto_loss, koleo_proto_loss = patch_prototype_loss(
-                    teacher_patch_features,
-                    student_patch_features,
-                    visible_mask,
-                    prototype_bank,
-                    current_iteration,
-                    current_teacher_temp
-                )
-            
-            # Combine prototype losses
-            prototype_loss = teacher_proto_loss + koleo_proto_loss
+            if args.clustering_mode == 'visible':
+                # Use visible patch tokens from ibot forward pass
+                teacher_patch_features = teacher_ibot_output['features']['patchtokens']
+                student_patch_features = student_ibot_output['features']['patchtokens']
+
+                # random_token_masks: [B, N] where True = masked, False = visible
+                visible_mask = ~random_token_masks  # [B, N] boolean
+                
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+                    clustering_loss, teacher_proto_loss, koleo_proto_loss = patch_prototype_loss(
+                        teacher_patch_features,
+                        student_patch_features,
+                        visible_mask,
+                        prototype_bank,
+                        current_iteration,
+                        current_teacher_temp
+                    )
+                
+                # Combine prototype losses
+                prototype_loss = teacher_proto_loss + koleo_proto_loss
+                
+            elif args.clustering_mode == 'masked':
+                # Use masked patch tokens from ibot forward pass
+                teacher_patch_features = teacher_ibot_output['features']['patchtokens']
+                student_patch_features = student_ibot_output['features']['patchtokens']
+                
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+                    clustering_loss, teacher_proto_loss, koleo_proto_loss = patch_prototype_loss(
+                        teacher_patch_features,
+                        student_patch_features,
+                        random_token_masks,  # True = masked positions
+                        prototype_bank,
+                        current_iteration,
+                        current_teacher_temp
+                    )
+                
+                # Combine prototype losses
+                prototype_loss = teacher_proto_loss + koleo_proto_loss
+
+            elif args.clustering_mode == 'separate':
+                # Do a separate forward pass and use all patch tokens
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+                    student_cluster = student(original_images, token_masks=None, mode='ibot')
+                    with torch.no_grad():
+                        teacher_cluster = teacher(original_images, token_masks=None, mode='ibot')
+                    
+                    all_mask = torch.ones_like(random_token_masks, dtype=torch.bool)  # Cluster all
+                    clustering_loss, teacher_proto_loss, koleo_proto_loss = patch_prototype_loss(
+                        teacher_cluster['features']['patchtokens'],
+                        student_cluster['features']['patchtokens'],
+                        all_mask,  # All positions
+                        prototype_bank,
+                        current_iteration,
+                        current_teacher_temp
+                    )
+                    
+                    # Combine prototype losses
+                    prototype_loss = teacher_proto_loss + koleo_proto_loss
+                    
         else:
             clustering_loss = torch.tensor(0.0).cuda()
             teacher_proto_loss = torch.tensor(0.0).cuda()
