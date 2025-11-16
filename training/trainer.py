@@ -534,6 +534,9 @@ def train_dinov2(args):
             # Get features from iBOT outputs
             teacher_patch_features = teacher_ibot_output['features']['patchtokens']
             student_patch_features = student_ibot_output['features']['patchtokens']
+
+            # random_token_masks: [B, N] where True = masked, False = visible
+            visible_mask = ~random_token_masks  # [B, N] boolean
             
             # Get current temperature (using DINO schedule for consistency)
             current_teacher_temp = dino_class_loss.teacher_temp_schedule(current_iteration)
@@ -543,7 +546,7 @@ def train_dinov2(args):
                 clustering_loss, teacher_proto_loss, koleo_proto_loss = patch_prototype_loss(
                     teacher_patch_features,
                     student_patch_features,
-                    random_token_masks,
+                    visible_mask,
                     prototype_bank,
                     current_iteration,
                     current_teacher_temp
