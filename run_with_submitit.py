@@ -28,7 +28,7 @@ def parse_args():
                         help="Number of nodes")
     parser.add_argument("--timeout", default=10000, type=int, 
                         help="Job duration in minutes")
-    parser.add_argument("--partition", default="vanderbc_gpu", type=str, 
+    parser.add_argument("--partition", default="gpu", type=str, 
                         help="Partition name")
     
     return parser.parse_args()
@@ -36,7 +36,7 @@ def parse_args():
 
 def get_shared_folder() -> Path:
     """Get shared folder for logs and checkpoints."""
-    p = Path("/data1/vanderbc/nandas1/TCGA_TMEDinov3_ViT-B_B2_seqpacking/logs")
+    p = Path("/data1/vanderbc/nandas1/TCGA_TMEDinov3_ViT-B_B3_seqpacking/logs")
     p.mkdir(exist_ok=True)
     return p
 
@@ -147,7 +147,8 @@ def main():
     
     # Prototype clustering
     args.use_prototype_clustering = True
-    args.num_prototypes = 4096
+    args.clustering_mode = 'visible'
+    args.num_prototypes = 16384
     args.clustering_weight = 1.0
     args.clustering_teacher_temp = 0.07
     args.clustering_student_temp = 0.1
