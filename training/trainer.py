@@ -608,9 +608,6 @@ def train_dinov2(args):
             args.clustering_weight * clustering_loss
         )
 
-        # Prototype loss: Arrangement + KoLeo (separate backward)
-        prototype_loss = teacher_proto_loss + koleo_proto_loss
-
         # ========== Backward and optimizer steps ==========
         if fp16_scaler is None:
             # ===== NON-MIXED PRECISION =====
