@@ -126,17 +126,15 @@ def load_checkpoint_fsdp2(
     """
     ckpt_dir = Path(ckpt_dir)
     
-    # Look for DCP checkpoints (both new and old naming)
+    # Look for DCP checkpoints
     dcp_checkpoints = sorted(ckpt_dir.glob("dcp_iter_*"))
     if not dcp_checkpoints:
-        # Fall back to old naming convention
         dcp_checkpoints = sorted(ckpt_dir.glob("iter_*"))
     
     if not dcp_checkpoints:
         print(f"No checkpoint found in {ckpt_dir}")
         return 0
     
-    # Use the latest checkpoint
     latest_ckpt = dcp_checkpoints[-1]
     print(f"Loading checkpoint from {latest_ckpt}")
     
@@ -162,19 +160,49 @@ def load_checkpoint_fsdp2(
     if fp16_scaler is not None:
         to_load["fp16_scaler"] = fp16_scaler.state_dict()
     
-    # Load with DCP
+    # Load with DCP - wrap in try/except to handle missing keys
     try:
         dcp.load(
             to_load,
             storage_reader=FileSystemReader(str(latest_ckpt)),
         )
-    except Exception as e:
-        print(f"[Rank {rank}] ERROR loading checkpoint: {e}")
-        import traceback
-        traceback.print_exc()
-        return 0
+    except RuntimeError as e:
+        if "Missing key in checkpoint state_dict" in str(e):
+            print(f"[Rank {rank}] WARNING: Checkpoint has mismatched keys (likely due to frozen parameters)")
+            print(f"[Rank {rank}] Attempting to load with no_dist_check=True...")
+            
+            # Try loading with more lenient settings
+            # First, load just the model states
+            model_to_load = {
+                "iteration": 0,
+                "student": get_model_state_dict(student),
+                "teacher": get_model_state_dict(teacher),
+            }
+            
+            if prototype_bank is not None:
+                model_to_load["prototype_bank"] = prototype_bank.state_dict()
+            
+            dcp.load(
+                model_to_load,
+                storage_reader=FileSystemReader(str(latest_ckpt)),
+            )
+            
+            # Set model states
+            iteration = model_to_load["iteration"]
+            set_model_state_dict(student, model_to_load["student"])
+            set_model_state_dict(teacher, model_to_load["teacher"])
+            
+            if prototype_bank is not None:
+                prototype_bank.load_state_dict(model_to_load["prototype_bank"])
+            
+            print(f"[Rank {rank}] ✓ Loaded model states successfully")
+            print(f"[Rank {rank}] ⚠ Skipped optimizer state due to mismatch - training will continue with fresh optimizer state")
+            
+            return iteration
+        else:
+            raise
     
-    # Set loaded states
+    # Normal path - all states loaded successfully
     iteration = to_load["iteration"]
     set_model_state_dict(student, to_load["student"])
     set_model_state_dict(teacher, to_load["teacher"])
