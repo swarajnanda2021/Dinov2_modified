@@ -21,7 +21,7 @@ class iBOTPatchLoss(nn.Module):
         student_patch_tokens_masked,
         teacher_patch_tokens_masked,
         student_masks_flat,
-        n_masked_patches_tensor,  # ADD THIS PARAMETER
+        n_masked_patches_tensor, 
         masks_weight=None,
         teacher_temp=0.07
     ):

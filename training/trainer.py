@@ -509,6 +509,7 @@ def train_dinov2(args):
                 student_patch_outputs,
                 teacher_patch_outputs,
                 random_token_masks,
+                n_masked_patches_tensor = random_token_masks.sum(),
                 teacher_temp=dino_class_loss.teacher_temp_schedule(current_iteration)
             )
 
