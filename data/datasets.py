@@ -547,12 +547,17 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
         self,
         dataset_configs: List[Dict],
         batch_size_per_gpu: int,
+        n_standard_local_crops: int,
+        global_views: int,
+        local_crop_size: int,
         worker_id: int = 0,
         num_workers: int = 1,
         rank: int = 0,
         world_size: int = 1,
         seed: int = 42,
-        **kwargs
+        global_size: int = 224,
+        mean: tuple = (0.6816, 0.5640, 0.7232),
+        std: tuple = (0.1617, 0.1714, 0.1389),
     ):
         super().__init__()
         
@@ -579,6 +584,9 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
             
             print(f"\nLoading {name} dataset from {base_dir}...")
             
+
+
+            
             dataset = MemoryEfficientShardedPathologyDataset(
                 base_dir=base_dir,
                 index_file=index_file,
@@ -587,7 +595,11 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
                 rank=rank,
                 world_size=world_size,
                 seed=seed,
-                **kwargs
+                global_size=global_size,
+                local_size=local_crop_size,  # Map parameter name
+                n_local_crops=n_standard_local_crops,  # Map parameter name
+                mean=mean,
+                std=std,
             )
             
             self.datasets.append(dataset)
