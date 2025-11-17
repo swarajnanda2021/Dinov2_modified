@@ -276,10 +276,13 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
             
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
+                # all_images = [f for f in zf.namelist() 
+                #             if f.endswith('.png') 
+                #             and ('_448_' in f) 
+                #             and ('_224_' not in f)]
                 all_images = [f for f in zf.namelist() 
-                            if f.endswith('.png') 
-                            and ('_448_' in f) 
-                            and ('_224_' not in f)]
+                            if f.endswith('.webp')
+                            and not f.startswith('__MACOSX')]
                 all_images.sort()
                 
                 image_names = all_images[start_idx:end_idx]
@@ -525,3 +528,171 @@ class DINOv2PathologyDataset(torch.utils.data.IterableDataset):
         if hasattr(self, 'base_dataset'):
             self.base_dataset.set_resume_position(global_samples_processed)
             print(f"DINOv2PathologyDataset: Set resume position to {global_samples_processed} samples")
+
+
+
+# ============================================================================
+# Multi-Dataset Wrapper with Proportional Sampling
+# ============================================================================
+
+class ProportionalMultiDatasetWrapper(IterableDataset):
+    """
+    Combines multiple dataset sources with proportional sampling per batch.
+    Each batch maintains the same proportion as overall dataset distribution.
+    
+    Example: If datasets are 30% TCGA, 10% CPTAC, 60% IMPACT, then each
+    batch of size 32 will have ~10 TCGA, ~3 CPTAC, ~19 IMPACT samples.
+    """
+    def __init__(
+        self,
+        dataset_configs: List[Dict],
+        batch_size_per_gpu: int,
+        worker_id: int = 0,
+        num_workers: int = 1,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 42,
+        **kwargs
+    ):
+        super().__init__()
+        
+        self.batch_size_per_gpu = batch_size_per_gpu
+        self.worker_id = worker_id
+        self.num_workers = num_workers
+        self.rank = rank
+        self.world_size = world_size
+        self.seed = seed
+        
+        # Initialize individual datasets
+        self.datasets = []
+        self.dataset_names = []
+        self.dataset_sizes = []
+        
+        print("\n" + "="*80)
+        print("Initializing Multi-Dataset with Proportional Sampling")
+        print("="*80)
+        
+        for config in dataset_configs:
+            name = config['name']
+            base_dir = config['base_dir']
+            index_file = config['index_file']
+            
+            print(f"\nLoading {name} dataset from {base_dir}...")
+            
+            dataset = MemoryEfficientShardedPathologyDataset(
+                base_dir=base_dir,
+                index_file=index_file,
+                dataset_name=name,  # Pass name for filtering
+                worker_id=worker_id,
+                num_workers=num_workers,
+                rank=rank,
+                world_size=world_size,
+                seed=seed,
+                **kwargs
+            )
+            
+            self.datasets.append(dataset)
+            self.dataset_names.append(name)
+            self.dataset_sizes.append(dataset.index_metadata['total_images'])
+            
+            print(f"  {name}: {dataset.index_metadata['total_images']:,} images")
+        
+        # Calculate proportions
+        total_images = sum(self.dataset_sizes)
+        self.proportions = [size / total_images for size in self.dataset_sizes]
+        
+        print("\n" + "-"*80)
+        print("Dataset Proportions:")
+        for name, size, prop in zip(self.dataset_names, self.dataset_sizes, self.proportions):
+            print(f"  {name}: {size:,} images ({prop*100:.2f}%)")
+        print(f"Total: {total_images:,} images")
+        
+        # Calculate samples per dataset per batch
+        self.samples_per_dataset = self._calculate_batch_distribution()
+        
+        print("\n" + "-"*80)
+        print(f"Per-batch distribution (batch_size={batch_size_per_gpu}):")
+        for name, count in zip(self.dataset_names, self.samples_per_dataset):
+            print(f"  {name}: {count} samples per batch ({count/batch_size_per_gpu*100:.1f}%)")
+        print("="*80 + "\n")
+        
+        # Create iterators
+        self.iterators = None
+    
+    def _calculate_batch_distribution(self):
+        """
+        Calculate how many samples from each dataset per batch.
+        Ensures proportions are maintained and sum equals batch_size.
+        """
+        # Calculate ideal samples (may be fractional)
+        ideal_samples = [prop * self.batch_size_per_gpu for prop in self.proportions]
+        
+        # Round to integers (floor first)
+        samples = [int(s) for s in ideal_samples]
+        
+        # Distribute remaining samples to maintain sum = batch_size
+        remainder = self.batch_size_per_gpu - sum(samples)
+        
+        # Give remaining samples to datasets with largest fractional parts
+        fractional_parts = [(ideal - actual, idx) 
+                           for idx, (ideal, actual) in enumerate(zip(ideal_samples, samples))]
+        fractional_parts.sort(reverse=True)
+        
+        for i in range(remainder):
+            idx = fractional_parts[i][1]
+            samples[idx] += 1
+        
+        assert sum(samples) == self.batch_size_per_gpu, \
+            f"Batch distribution error: {sum(samples)} != {self.batch_size_per_gpu}"
+        
+        return samples
+    
+    def set_worker_info(self, worker_id, num_workers):
+        """Propagate worker info to all datasets"""
+        self.worker_id = worker_id
+        self.num_workers = num_workers
+        for dataset in self.datasets:
+            dataset.set_worker_info(worker_id, num_workers)
+    
+    def set_resume_position(self, global_samples_processed):
+        """Propagate resume position to all datasets"""
+        for dataset in self.datasets:
+            dataset.set_resume_position(global_samples_processed)
+    
+    def __iter__(self):
+        """
+        Yield samples in proportion-maintaining pattern.
+        Pattern repeats every batch_size samples.
+        """
+        # Create fresh iterators
+        self.iterators = [iter(ds) for ds in self.datasets]
+        
+        # Create sampling pattern for one batch
+        # Example: [0, 0, 0, ...(10x), 1, 1, 1 (3x), 2, 2, ...(19x)]
+        pattern = []
+        for dataset_idx, count in enumerate(self.samples_per_dataset):
+            pattern.extend([dataset_idx] * count)
+        
+        # Shuffle pattern to avoid systematic bias within batch
+        rng = random.Random(self.seed + self.rank * self.num_workers + self.worker_id)
+        
+        # Yield samples according to pattern
+        while True:
+            # Shuffle pattern for this batch
+            batch_pattern = pattern.copy()
+            rng.shuffle(batch_pattern)
+            
+            for dataset_idx in batch_pattern:
+                try:
+                    sample = next(self.iterators[dataset_idx])
+                    yield sample
+                except StopIteration:
+                    # One dataset exhausted - recreate its iterator
+                    print(f"Dataset {self.dataset_names[dataset_idx]} exhausted, restarting...")
+                    self.iterators[dataset_idx] = iter(self.datasets[dataset_idx])
+                    sample = next(self.iterators[dataset_idx])
+                    yield sample
+    
+    def __len__(self):
+        """Return combined length"""
+        return sum(len(ds) for ds in self.datasets)

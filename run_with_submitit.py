@@ -178,7 +178,11 @@ def main():
     args.grad_checkpointing = True
     
     # Dataset
-    args.base_dir = "/data1/vanderbc/foundation_model_training_images/TCGA"
+    args.dataset_sources = [
+        "TCGA:/data1/vanderbc/foundation_model_training_images/TCGA/TCGA-ACC_svs/zip_tiles_webp:TCGA_dataset_index.pkl",
+        "CPTAC:/data1/vanderbc/foundation_model_training_images/CPTAC:CPTAC_dataset_index.pkl",
+        "IMPACT:/data1/vanderbc/foundation_model_training_images/IMPACT:IMPACT_dataset_index.pkl"
+    ]
     
     # Save configuration
     with open(os.path.join(args.output_dir, f"{job_name}_config.txt"), "w") as f:

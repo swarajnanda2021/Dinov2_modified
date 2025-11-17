@@ -8,4 +8,5 @@ from .transforms import TMEDinoTransforms
 __all__ = [
     'DINOv2PathologyDataset',
     'TMEDinoTransforms',
+    'ProportionalMultiDatasetWrapper'
 ]

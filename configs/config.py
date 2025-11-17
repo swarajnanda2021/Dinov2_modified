@@ -102,10 +102,12 @@ def get_args_parser():
                     help='Enable gradient checkpointing to reduce memory at cost of ~40% speed')
     
     # ========== Dataset and I/O ==========
-    parser.add_argument('--base_dir', 
-                        default='/data1/vanderbc/foundation_model_training_images/TCGA', 
-                        type=str,
-                        help='Base directory for dataset')
+    # parser.add_argument('--base_dir', 
+    #                     default='/data1/vanderbc/foundation_model_training_images/TCGA', 
+    #                     type=str,
+    #                     help='Base directory for dataset')
+    parser.add_argument('--dataset_sources', type=str, nargs='+',
+                        help='Dataset sources in format NAME:BASE_DIR:INDEX_FILE')
     parser.add_argument('--output_dir', default=".", type=str,
                         help='Output directory for checkpoints and logs')
     parser.add_argument('--save_checkpoint_freq', default=2000, type=int,
