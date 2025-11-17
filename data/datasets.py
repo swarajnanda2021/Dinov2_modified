@@ -581,15 +581,11 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
             name = config['name']
             base_dir = config['base_dir']
             index_file = config['index_file']
-            
             print(f"\nLoading {name} dataset from {base_dir}...")
-            
 
-
-            
             dataset = MemoryEfficientShardedPathologyDataset(
                 base_dir=base_dir,
-                index_file=index_file,
+                index_file=os.path.join(base_dir, index_file),
                 worker_id=worker_id,
                 num_workers=num_workers,
                 rank=rank,
