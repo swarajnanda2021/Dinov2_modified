@@ -16,7 +16,7 @@ import time
 import pickle
 import fcntl
 from datetime import datetime
-from typing import Set
+from typing import List, Dict, Optional, Tuple, Iterator, Set
 import torch.distributed as dist
 
 from .transforms import TMEDinoTransforms
