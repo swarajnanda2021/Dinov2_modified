@@ -121,9 +121,9 @@ def main():
     # ========== Default training configuration ==========
     # Architecture
     args.patch_size = 16
-    args.embeddingdim = 768
-    args.vitheads = 12
-    args.vitdepth = 12
+    args.embeddingdim = 1024
+    args.vitheads = args.embeddingdim // 64
+    args.vitdepth = 24
 
     # Mask model
     args.mask_checkpoint = "/data1/vanderbc/nandas1/TCGA_TMEDinov3_ViT-B/checkpoint_saved_mask_model.pth"
@@ -146,8 +146,9 @@ def main():
     args.token_mask_ratio = 0.4
     
     # Prototype clustering
-    args.use_prototype_clustering = True 
-    args.num_prototypes = 4096
+    args.use_prototype_clustering = False#True 
+    args.clustering_mode = 'masked'
+    args.num_prototypes = 16384
     args.clustering_weight = 1.0
     args.clustering_teacher_temp = 0.07
     args.clustering_student_temp = 0.1
@@ -177,7 +178,11 @@ def main():
     args.grad_checkpointing = True
     
     # Dataset
-    args.base_dir = "/data1/vanderbc/foundation_model_training_images/TCGA"
+    args.dataset_sources = [
+        "TCGA:/data1/vanderbc/foundation_model_training_images/TCGA/TCGA-ACC_svs/zip_tiles_webp:TCGA_dataset_index.pkl",
+        "CPTAC:/data1/vanderbc/foundation_model_training_images/CPTAC:CPTAC_dataset_index.pkl",
+        "IMPACT:/data1/vanderbc/foundation_model_training_images/IMPACT:IMPACT_dataset_index.pkl"
+    ]
     
     # Save configuration
     with open(os.path.join(args.output_dir, f"{job_name}_config.txt"), "w") as f:

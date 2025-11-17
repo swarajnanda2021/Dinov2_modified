@@ -23,7 +23,7 @@ import torch.nn.functional as F
 import utils
 from models import CombinedModelDINO, LinearPrototypeBank, ModernViT, DINOHead
 from losses import DINOLoss, iBOTPatchLoss, KoLeoLoss, PatchPrototypeLoss
-from data import DINOv2PathologyDataset
+from data import ProportionalMultiDatasetWrapper
 from .helpers import (
     load_pretrained_mask_model,
     apply_masks_to_images,
@@ -82,9 +82,22 @@ def train_dinov2(args):
         print("No mask model loaded (num_masks=0)")
 
     # ============ Create dataset ============
-    trainset = DINOv2PathologyDataset(
-        base_dir=args.base_dir,
-        index_file="dataset_index.pkl",
+    # Parse dataset sources from args
+    dataset_configs = []
+    for source in args.dataset_sources:
+        parts = source.split(':')
+        name, base_dir, index_file = parts
+        index_path = os.path.join(base_dir, index_file)
+        metadata_path = index_path.replace('.pkl', '_metadata.pkl')
+        dataset_configs.append({
+            'name': name,
+            'base_dir': base_dir,
+            'index_file': index_file
+        })
+        
+    trainset = ProportionalMultiDatasetWrapper(
+        dataset_configs=dataset_configs,
+        batch_size_per_gpu=args.batch_size_per_gpu,
         n_standard_local_crops=args.n_standard_local_crops,
         global_views=args.global_views,
         local_crop_size=args.local_crop_size,
