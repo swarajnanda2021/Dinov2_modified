@@ -179,7 +179,7 @@ def main():
     
     # Dataset
     args.dataset_sources = [
-        "TCGA:/data1/vanderbc/foundation_model_training_images/TCGA/TCGA-ACC_svs/zip_tiles_webp:TCGA_dataset_index.pkl",
+        "TCGA:/data1/vanderbc/foundation_model_training_images/TCGA:TCGA_dataset_index.pkl",
         "CPTAC:/data1/vanderbc/foundation_model_training_images/CPTAC:CPTAC_dataset_index.pkl",
         "IMPACT:/data1/vanderbc/foundation_model_training_images/IMPACT:IMPACT_dataset_index.pkl"
     ]
