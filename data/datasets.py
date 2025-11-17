@@ -582,7 +582,6 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
             dataset = MemoryEfficientShardedPathologyDataset(
                 base_dir=base_dir,
                 index_file=index_file,
-                dataset_name=name,  # Pass name for filtering
                 worker_id=worker_id,
                 num_workers=num_workers,
                 rank=rank,
