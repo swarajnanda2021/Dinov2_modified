@@ -599,3 +599,210 @@ class VisionTransformer(nn.Module):
                 'patchtokens': x[:, self.numregisters+1:],
                 'masks': token_masks
             }
+
+
+
+# ============================ CellViT with BatchNorms purely for augmentation purposes ==================================
+
+
+class CellViT(nn.Module):
+    """
+    CellViT for nuclei/background segmentation augmentation.
+    Simplified from instance segmentation version - single decoder, 2-channel output.
+    Uses BatchNorm2d to match pre-trained checkpoint architecture.
+    
+    Returns:
+        dict with "masks": [B, 2, H, W] where channel 0=nuclei, channel 1=background
+    """
+    def __init__(self, encoder, encoder_dim=768, drop_rate=0.1):
+        super().__init__()
+        
+        self.encoder = encoder
+        
+        # Freeze encoder for augmentation use
+        for parameter in self.encoder.parameters():
+            parameter.requires_grad = False
+
+        self.embed_dim = encoder_dim
+        self.drop_rate = drop_rate
+
+        # Set dimensions based on encoder size
+        if self.embed_dim < 512:
+            self.skip_dim_11 = 256
+            self.skip_dim_12 = 128
+            self.bottleneck_dim = 256
+        elif self.embed_dim < 1024:
+            self.skip_dim_11 = 512
+            self.skip_dim_12 = 256
+            self.bottleneck_dim = 512
+        else:
+            self.skip_dim_11 = 768
+            self.skip_dim_12 = 384
+            self.bottleneck_dim = 768
+
+        # Shared decoder layers (using Conv2DBlockBN and Deconv2DBlockBN with BatchNorm)
+        self.decoder0 = nn.Sequential(
+            Conv2DBlockBN(3, 32, 3, dropout=self.drop_rate),
+            Conv2DBlockBN(32, 64, 3, dropout=self.drop_rate),
+        )
+        self.decoder1 = nn.Sequential(
+            Deconv2DBlockBN(self.embed_dim, self.skip_dim_11, dropout=self.drop_rate),
+            Deconv2DBlockBN(self.skip_dim_11, self.skip_dim_12, dropout=self.drop_rate),
+            Deconv2DBlockBN(self.skip_dim_12, 128, dropout=self.drop_rate),
+        )
+        self.decoder2 = nn.Sequential(
+            Deconv2DBlockBN(self.embed_dim, self.skip_dim_11, dropout=self.drop_rate),
+            Deconv2DBlockBN(self.skip_dim_11, 256, dropout=self.drop_rate),
+        )
+        self.decoder3 = nn.Sequential(
+            Deconv2DBlockBN(self.embed_dim, self.bottleneck_dim, dropout=self.drop_rate)
+        )
+
+        # Single decoder for nuclei/background (2 channels)
+        self.nuclei_binary_map_decoder = self.create_upsampling_branch(2)
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        def init_weights(m):
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        self.apply(init_weights)
+        
+        # Initialize final layer with smaller weights
+        final_conv = self.nuclei_binary_map_decoder.decoder0_header[-1]
+        if isinstance(final_conv, nn.Conv2d):
+            nn.init.normal_(final_conv.weight, std=0.01)
+            nn.init.constant_(final_conv.bias, 0)
+
+    def create_upsampling_branch(self, num_classes: int) -> nn.Module:
+        """Create upsampling branch for binary segmentation."""
+        bottleneck_upsampler = nn.ConvTranspose2d(
+            in_channels=self.embed_dim,
+            out_channels=self.bottleneck_dim,
+            kernel_size=2, stride=2, padding=0, output_padding=0,
+        )
+        decoder3_upsampler = nn.Sequential(
+            Conv2DBlockBN(self.bottleneck_dim * 2, self.bottleneck_dim, dropout=self.drop_rate),
+            Conv2DBlockBN(self.bottleneck_dim, self.bottleneck_dim, dropout=self.drop_rate),
+            Conv2DBlockBN(self.bottleneck_dim, self.bottleneck_dim, dropout=self.drop_rate),
+            nn.ConvTranspose2d(self.bottleneck_dim, 256, kernel_size=2, stride=2, padding=0, output_padding=0),
+        )
+        decoder2_upsampler = nn.Sequential(
+            Conv2DBlockBN(256 * 2, 256, dropout=self.drop_rate),
+            Conv2DBlockBN(256, 256, dropout=self.drop_rate),
+            nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2, padding=0, output_padding=0),
+        )
+        decoder1_upsampler = nn.Sequential(
+            Conv2DBlockBN(128 * 2, 128, dropout=self.drop_rate),
+            Conv2DBlockBN(128, 128, dropout=self.drop_rate),
+            nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2, padding=0, output_padding=0),
+        )
+        decoder0_header = nn.Sequential(
+            Conv2DBlockBN(64 * 2, 64, dropout=self.drop_rate),
+            Conv2DBlockBN(64, 64, dropout=self.drop_rate),
+            nn.Conv2d(64, num_classes, kernel_size=1, stride=1, padding=0),
+        )
+
+        decoder = nn.Sequential(
+            OrderedDict([
+                ("bottleneck_upsampler", bottleneck_upsampler),
+                ("decoder3_upsampler", decoder3_upsampler),
+                ("decoder2_upsampler", decoder2_upsampler),
+                ("decoder1_upsampler", decoder1_upsampler),
+                ("decoder0_header", decoder0_header),
+            ])
+        )
+        return decoder
+
+    def _forward_upsample(
+        self,
+        images: torch.Tensor,
+        f1: torch.Tensor,
+        f2: torch.Tensor,
+        f3: torch.Tensor,
+        f4: torch.Tensor,
+        branch_decoder: nn.Sequential,
+    ) -> torch.Tensor:
+        b4 = branch_decoder.bottleneck_upsampler(f4)
+        b3 = self.decoder3(f3)
+        b3 = branch_decoder.decoder3_upsampler(torch.cat([b3, b4], dim=1))
+        
+        b2 = self.decoder2(f2)
+        b2 = branch_decoder.decoder2_upsampler(torch.cat([b2, b3], dim=1))
+        
+        b1 = self.decoder1(f1)
+        b1 = branch_decoder.decoder1_upsampler(torch.cat([b1, b2], dim=1))
+        
+        b0 = self.decoder0(images)
+        branch_output = branch_decoder.decoder0_header(torch.cat([b0, b1], dim=1))
+
+        return branch_output
+
+    def forward(self, images, magnification='40x'):
+        out_dict = {}
+        num_registers = 4
+        features = self.encoder.get_intermediate_layers(images)
+        f1, f2, f3, f4 = features
+        
+        # Determine feature map size dynamically
+        num_patches = f1.shape[1] - (num_registers + 1)
+        feature_size = int(np.sqrt(num_patches))
+
+        # Reshape features to [B, C, H, W]
+        f1 = f1[:, (num_registers+1):, :].permute(0, 2, 1).view(f1.shape[0], -1, feature_size, feature_size)
+        f2 = f2[:, (num_registers+1):, :].permute(0, 2, 1).view(f2.shape[0], -1, feature_size, feature_size)
+        f3 = f3[:, (num_registers+1):, :].permute(0, 2, 1).view(f3.shape[0], -1, feature_size, feature_size)
+        f4 = f4[:, (num_registers+1):, :].permute(0, 2, 1).view(f4.shape[0], -1, feature_size, feature_size)
+        
+        # Binary nuclei/background segmentation
+        mask_logits = self._forward_upsample(
+            images, f1, f2, f3, f4, self.nuclei_binary_map_decoder
+        )
+        
+        # Apply softmax to get probabilities
+        out_dict["masks"] = F.log_softmax(mask_logits, dim=1).exp()
+
+        return out_dict
+
+
+# Helper blocks with BatchNorm (for CellViT checkpoint compatibility)
+class Conv2DBlockBN(nn.Module):
+    """Conv2D block with BatchNorm (for CellViT checkpoint compatibility)."""
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, dropout: float = 0):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride=1, padding=((kernel_size - 1) // 2)),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(True),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class Deconv2DBlockBN(nn.Module):
+    """Deconv2D block with BatchNorm (for CellViT checkpoint compatibility)."""
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, dropout: float = 0):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2, padding=0, output_padding=0),
+            nn.Conv2d(out_channels, out_channels, kernel_size, stride=1, padding=((kernel_size - 1) // 2)),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(True),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.block(x)

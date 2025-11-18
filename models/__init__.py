@@ -11,6 +11,7 @@ from .vision_transformer.auxiliary_models import (
     TMEHead,
     MaskModel_SpectralNorm,
     MaskModel,
+    CellViT,
 )
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     'TMEHead',
     'MaskModel_SpectralNorm',
     'MaskModel',
+    'CellViT',
 ]

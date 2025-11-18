@@ -346,10 +346,7 @@ def setup_ddp_model(model, args, find_unused=False):
 
 def load_pretrained_cellvit_model(checkpoint_path, device='cuda'):
     """
-    Load pre-trained CellViT-B model for nuclei/background segmentation. You don't need anything more sophisticated than ViT-B.
-    The model has been trained on PanNuke, the backbone was previously trained on TCGA (300k iterations, 768 batch size, dinov2),
-    and then fine tuned on PanNuke.
-
+    Load pre-trained CellViT model for nuclei/background segmentation.
     Returns 2-channel mask output: [B, 2, H, W] where channel 0=nuclei, channel 1=background.
     
     Args:
@@ -364,17 +361,8 @@ def load_pretrained_cellvit_model(checkpoint_path, device='cuda'):
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"CellViT checkpoint not found at {checkpoint_path}")
     
-    # Import models from your repo
-    # We need to import from the PostProc directory where models.py lives
-    import sys
-    from pathlib import Path
-    
-    # Add PostProc directory to path if not already there
-    postproc_dir = Path(__file__).parent.parent / 'PostProc'
-    if str(postproc_dir) not in sys.path:
-        sys.path.insert(0, str(postproc_dir))
-    
-    from models import VisionTransformer, CellViT
+    # Import from local models package
+    from models.vision_transformer import VisionTransformer as ModernViT, CellViT
     
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
@@ -389,13 +377,13 @@ def load_pretrained_cellvit_model(checkpoint_path, device='cuda'):
     
     print(f"CellViT checkpoint info: magnification={magnification}, feature_dim={feature_dim}")
     
-    # Create encoder (frozen, just for inference)
-    encoder = VisionTransformer(
+    # Create encoder
+    encoder = ModernViT(
         img_size=224,
         patch_size=16,
         embed_dim=feature_dim,
         depth=12,
-        num_heads=feature_dim // 64,  # Typical ratio
+        num_heads=feature_dim // 64,
         mlp_ratio=4.0,
         qkv_bias=True,
         qk_norm=False,
@@ -420,13 +408,16 @@ def load_pretrained_cellvit_model(checkpoint_path, device='cuda'):
         else:
             cleaned_state_dict[k] = v
     
-    # Load state dict - use strict=False to handle any mismatches
+    # Load state dict - use strict=False since we only need the binary decoder
     missing_keys, unexpected_keys = cellvit_model.load_state_dict(cleaned_state_dict, strict=False)
     
     if missing_keys:
-        print(f"  Warning: Missing keys in checkpoint: {missing_keys[:5]}...")
+        print(f"  Missing keys (expected for simplified model): {len(missing_keys)} keys")
     if unexpected_keys:
-        print(f"  Warning: Unexpected keys in checkpoint: {unexpected_keys[:5]}...")
+        # Filter out hv_map_decoder keys since we don't use that branch
+        unexpected_filtered = [k for k in unexpected_keys if 'hv_map' not in k]
+        if unexpected_filtered:
+            print(f"  Warning: Unexpected keys: {unexpected_filtered[:5]}...")
     
     # Move to device and set to eval mode
     cellvit_model = cellvit_model.to(device)
