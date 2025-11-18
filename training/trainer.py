@@ -811,8 +811,11 @@ def train_dinov2(args):
             if args.use_cellvit_augmentation and cellvit_model_frozen is not None:
                 sample_image = original_images[:1]
                 with torch.no_grad():
-                    cellvit_vis = cellvit_model_frozen(sample_image)
-                    cellvit_vis_masks = cellvit_vis['masks']  # [1, 2, H, W]
+                    
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
+                        cellvit_vis = cellvit_model_frozen(sample_image)
+                        cellvit_vis_masks = cellvit_vis['masks']  # [1, 2, H, W]
+
                     save_iteration_masks_efficient(
                         sample_image,
                         cellvit_vis_masks,
