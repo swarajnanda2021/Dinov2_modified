@@ -508,11 +508,11 @@ def train_dinov2(args):
         cellvit_background_crops = []
         
         if args.use_cellvit_augmentation and cellvit_model_frozen is not None:
-            with torch.no_grad():
-                # Generate 2-channel masks: [B, 2, H, W]
+            
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
                 cellvit_output = cellvit_model_frozen(original_images)
                 cellvit_masks = cellvit_output['masks']  # [B, 2, H, W]
-            
+                
             # Apply masks to create nuclei and background views
             nuclei_images, background_images = apply_cellvit_masks(original_images, cellvit_masks)
             
