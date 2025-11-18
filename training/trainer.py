@@ -506,33 +506,36 @@ def train_dinov2(args):
         cellvit_background_global = None
         cellvit_nuclei_crops = []
         cellvit_background_crops = []
-        
+
         if args.use_cellvit_augmentation and cellvit_model_frozen is not None:
+            with torch.no_grad():  # Add this for clarity
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
+                    cellvit_output = cellvit_model_frozen(original_images)  # Remove .to() - autocast handles it
+                    cellvit_masks = cellvit_output['masks'].float()  # [B, 2, H, W]
             
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
-                cellvit_output = cellvit_model_frozen(original_images)
-                cellvit_masks = cellvit_output['masks']  # [B, 2, H, W]
-                
+            del cellvit_output
+            
             # Apply masks to create nuclei and background views
             nuclei_images, background_images = apply_cellvit_masks(original_images, cellvit_masks)
+            del cellvit_masks
             
-            # Global views (224x224)
-            cellvit_nuclei_global = nuclei_images
-            cellvit_background_global = background_images
+            # Global views (224x224) - store these BEFORE deleting
+            cellvit_nuclei_global = nuclei_images.clone()
+            cellvit_background_global = background_images.clone()
             
             # Add global views to student crops
             student_all_crops.append(cellvit_nuclei_global)
             student_all_crops.append(cellvit_background_global)
             
-            # Extract local crops (96x96) from each channel
+            # Extract local crops (96x96) from each channel - do this BEFORE deleting
             if args.cellvit_crops_per_channel > 0:
                 nuclei_crops = extract_crops_from_cellvit_channel(
-                    nuclei_images,
+                    nuclei_images,  # Still available here
                     n_crops=args.cellvit_crops_per_channel,
                     crop_size=args.local_crop_size
                 )
                 background_crops = extract_crops_from_cellvit_channel(
-                    background_images,
+                    background_images,  # Still available here
                     n_crops=args.cellvit_crops_per_channel,
                     crop_size=args.local_crop_size
                 )
@@ -542,6 +545,12 @@ def train_dinov2(args):
                 cellvit_background_crops = background_crops
                 student_all_crops.extend(nuclei_crops)
                 student_all_crops.extend(background_crops)
+                
+                del nuclei_crops, background_crops
+            
+            # NOW delete nuclei_images and background_images after we're done with them
+            del nuclei_images, background_images
+            
         
         # ========== Debug: Print shapes on first iteration ==========
         if current_iteration == 0 and utils.is_main_process():

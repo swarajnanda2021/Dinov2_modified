@@ -421,6 +421,7 @@ def load_pretrained_cellvit_model(checkpoint_path, device='cuda'):
     
     # Move to device and set to eval mode
     cellvit_model = cellvit_model.to(device)
+    cellvit_model = cellvit_model.to(torch.bfloat16)
     cellvit_model.eval()
     
     # Freeze all parameters
