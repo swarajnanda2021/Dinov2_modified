@@ -899,7 +899,6 @@ def train_dinov2(args):
 
         # Synchronize else might time out
         if current_iteration % 100 == 0:
-            torch.cuda.empty_cache()
             if dist.is_initialized():
                 dist.barrier() 
 
