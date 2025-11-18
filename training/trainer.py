@@ -26,8 +26,11 @@ from losses import DINOLoss, iBOTPatchLoss, KoLeoLoss, PatchPrototypeLoss
 from data import DINOv2PathologyDataset, ProportionalMultiDatasetWrapper
 from .helpers import (
     load_pretrained_mask_model,
+    load_pretrained_cellvit_model,
     apply_masks_to_images,
+    apply_cellvit_masks,
     extract_local_crops_from_masked,
+    extract_crops_from_cellvit_channel,
     generate_random_token_masks,
     calculate_total_student_views,
     save_iteration_masks_efficient,
@@ -57,15 +60,35 @@ def train_dinov2(args):
     print(f"Global views (teacher/student): {args.global_views}")
     print(f"Standard local crops: {args.n_standard_local_crops}")
     print(f"Local crop size: {args.local_crop_size}x{args.local_crop_size}")
-    print(f"Number of masks: {args.num_masks}")
-    print(f"Crops per mask: {args.crops_per_mask}")
+
+    # Adversarial mask augmentation
+    if args.use_adversarial_mask_augmentation:
+        print(f"\nAdversarial Mask Augmentation: ENABLED")
+        print(f"  Number of masks: {args.num_masks}")
+        print(f"  Crops per mask: {args.crops_per_mask}")
+    else:
+        print(f"\nAdversarial Mask Augmentation: DISABLED")
+
+    # CellViT augmentation
+    if args.use_cellvit_augmentation:
+        print(f"\nCellViT Augmentation: ENABLED")
+        print(f"  Crops per channel: {args.cellvit_crops_per_channel}")
+    else:
+        print(f"\nCellViT Augmentation: DISABLED")
+
     total_student_views = calculate_total_student_views(args)
-    print(f"Total student views: {total_student_views}")
+    print(f"\nTotal student views: {total_student_views}")
     print("================================================\n")
     
-    # ============ Load pre-trained mask model ============
+    # ============ Load pre-trained adversarial mask model (if enabled) ============
     mask_model_frozen = None
-    if args.num_masks > 0:
+    if args.use_adversarial_mask_augmentation:
+        if args.mask_checkpoint is None:
+            raise ValueError("--use_adversarial_mask_augmentation is True but --mask_checkpoint not provided")
+        
+        if args.num_masks <= 0:
+            raise ValueError("--use_adversarial_mask_augmentation is True but --num_masks must be > 0")
+        
         mask_model_frozen = load_pretrained_mask_model(args.mask_checkpoint, args.num_masks)
         mask_model_frozen = mask_model_frozen.cuda()
         mask_model_frozen.eval()
@@ -73,9 +96,27 @@ def train_dinov2(args):
         for param in mask_model_frozen.parameters():
             param.requires_grad = False
         
-        print(f"Loaded and froze mask model with {args.num_masks} masks")
+        print(f"Loaded and froze adversarial mask model with {args.num_masks} masks")
+        print(f"  Crops per mask: {args.crops_per_mask}")
     else:
-        print("No mask model loaded (num_masks=0)")
+        print("Adversarial mask augmentation disabled (--use_adversarial_mask_augmentation=False)")
+    
+    # ============ Load pre-trained CellViT model (if enabled) ============
+    cellvit_model_frozen = None
+    if args.use_cellvit_augmentation:
+        if args.cellvit_checkpoint is None:
+            raise ValueError("--use_cellvit_augmentation is True but --cellvit_checkpoint not provided")
+        
+        cellvit_model_frozen = load_pretrained_cellvit_model(args.cellvit_checkpoint, device='cuda')
+        cellvit_model_frozen.eval()
+        
+        for param in cellvit_model_frozen.parameters():
+            param.requires_grad = False
+        
+        print(f"Loaded and froze CellViT model for nuclei/background segmentation")
+        print(f"  CellViT crops per channel: {args.cellvit_crops_per_channel}")
+    else:
+        print("CellViT augmentation disabled (--use_cellvit_augmentation=False)")
 
     # ============ Create dataset ============
     # Parse dataset sources from args
@@ -431,11 +472,11 @@ def train_dinov2(args):
         # Get original images for masking and iBOT
         original_images = batch_data[-1].cuda(non_blocking=True)
         
-        # 3. Generate masks and masked views if configured
+        # 3. Generate adversarial masked views if configured
         masked_global_crops = []
         masked_local_crops_all = []
-        
-        if args.num_masks > 0 and mask_model_frozen is not None:
+
+        if args.use_adversarial_mask_augmentation and mask_model_frozen is not None:
             with torch.no_grad():
                 mask_output = mask_model_frozen(original_images)
                 masks = mask_output['masks']
@@ -459,6 +500,48 @@ def train_dinov2(args):
                 
                 # Add masked local crops to student views
                 student_all_crops.extend(masked_local_crops_all)
+
+        # 4. Generate CellViT (Nuclei/Background) masks and masked views if configured
+        cellvit_nuclei_global = None
+        cellvit_background_global = None
+        cellvit_nuclei_crops = []
+        cellvit_background_crops = []
+        
+        if args.use_cellvit_augmentation and cellvit_model_frozen is not None:
+            with torch.no_grad():
+                # Generate 2-channel masks: [B, 2, H, W]
+                cellvit_output = cellvit_model_frozen(original_images)
+                cellvit_masks = cellvit_output['masks']  # [B, 2, H, W]
+            
+            # Apply masks to create nuclei and background views
+            nuclei_images, background_images = apply_cellvit_masks(original_images, cellvit_masks)
+            
+            # Global views (224x224)
+            cellvit_nuclei_global = nuclei_images
+            cellvit_background_global = background_images
+            
+            # Add global views to student crops
+            student_all_crops.append(cellvit_nuclei_global)
+            student_all_crops.append(cellvit_background_global)
+            
+            # Extract local crops (96x96) from each channel
+            if args.cellvit_crops_per_channel > 0:
+                nuclei_crops = extract_crops_from_cellvit_channel(
+                    nuclei_images,
+                    n_crops=args.cellvit_crops_per_channel,
+                    crop_size=args.local_crop_size
+                )
+                background_crops = extract_crops_from_cellvit_channel(
+                    background_images,
+                    n_crops=args.cellvit_crops_per_channel,
+                    crop_size=args.local_crop_size
+                )
+                
+                # Add to student views
+                cellvit_nuclei_crops = nuclei_crops
+                cellvit_background_crops = background_crops
+                student_all_crops.extend(nuclei_crops)
+                student_all_crops.extend(background_crops)
         
         # ========== Debug: Print shapes on first iteration ==========
         if current_iteration == 0 and utils.is_main_process():
@@ -470,6 +553,21 @@ def train_dinov2(args):
             for i, crop in enumerate(student_all_crops):
                 print(f"  Student crop {i}: {crop.shape}")
             print(f"Original images: {original_images.shape}")
+            
+            # Adversarial mask augmentation debug info
+            if args.use_adversarial_mask_augmentation:
+                print(f"\nAdversarial Mask Augmentation:")
+                print(f"  Masked global crops: {len(masked_global_crops)}")
+                print(f"  Masked local crops: {len(masked_local_crops_all)}")
+            
+            # CellViT augmentation debug info
+            if args.use_cellvit_augmentation:
+                print(f"\nCellViT Augmentation:")
+                print(f"  Nuclei global: {cellvit_nuclei_global.shape if cellvit_nuclei_global is not None else 'None'}")
+                print(f"  Background global: {cellvit_background_global.shape if cellvit_background_global is not None else 'None'}")
+                print(f"  Nuclei crops: {len(cellvit_nuclei_crops)} x {cellvit_nuclei_crops[0].shape if cellvit_nuclei_crops else 'None'}")
+                print(f"  Background crops: {len(cellvit_background_crops)} x {cellvit_background_crops[0].shape if cellvit_background_crops else 'None'}")
+            
             print("="*50 + "\n")
         
         # ========== Update learning rates ==========
@@ -686,17 +784,33 @@ def train_dinov2(args):
             torch.cuda.empty_cache()
         
         # ========== Visualize masks ==========
-        if current_iteration % args.visualization_freq == 0 and current_iteration < 5000 and args.num_masks > 0:
-            sample_image = original_images[:1]
-            with torch.no_grad():
-                vis_masks = mask_model_frozen(sample_image)['masks']
-                save_iteration_masks_efficient(
-                    sample_image,
-                    vis_masks,
-                    current_iteration,
-                    os.path.join(args.output_dir, 'mask_visualizations'),
-                    num_samples=1
-                )
+        if current_iteration % args.visualization_freq == 0 and current_iteration < 5000:
+            # Visualize adversarial masks
+            if args.use_adversarial_mask_augmentation and mask_model_frozen is not None:
+                sample_image = original_images[:1]
+                with torch.no_grad():
+                    vis_masks = mask_model_frozen(sample_image)['masks']
+                    save_iteration_masks_efficient(
+                        sample_image,
+                        vis_masks,
+                        current_iteration,
+                        os.path.join(args.output_dir, 'adversarial_mask_visualizations'),
+                        num_samples=1
+                    )
+            
+            # Visualize CellViT masks
+            if args.use_cellvit_augmentation and cellvit_model_frozen is not None:
+                sample_image = original_images[:1]
+                with torch.no_grad():
+                    cellvit_vis = cellvit_model_frozen(sample_image)
+                    cellvit_vis_masks = cellvit_vis['masks']  # [1, 2, H, W]
+                    save_iteration_masks_efficient(
+                        sample_image,
+                        cellvit_vis_masks,
+                        current_iteration,
+                        os.path.join(args.output_dir, 'cellvit_mask_visualizations'),
+                        num_samples=1
+                    )
         
         # ========== Logging ==========
         metric_logger.update(student_loss=student_loss.item())
@@ -738,8 +852,11 @@ def train_dinov2(args):
                 'augmentation_config': {
                     'global_views': args.global_views,
                     'n_standard_local_crops': args.n_standard_local_crops,
-                    'num_masks': args.num_masks,
-                    'crops_per_mask': args.crops_per_mask,
+                    'adversarial_mask_augmentation': args.use_adversarial_mask_augmentation,
+                    'num_masks': args.num_masks if args.use_adversarial_mask_augmentation else 0,
+                    'crops_per_mask': args.crops_per_mask if args.use_adversarial_mask_augmentation else 0,
+                    'cellvit_augmentation': args.use_cellvit_augmentation,
+                    'cellvit_crops_per_channel': args.cellvit_crops_per_channel if args.use_cellvit_augmentation else 0,
                     'total_student_views': total_student_views,
                 }
             }

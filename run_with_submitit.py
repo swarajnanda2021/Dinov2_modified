@@ -122,18 +122,24 @@ def main():
     # Architecture
     args.patch_size = 16
     args.embeddingdim = 768
-    args.vitheads = 12
+    args.vitheads = args.embeddingdim // 64
     args.vitdepth = 12
 
-    # Mask model
-    args.mask_checkpoint = "/data1/vanderbc/nandas1/TCGA_TMEDinov3_ViT-B/checkpoint_saved_mask_model.pth"
-
-    # Augmentation
+    # ========== Augmentation Configuration ==========
     args.global_views = 2
-    args.n_standard_local_crops = 8
+    args.n_standard_local_crops = 6
     args.local_crop_size = 96
-    args.num_masks = 0
-    args.crops_per_mask = 0
+    
+    # Adversarial mask augmentation (3-channel semantic masks)
+    args.use_adversarial_mask_augmentation = False
+    args.mask_checkpoint = "/data1/vanderbc/nandas1/TCGA_TMEDinov3_ViT-B/checkpoint_saved_mask_model.pth"
+    args.num_masks = 0  # Only used if use_adversarial_mask_augmentation=True
+    args.crops_per_mask = 0  # Only used if use_adversarial_mask_augmentation=True
+    
+    # CellViT augmentation (2-channel nuclei/background)
+    args.use_cellvit_augmentation = False
+    args.cellvit_checkpoint = "/data1/vanderbc/nandas1/CellViT_models/TCGA_Dinov2_ViT-B_run2/model.pth"
+    args.cellvit_crops_per_channel = 1  # Only used if use_cellvit_augmentation=True
 
     # DINO parameters
     args.out_dim = 65536
@@ -146,13 +152,13 @@ def main():
     args.token_mask_ratio = 0.4
     
     # Prototype clustering
-    args.use_prototype_clustering = True
+    args.use_prototype_clustering = False
     args.clustering_mode = 'visible'
     args.num_prototypes = 16384
     args.clustering_weight = 1.0
     args.clustering_teacher_temp = 0.07
     args.clustering_student_temp = 0.1
-
+    
     # Teacher parameters
     args.momentum_teacher = 0.996
     args.teacher_temp = 0.07
@@ -160,9 +166,9 @@ def main():
     args.teacher_temp_warmup_iters = 37_500
     
     # Optimization
-    args.batch_size_per_gpu = 192
+    args.batch_size_per_gpu = 256
     args.warmup_iterations = 12_500
-    args.total_iterations = 300_000
+    args.total_iterations = 150_000
     args.freeze_last_layer_iters = 1_250
     args.lr = 5e-5
     args.min_lr = 1e-6

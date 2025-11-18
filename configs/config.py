@@ -44,8 +44,18 @@ def get_args_parser():
                         help='Number of local crops per mask')
     
     # ========== Mask model parameters ==========
+    parser.add_argument('--use_adversarial_mask_augmentation', default=False, type=utils.bool_flag,
+                    help='Enable adversarial mask-based augmentation (3-channel semantic masks)')
     parser.add_argument('--mask_checkpoint', type=str,
                         help='Path to pre-trained mask model checkpoint')
+    
+    # ========== CellViT augmentation parameters ==========
+    parser.add_argument('--use_cellvit_augmentation', default=False, type=utils.bool_flag,
+                        help='Enable CellViT-B based nuclei/background augmentation')
+    parser.add_argument('--cellvit_checkpoint', type=str, default=None,
+                        help='Path to trained CellViT model checkpoint')
+    parser.add_argument('--cellvit_crops_per_channel', default=1, type=int,
+                        help='Number of crops per channel (nuclei/background)')
     
     # ========== Loss parameters ==========
     parser.add_argument('--momentum_teacher', default=0.996, type=float,
@@ -102,10 +112,6 @@ def get_args_parser():
                     help='Enable gradient checkpointing to reduce memory at cost of ~40% speed')
     
     # ========== Dataset and I/O ==========
-    # parser.add_argument('--base_dir', 
-    #                     default='/data1/vanderbc/foundation_model_training_images/TCGA', 
-    #                     type=str,
-    #                     help='Base directory for dataset')
     parser.add_argument('--dataset_sources', type=str, nargs='+',
                         help='Dataset sources in format NAME:BASE_DIR:INDEX_FILE')
     parser.add_argument('--output_dir', default=".", type=str,
