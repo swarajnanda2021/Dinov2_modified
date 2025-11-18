@@ -897,6 +897,13 @@ def train_dinov2(args):
         
         current_iteration += 1
 
+        # Synchronize else might time out
+        if current_iteration % 100 == 0:
+            torch.cuda.empty_cache()
+            if dist.is_initialized():
+                dist.barrier() 
+
+
     # ========== Final checkpoint and log ==========
     if utils.is_main_process():
         final_log_stats = {
