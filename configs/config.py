@@ -43,7 +43,7 @@ def get_args_parser():
     parser.add_argument('--crops_per_mask', default=1, type=int,
                         help='Number of local crops per mask')
     
-    # ========== Mask model parameters ==========
+    # ========== Adversarial mask model parameters ==========
     parser.add_argument('--use_adversarial_mask_augmentation', default=False, type=utils.bool_flag,
                     help='Enable adversarial mask-based augmentation (3-channel semantic masks)')
     parser.add_argument('--mask_checkpoint', type=str,
@@ -57,6 +57,14 @@ def get_args_parser():
     parser.add_argument('--cellvit_crops_per_channel', default=1, type=int,
                         help='Number of crops per channel (nuclei/background)')
     
+    # ========== Random Masking augmentation parameters ==========
+    parser.add_argument('--use_random_mask_augmentation', default=False, type=utils.bool_flag,
+                        help='Enable random rectangular mask-based augmentation')
+    parser.add_argument('--random_num_masks', default=2, type=int,
+                        help='Number of random rectangular masks to generate')
+    parser.add_argument('--random_crops_per_mask', default=1, type=int,
+                        help='Number of local crops per random mask')
+        
     # ========== Loss parameters ==========
     parser.add_argument('--momentum_teacher', default=0.996, type=float,
                         help='EMA momentum for teacher update')

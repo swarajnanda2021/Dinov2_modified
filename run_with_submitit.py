@@ -139,7 +139,12 @@ def main():
     # CellViT augmentation (2-channel nuclei/background)
     args.use_cellvit_augmentation = False
     args.cellvit_checkpoint = "/data1/vanderbc/nandas1/CellViT_models/TCGA_Dinov2_ViT-B_run2/model.pth"
-    args.cellvit_crops_per_channel = 1  # Only used if use_cellvit_augmentation=True
+    args.cellvit_crops_per_channel = 0  # Only used if use_cellvit_augmentation=True
+
+    # Random mask augmentation
+    args.use_random_mask_augmentation = False
+    args.random_num_masks = 2
+    args.random_crops_per_mask = 0
 
     # DINO parameters
     args.out_dim = 65536
@@ -207,7 +212,12 @@ def main():
     print("Configuration Summary:")
     print(f"  Global crops: {args.global_views}")
     print(f"  Local crops: {args.n_standard_local_crops}")
-    print(f"  Masked crops: {args.num_masks}")
+    if args.use_adversarial_mask_augmentation:
+        print(f"  Adversarial masked crops: {args.num_masks}")
+    if args.use_cellvit_augmentation:
+        print(f"  CellViT masked crops: 2 (nuclei + background)")
+    if args.use_random_mask_augmentation:  # NEW
+        print(f"  Random masked crops: {args.random_num_masks}")
     total_views = args.global_views + args.n_standard_local_crops + args.num_masks
     print(f"  Total student views: {total_views}")
     print(f"  Batch size per GPU: {args.batch_size_per_gpu}")

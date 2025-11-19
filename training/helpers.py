@@ -150,17 +150,41 @@ def generate_random_token_masks(batch_size, n_patches_h, n_patches_w, mask_ratio
     ).bool().to(device)
     return token_masks
 
+def generate_random_image_masks(batch_size, num_masks, height, width, device):
+    """
+    Generate random rectangular masks for image-level augmentation.
+    
+    Args:
+        batch_size: Number of images
+        num_masks: Number of masks per image
+        height: Image height
+        width: Image width
+        device: Device to create masks on
+        
+    Returns:
+        masks: [B, num_masks, H, W] float masks with 1.0 in masked regions
+    """
+    masks = torch.zeros(batch_size, num_masks, height, width, device=device)
+    
+    for b in range(batch_size):
+        for m in range(num_masks):
+            # Random rectangle parameters
+            h_start = torch.randint(0, height//2, (1,)).item()
+            w_start = torch.randint(0, width//2, (1,)).item()
+            h_size = torch.randint(height//4, height//2, (1,)).item()
+            w_size = torch.randint(width//4, width//2, (1,)).item()
+            
+            h_end = min(h_start + h_size, height)
+            w_end = min(w_start + w_size, width)
+            
+            masks[b, m, h_start:h_end, w_start:w_end] = 1.0
+    
+    return masks
 
 def calculate_total_student_views(args):
     """
     Calculate total number of student views based on configuration.
-    Handles both adversarial mask augmentation and CellViT augmentation.
-    
-    Args:
-        args: Arguments namespace
-        
-    Returns:
-        Total number of student views
+    Handles adversarial, CellViT, and random mask augmentations independently.
     """
     total = 0
     
@@ -181,6 +205,12 @@ def calculate_total_student_views(args):
     if hasattr(args, 'use_cellvit_augmentation') and args.use_cellvit_augmentation:
         total += 2  # 1 nuclei global + 1 background global
         total += 2 * args.cellvit_crops_per_channel  # Crops from both channels
+    
+    # Random mask augmentation
+    if hasattr(args, 'use_random_mask_augmentation') and args.use_random_mask_augmentation:
+        if args.random_num_masks > 0:
+            total += args.random_num_masks  # Masked global views
+            total += args.random_num_masks * args.random_crops_per_mask  # Masked local crops
     
     return total
 

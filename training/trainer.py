@@ -32,6 +32,7 @@ from .helpers import (
     extract_local_crops_from_masked,
     extract_crops_from_cellvit_channel,
     generate_random_token_masks,
+    generate_random_image_masks,
     calculate_total_student_views,
     save_iteration_masks_efficient,
     worker_init_fn,
@@ -75,6 +76,13 @@ def train_dinov2(args):
         print(f"  Crops per channel: {args.cellvit_crops_per_channel}")
     else:
         print(f"\nCellViT Augmentation: DISABLED")
+
+    if args.use_random_mask_augmentation:
+        print(f"\nRandom Mask Augmentation: ENABLED")
+        print(f"  Number of masks: {args.random_num_masks}")
+        print(f"  Crops per mask: {args.random_crops_per_mask}")
+    else:
+        print(f"\nRandom Mask Augmentation: DISABLED")
 
     total_student_views = calculate_total_student_views(args)
     print(f"\nTotal student views: {total_student_views}")
@@ -550,7 +558,40 @@ def train_dinov2(args):
             
             # NOW delete nuclei_images and background_images after we're done with them
             del nuclei_images, background_images
+        
+        # 5. Generate Random Rectangular Masks if configured
+        random_masked_global_crops = []
+        random_masked_local_crops = []
+        
+        if args.use_random_mask_augmentation:
+            # Generate random rectangular masks
+            random_masks = generate_random_image_masks(
+                batch_size=original_images.shape[0],
+                num_masks=args.random_num_masks,
+                height=224,
+                width=224,
+                device=original_images.device,
+            )
             
+            # Apply masks to create masked global views
+            random_masked_images = apply_masks_to_images(original_images, random_masks)
+            random_masked_global_crops = random_masked_images
+            
+            # Add masked global crops to student views
+            student_all_crops.extend(random_masked_global_crops)
+            
+            # Extract local crops from masked images
+            if args.random_crops_per_mask > 0:
+                for masked_img in random_masked_images:
+                    crops = extract_local_crops_from_masked(
+                        masked_img,
+                        n_crops=args.random_crops_per_mask,
+                        crop_size=args.local_crop_size
+                    )
+                    random_masked_local_crops.extend(crops)
+                
+                # Add masked local crops to student views
+                student_all_crops.extend(random_masked_local_crops)
         
         # ========== Debug: Print shapes on first iteration ==========
         if current_iteration == 0 and utils.is_main_process():
@@ -576,6 +617,13 @@ def train_dinov2(args):
                 print(f"  Background global: {cellvit_background_global.shape if cellvit_background_global is not None else 'None'}")
                 print(f"  Nuclei crops: {len(cellvit_nuclei_crops)} x {cellvit_nuclei_crops[0].shape if cellvit_nuclei_crops else 'None'}")
                 print(f"  Background crops: {len(cellvit_background_crops)} x {cellvit_background_crops[0].shape if cellvit_background_crops else 'None'}")
+            
+            # Random mask augmentation debug info
+            if args.use_random_mask_augmentation:
+                print(f"\nRandom Mask Augmentation:")
+                print(f"  Random masked global crops: {len(random_masked_global_crops)}")
+                print(f"  Random masked local crops: {len(random_masked_local_crops)}")
+            
             
             print("="*50 + "\n")
         
@@ -823,6 +871,24 @@ def train_dinov2(args):
                         os.path.join(args.output_dir, 'cellvit_mask_visualizations'),
                         num_samples=1
                     )
+            
+            # Visualize Random masks
+            if args.use_random_mask_augmentation:
+                sample_image = original_images[:1]
+                random_vis_masks = generate_random_image_masks(
+                    batch_size=1,
+                    num_masks=args.random_num_masks,
+                    height=224,
+                    width=224,
+                    device=sample_image.device,
+                )
+                save_iteration_masks_efficient(
+                    sample_image,
+                    random_vis_masks,
+                    current_iteration,
+                    os.path.join(args.output_dir, 'random_mask_visualizations'),
+                    num_samples=1
+                )
         
         # ========== Logging ==========
         metric_logger.update(student_loss=student_loss.item())
@@ -869,6 +935,9 @@ def train_dinov2(args):
                     'crops_per_mask': args.crops_per_mask if args.use_adversarial_mask_augmentation else 0,
                     'cellvit_augmentation': args.use_cellvit_augmentation,
                     'cellvit_crops_per_channel': args.cellvit_crops_per_channel if args.use_cellvit_augmentation else 0,
+                    'random_mask_augmentation': args.use_random_mask_augmentation,
+                    'random_num_masks': args.random_num_masks if args.use_random_mask_augmentation else 0,
+                    'random_crops_per_mask': args.random_crops_per_mask if args.use_random_mask_augmentation else 0,
                     'total_student_views': total_student_views,
                 }
             }

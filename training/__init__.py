@@ -17,9 +17,13 @@ from .helpers import (
 __all__ = [
     'train_dinov2',
     'load_pretrained_mask_model',
+    'load_pretrained_cellvit_model',
     'apply_masks_to_images',
+    'apply_cellvit_masks',
     'extract_local_crops_from_masked',
+    'extract_crops_from_cellvit_channel',
     'generate_random_token_masks',
+    'generate_random_image_masks', 
     'calculate_total_student_views',
     'save_iteration_masks_efficient',
     'worker_init_fn',
