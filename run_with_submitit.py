@@ -28,7 +28,7 @@ def parse_args():
                         help="Number of nodes")
     parser.add_argument("--timeout", default=10000, type=int, 
                         help="Job duration in minutes")
-    parser.add_argument("--partition", default="gpu", type=str, 
+    parser.add_argument("--partition", default="vanderbc_gpu", type=str, 
                         help="Partition name")
     
     return parser.parse_args()
@@ -36,7 +36,7 @@ def parse_args():
 
 def get_shared_folder() -> Path:
     """Get shared folder for logs and checkpoints."""
-    p = Path("/data1/vanderbc/nandas1/TCGA_TMEDinov3_ViT-B_B3_seqpacking/logs")
+    p = Path("/data1/vanderbc/nandas1/FoundationModel_ViT-B_p16_b1024_cellvit/logs")
     p.mkdir(exist_ok=True)
     return p
 
@@ -137,7 +137,7 @@ def main():
     args.crops_per_mask = 0  # Only used if use_adversarial_mask_augmentation=True
     
     # CellViT augmentation (2-channel nuclei/background)
-    args.use_cellvit_augmentation = False
+    args.use_cellvit_augmentation = True
     args.cellvit_checkpoint = "/data1/vanderbc/nandas1/CellViT_models/TCGA_Dinov2_ViT-B_run2/model.pth"
     args.cellvit_crops_per_channel = 0  # Only used if use_cellvit_augmentation=True
 
@@ -185,7 +185,7 @@ def main():
     args.clip_grad = 1.0
     args.save_checkpoint_freq = 2_000
     args.num_workers = 10
-    args.visualization_freq = 100
+    args.visualization_freq = 10000
     args.grad_checkpointing = True
     
     # Dataset
