@@ -210,15 +210,19 @@ def main():
     
     print("\n" + "="*80)
     print("Configuration Summary:")
+    print(f"  Architecture: ViT-L/{args.patch_size}")
     print(f"  Global crops: {args.global_views}")
-    print(f"  Local crops: {args.n_standard_local_crops}")
+    print(f"  Standard local crops: {args.n_standard_local_crops}")
+
     if args.use_adversarial_mask_augmentation:
-        print(f"  Adversarial masked crops: {args.num_masks}")
+        print(f"  Adversarial masked crops: {args.num_masks} global + {args.num_masks * args.crops_per_mask} local")
+
     if args.use_cellvit_augmentation:
-        print(f"  CellViT masked crops: 2 (nuclei + background)")
-    if args.use_random_mask_augmentation:  # NEW
-        print(f"  Random masked crops: {args.random_num_masks}")
-    total_views = args.global_views + args.n_standard_local_crops + args.num_masks
+        print(f"  CellViT masked crops: 2 global + {2 * args.cellvit_crops_per_channel} local")
+
+    if args.use_random_mask_augmentation:
+        print(f"  Random masked crops: {args.random_num_masks} global + {args.random_num_masks * args.random_crops_per_mask} local")
+
     print(f"  Total student views: {total_views}")
     print(f"  Batch size per GPU: {args.batch_size_per_gpu}")
     print(f"  Total GPUs: {args.ngpus * args.nodes}")
