@@ -84,14 +84,6 @@ def save_checkpoint_fsdp2(
         
         print(f"[Rank {rank}] DCP save completed")
         
-        # Clean up old checkpoints (keep only last 3)
-        if rank == 0:
-            existing_checkpoints = sorted(ckpt_dir.glob("dcp_iter_*"))
-            if len(existing_checkpoints) > 3:
-                for old_ckpt in existing_checkpoints[:-3]:
-                    shutil.rmtree(old_ckpt)
-                    print(f"Removed old checkpoint: {old_ckpt}")
-        
     except Exception as e:
         print(f"[Rank {rank}] ERROR during checkpoint save: {e}")
         import traceback
