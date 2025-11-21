@@ -1,151 +1,212 @@
 #!/usr/bin/env python3
 """
-Inspect raw DCP checkpoint files to understand structure.
+Inspect DCP checkpoint files using proper DCP APIs.
 """
 
 import os
 import sys
-import json
+import pickle
 from pathlib import Path
 import torch
+import torch.distributed as dist
 
 script_dir = Path(__file__).resolve().parent
 project_root = script_dir.parent
 
+# Import DCP utilities
+try:
+    from torch.distributed.checkpoint import FileSystemReader
+    import torch.distributed.checkpoint as dcp
+except ImportError:
+    print("ERROR: torch.distributed.checkpoint not available!")
+    print("You need PyTorch 2.0+ with DCP support")
+    sys.exit(1)
 
-def inspect_dcp_files(dcp_dir):
-    """Inspect raw files in DCP directory."""
+
+def init_fake_distributed():
+    """Initialize minimal distributed context for DCP inspection."""
+    if not dist.is_initialized():
+        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_PORT'] = '12356'
+        os.environ['RANK'] = '0'
+        os.environ['WORLD_SIZE'] = '1'
+        
+        try:
+            dist.init_process_group(backend='gloo', rank=0, world_size=1)
+            print("✓ Initialized fake distributed context\n")
+        except Exception as e:
+            print(f"Warning: Could not init distributed: {e}\n")
+
+
+def inspect_metadata_file(metadata_file):
+    """Inspect .metadata file (pickle format)."""
     print(f"\n{'='*60}")
-    print(f"Inspecting: {dcp_dir}")
+    print("METADATA FILE")
     print(f"{'='*60}\n")
     
-    # List all files
-    files = sorted(dcp_dir.glob("*"))
-    print(f"Files in checkpoint directory:")
-    for f in files:
-        size = f.stat().st_size / (1024**2)  # MB
-        print(f"  {f.name:30s} {size:8.1f} MB")
+    try:
+        with open(metadata_file, 'rb') as f:
+            metadata = pickle.load(f)
+        
+        print(f"Type: {type(metadata)}")
+        print(f"Size: {metadata_file.stat().st_size / (1024**2):.2f} MB\n")
+        
+        if hasattr(metadata, '__dict__'):
+            print("Attributes:")
+            for key, value in metadata.__dict__.items():
+                print(f"  {key}: {type(value).__name__}")
+                if isinstance(value, dict):
+                    print(f"    Dict with {len(value)} keys")
+                    if len(value) <= 10:
+                        for k in list(value.keys()):
+                            print(f"      - {k}")
+                    else:
+                        print(f"      First 10: {list(value.keys())[:10]}")
+                elif isinstance(value, list):
+                    print(f"    List with {len(value)} items")
+                    if len(value) <= 5:
+                        for item in value:
+                            print(f"      - {item}")
+                elif isinstance(value, (int, float, str, bool)):
+                    print(f"    Value: {value}")
+                print()
+        else:
+            print(f"Content: {metadata}")
+            
+    except Exception as e:
+        print(f"❌ Error loading metadata: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def inspect_dcp_checkpoint(dcp_dir):
+    """Inspect DCP checkpoint using DCP API."""
+    print(f"\n{'='*60}")
+    print(f"Inspecting DCP Checkpoint: {dcp_dir}")
+    print(f"{'='*60}\n")
     
-    # Look for .metadata file
+    # List files
+    files = sorted(dcp_dir.glob("*"))
+    print("Files in checkpoint:")
+    total_size = 0
+    for f in files:
+        size = f.stat().st_size / (1024**2)
+        total_size += size
+        print(f"  {f.name:30s} {size:8.1f} MB")
+    print(f"\nTotal size: {total_size/1024:.2f} GB\n")
+    
+    # Inspect metadata file
     metadata_file = dcp_dir / ".metadata"
     if metadata_file.exists():
-        print(f"\n\n{'='*60}")
-        print("METADATA FILE")
-        print(f"{'='*60}")
-        
-        # Read as binary first to avoid decode errors
-        with open(metadata_file, 'rb') as f:
-            raw_content = f.read()
-        
-        # Try to decode as JSON
-        try:
-            content_str = raw_content.decode('utf-8')
-            metadata = json.loads(content_str)
-            print("Format: JSON\n")
-            print(f"Metadata keys: {list(metadata.keys())}\n")
-            
-            for key, value in metadata.items():
-                print(f"{key}:")
-                if isinstance(value, dict):
-                    print(f"  Dict with {len(value)} keys")
-                    if len(value) < 20:
-                        for k, v in list(value.items())[:20]:
-                            if isinstance(v, dict):
-                                print(f"    - {k}: {type(v).__name__} with {len(v)} keys")
-                            else:
-                                v_str = str(v)[:100]
-                                print(f"    - {k}: {v_str}")
-                    else:
-                        print(f"    First 10 keys:")
-                        for k in list(value.keys())[:10]:
-                            print(f"    - {k}")
-                elif isinstance(value, list):
-                    print(f"  List with {len(value)} items")
-                    if len(value) < 10:
-                        for item in value:
-                            print(f"    - {item}")
-                else:
-                    print(f"  {value}")
-                print()
-                
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            # Binary format - not JSON
-            print(f"Format: Binary (not JSON)")
-            print(f"Error: {e}\n")
-            print(f"Size: {metadata_file.stat().st_size} bytes")
-            print(f"First 100 bytes (hex):\n{raw_content[:100].hex()}")
-            print(f"\nFirst 100 bytes (repr):\n{repr(raw_content[:100])}")
-            
-            # Try to detect format
-            if raw_content[:2] == b'\x80\x02':
-                print("\n⚠️  Looks like Python pickle format")
-            elif raw_content[:4] == b'PK\x03\x04':
-                print("\n⚠️  Looks like ZIP format")
-            else:
-                print("\n⚠️  Unknown binary format")
+        inspect_metadata_file(metadata_file)
     
-    # Look for individual shard files
-    print(f"\n\n{'='*60}")
-    print("SHARD FILES")
+    # Try loading with DCP
+    print(f"\n{'='*60}")
+    print("LOADING WITH DCP API")
     print(f"{'='*60}\n")
     
-    shard_files = sorted(dcp_dir.glob("__*_*.distcp"))
-    if shard_files:
-        print(f"Found {len(shard_files)} shard files\n")
-        print("Loading first shard to inspect structure...\n")
+    try:
+        init_fake_distributed()
         
-        first_shard = shard_files[0]
-        print(f"File: {first_shard.name}")
-        print(f"Size: {first_shard.stat().st_size / (1024**2):.1f} MB\n")
+        # Create empty state dict to load into
+        state_dict = {}
         
-        try:
-            shard_data = torch.load(first_shard, map_location='cpu', weights_only=False)
-            print(f"Type: {type(shard_data)}")
+        print("Loading checkpoint...")
+        dcp.load(
+            state_dict,
+            storage_reader=FileSystemReader(str(dcp_dir)),
+        )
+        
+        print(f"✓ Successfully loaded checkpoint\n")
+        print(f"Top-level keys: {list(state_dict.keys())}\n")
+        
+        # Analyze each top-level key
+        for key in state_dict.keys():
+            value = state_dict[key]
+            print(f"\n{'='*60}")
+            print(f"Key: {key}")
+            print(f"{'='*60}")
+            print(f"Type: {type(value)}")
             
-            if isinstance(shard_data, dict):
-                print(f"Keys: {len(shard_data)} total\n")
-                print(f"First 10 keys with details:\n")
-                
-                for i, (key, value) in enumerate(list(shard_data.items())[:10]):
-                    print(f"[{i+1}] {key}:")
-                    print(f"    Type: {type(value)}")
-                    if hasattr(value, 'shape'):
-                        print(f"    Shape: {value.shape}")
-                        print(f"    Dtype: {value.dtype}")
-                        print(f"    Size: {value.numel() * value.element_size() / (1024**2):.1f} MB")
-                    elif isinstance(value, dict):
-                        print(f"    Dict with {len(value)} keys")
-                        if len(value) < 5:
-                            print(f"    Keys: {list(value.keys())}")
-                    elif isinstance(value, (int, float, str, bool)):
-                        print(f"    Value: {value}")
-                    print()
-                
-                # Summary statistics
-                print(f"\n{'='*60}")
-                print("SUMMARY")
-                print(f"{'='*60}\n")
-                
-                tensor_keys = [k for k, v in shard_data.items() if hasattr(v, 'shape')]
-                dict_keys = [k for k, v in shard_data.items() if isinstance(v, dict)]
-                scalar_keys = [k for k, v in shard_data.items() if isinstance(v, (int, float, str, bool))]
-                
-                print(f"Tensor parameters: {len(tensor_keys)}")
-                print(f"Dict entries: {len(dict_keys)}")
-                print(f"Scalar values: {len(scalar_keys)}")
-                
-                if tensor_keys:
-                    total_params = sum(shard_data[k].numel() for k in tensor_keys)
-                    total_size = sum(shard_data[k].numel() * shard_data[k].element_size() for k in tensor_keys) / (1024**3)
-                    print(f"\nTotal parameters: {total_params:,}")
-                    print(f"Total size: {total_size:.2f} GB")
+            if isinstance(value, dict):
+                if "state" in value:
+                    # FSDP2 wrapped state
+                    print(f"Structure: FSDP2 wrapped")
+                    inner_state = value["state"]
+                    print(f"Inner state type: {type(inner_state)}")
                     
-        except Exception as e:
-            print(f"❌ Error loading shard: {e}")
-            import traceback
-            traceback.print_exc()
-    else:
-        print("No shard files found")
+                    if isinstance(inner_state, dict):
+                        print(f"Parameters: {len(inner_state)}")
+                        
+                        # Show first few keys
+                        print(f"\nFirst 10 parameters:")
+                        for i, (param_key, param_value) in enumerate(list(inner_state.items())[:10]):
+                            if hasattr(param_value, 'shape'):
+                                size_mb = param_value.numel() * param_value.element_size() / (1024**2)
+                                print(f"  [{i+1}] {param_key}")
+                                print(f"      Shape: {param_value.shape}, Dtype: {param_value.dtype}, Size: {size_mb:.2f} MB")
+                            else:
+                                print(f"  [{i+1}] {param_key}: {type(param_value)}")
+                        
+                        # Count total parameters and size
+                        tensor_params = {k: v for k, v in inner_state.items() if hasattr(v, 'shape')}
+                        if tensor_params:
+                            total_params = sum(v.numel() for v in tensor_params.values())
+                            total_size_gb = sum(v.numel() * v.element_size() for v in tensor_params.values()) / (1024**3)
+                            print(f"\nTotal parameters: {total_params:,}")
+                            print(f"Total size: {total_size_gb:.2f} GB")
+                else:
+                    # Regular dict
+                    print(f"Dict with {len(value)} keys")
+                    print(f"Keys: {list(value.keys())[:20]}")
+                    
+                    # Check if it contains tensors
+                    tensor_keys = [k for k, v in value.items() if hasattr(v, 'shape')]
+                    if tensor_keys:
+                        print(f"\nTensor parameters: {len(tensor_keys)}")
+                        print(f"First 5 tensors:")
+                        for k in tensor_keys[:5]:
+                            v = value[k]
+                            size_mb = v.numel() * v.element_size() / (1024**2)
+                            print(f"  {k}: {v.shape}, {v.dtype}, {size_mb:.2f} MB")
+            
+            elif hasattr(value, 'shape'):
+                # Direct tensor
+                size_mb = value.numel() * value.element_size() / (1024**2)
+                print(f"Shape: {value.shape}")
+                print(f"Dtype: {value.dtype}")
+                print(f"Size: {size_mb:.2f} MB")
+            
+            elif isinstance(value, (int, float, str, bool)):
+                print(f"Value: {value}")
+            
+            else:
+                print(f"Unknown type: {type(value)}")
+        
+        # Overall summary
+        print(f"\n\n{'='*60}")
+        print("CHECKPOINT SUMMARY")
+        print(f"{'='*60}\n")
+        print(f"Top-level keys: {len(state_dict)}")
+        print(f"Keys: {list(state_dict.keys())}")
+        
+        # Check for iteration
+        if 'iteration' in state_dict:
+            print(f"\nIteration: {state_dict['iteration']}")
+        
+        # Check for args
+        if 'args' in state_dict:
+            print(f"\nArgs available: Yes")
+            if isinstance(state_dict['args'], dict):
+                print(f"  Sample args: {list(state_dict['args'].keys())[:10]}")
+        
+    except Exception as e:
+        print(f"❌ Error loading with DCP: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -153,9 +214,9 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Inspect DCP checkpoint structure')
     parser.add_argument('--checkpoint', type=str, default=None,
-                       help='Path to specific checkpoint (default: latest in logs/)')
+                       help='Path to specific checkpoint')
     parser.add_argument('--iteration', type=int, default=None,
-                       help='Specific iteration to inspect')
+                       help='Specific iteration to inspect (default: latest)')
     args = parser.parse_args()
     
     # Determine checkpoint directory
@@ -178,4 +239,4 @@ if __name__ == "__main__":
         print(f"ERROR: {dcp_dir} not found!")
         sys.exit(1)
     
-    inspect_dcp_files(dcp_dir)
+    inspect_dcp_checkpoint(dcp_dir)
