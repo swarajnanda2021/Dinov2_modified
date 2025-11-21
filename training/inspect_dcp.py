@@ -41,7 +41,7 @@ def init_fake_distributed():
 def inspect_metadata_file(metadata_file):
     """Inspect .metadata file (pickle format)."""
     print(f"\n{'='*60}")
-    print("METADATA FILE")
+    print("METADATA FILE ANALYSIS")
     print(f"{'='*60}\n")
     
     try:
@@ -51,27 +51,43 @@ def inspect_metadata_file(metadata_file):
         print(f"Type: {type(metadata)}")
         print(f"Size: {metadata_file.stat().st_size / (1024**2):.2f} MB\n")
         
-        if hasattr(metadata, '__dict__'):
-            print("Attributes:")
-            for key, value in metadata.__dict__.items():
-                print(f"  {key}: {type(value).__name__}")
-                if isinstance(value, dict):
-                    print(f"    Dict with {len(value)} keys")
-                    if len(value) <= 10:
-                        for k in list(value.keys()):
-                            print(f"      - {k}")
-                    else:
-                        print(f"      First 10: {list(value.keys())[:10]}")
-                elif isinstance(value, list):
-                    print(f"    List with {len(value)} items")
-                    if len(value) <= 5:
-                        for item in value:
-                            print(f"      - {item}")
-                elif isinstance(value, (int, float, str, bool)):
-                    print(f"    Value: {value}")
-                print()
-        else:
-            print(f"Content: {metadata}")
+        if hasattr(metadata, 'state_dict_metadata'):
+            state_dict_meta = metadata.state_dict_metadata
+            print(f"State dict keys: {len(state_dict_meta)}")
+            
+            # Categorize keys
+            param_keys = []
+            args_keys = []
+            scalar_keys = []
+            optimizer_keys = []
+            
+            for key in state_dict_meta.keys():
+                if key.startswith('student.') or key.startswith('teacher.'):
+                    param_keys.append(key)
+                elif key.startswith('args.'):
+                    args_keys.append(key)
+                elif key.startswith('optimizer_'):
+                    optimizer_keys.append(key)
+                else:
+                    scalar_keys.append(key)
+            
+            print(f"\nKey categories:")
+            print(f"  Student/Teacher parameters: {len(param_keys)}")
+            print(f"  Args: {len(args_keys)}")
+            print(f"  Optimizer states: {len(optimizer_keys)}")
+            print(f"  Other/Scalar: {len(scalar_keys)}")
+            
+            print(f"\nSample student parameters (first 10):")
+            for key in sorted(param_keys)[:10]:
+                print(f"  - {key}")
+            
+            print(f"\nSample args (first 10):")
+            for key in sorted(args_keys)[:10]:
+                print(f"  - {key}")
+                
+            print(f"\nScalar keys:")
+            for key in sorted(scalar_keys):
+                print(f"  - {key}")
             
     except Exception as e:
         print(f"❌ Error loading metadata: {e}")
@@ -100,108 +116,85 @@ def inspect_dcp_checkpoint(dcp_dir):
     if metadata_file.exists():
         inspect_metadata_file(metadata_file)
     
-    # Try loading with DCP
+    # Try loading checkpoint content without model objects
     print(f"\n{'='*60}")
-    print("LOADING WITH DCP API")
+    print("LOADING SCALAR VALUES")
     print(f"{'='*60}\n")
     
     try:
         init_fake_distributed()
         
-        # Create empty state dict to load into
-        state_dict = {}
+        # Load just scalar values (iteration, args, etc.)
+        state_dict = {
+            "iteration": 0,
+            "args": {},
+        }
         
-        print("Loading checkpoint...")
-        dcp.load(
-            state_dict,
-            storage_reader=FileSystemReader(str(dcp_dir)),
-        )
+        # Try to load what we can
+        print("Attempting to load scalars and args...")
+        try:
+            dcp.load(
+                state_dict,
+                storage_reader=FileSystemReader(str(dcp_dir)),
+            )
+            
+            print(f"✓ Successfully loaded\n")
+            
+            if "iteration" in state_dict:
+                print(f"Iteration: {state_dict['iteration']}")
+            
+            if "args" in state_dict and isinstance(state_dict['args'], dict):
+                print(f"\nArgs ({len(state_dict['args'])} items):")
+                print(f"\nTraining configuration:")
+                for key in sorted(state_dict['args'].keys())[:30]:
+                    value = state_dict['args'][key]
+                    print(f"  {key}: {value}")
+                
+                if len(state_dict['args']) > 30:
+                    print(f"  ... and {len(state_dict['args']) - 30} more args")
         
-        print(f"✓ Successfully loaded checkpoint\n")
-        print(f"Top-level keys: {list(state_dict.keys())}\n")
+        except Exception as e:
+            print(f"Could not load scalars: {e}")
         
-        # Analyze each top-level key
-        for key in state_dict.keys():
-            value = state_dict[key]
-            print(f"\n{'='*60}")
-            print(f"Key: {key}")
-            print(f"{'='*60}")
-            print(f"Type: {type(value)}")
-            
-            if isinstance(value, dict):
-                if "state" in value:
-                    # FSDP2 wrapped state
-                    print(f"Structure: FSDP2 wrapped")
-                    inner_state = value["state"]
-                    print(f"Inner state type: {type(inner_state)}")
-                    
-                    if isinstance(inner_state, dict):
-                        print(f"Parameters: {len(inner_state)}")
-                        
-                        # Show first few keys
-                        print(f"\nFirst 10 parameters:")
-                        for i, (param_key, param_value) in enumerate(list(inner_state.items())[:10]):
-                            if hasattr(param_value, 'shape'):
-                                size_mb = param_value.numel() * param_value.element_size() / (1024**2)
-                                print(f"  [{i+1}] {param_key}")
-                                print(f"      Shape: {param_value.shape}, Dtype: {param_value.dtype}, Size: {size_mb:.2f} MB")
-                            else:
-                                print(f"  [{i+1}] {param_key}: {type(param_value)}")
-                        
-                        # Count total parameters and size
-                        tensor_params = {k: v for k, v in inner_state.items() if hasattr(v, 'shape')}
-                        if tensor_params:
-                            total_params = sum(v.numel() for v in tensor_params.values())
-                            total_size_gb = sum(v.numel() * v.element_size() for v in tensor_params.values()) / (1024**3)
-                            print(f"\nTotal parameters: {total_params:,}")
-                            print(f"Total size: {total_size_gb:.2f} GB")
-                else:
-                    # Regular dict
-                    print(f"Dict with {len(value)} keys")
-                    print(f"Keys: {list(value.keys())[:20]}")
-                    
-                    # Check if it contains tensors
-                    tensor_keys = [k for k, v in value.items() if hasattr(v, 'shape')]
-                    if tensor_keys:
-                        print(f"\nTensor parameters: {len(tensor_keys)}")
-                        print(f"First 5 tensors:")
-                        for k in tensor_keys[:5]:
-                            v = value[k]
-                            size_mb = v.numel() * v.element_size() / (1024**2)
-                            print(f"  {k}: {v.shape}, {v.dtype}, {size_mb:.2f} MB")
-            
-            elif hasattr(value, 'shape'):
-                # Direct tensor
-                size_mb = value.numel() * value.element_size() / (1024**2)
-                print(f"Shape: {value.shape}")
-                print(f"Dtype: {value.dtype}")
-                print(f"Size: {size_mb:.2f} MB")
-            
-            elif isinstance(value, (int, float, str, bool)):
-                print(f"Value: {value}")
-            
-            else:
-                print(f"Unknown type: {type(value)}")
-        
-        # Overall summary
-        print(f"\n\n{'='*60}")
-        print("CHECKPOINT SUMMARY")
+        # Summary from metadata
+        print(f"\n{'='*60}")
+        print("CHECKPOINT CONTENT SUMMARY (from metadata)")
         print(f"{'='*60}\n")
-        print(f"Top-level keys: {len(state_dict)}")
-        print(f"Keys: {list(state_dict.keys())}")
         
-        # Check for iteration
-        if 'iteration' in state_dict:
-            print(f"\nIteration: {state_dict['iteration']}")
+        with open(metadata_file, 'rb') as f:
+            metadata = pickle.load(f)
         
-        # Check for args
-        if 'args' in state_dict:
-            print(f"\nArgs available: Yes")
-            if isinstance(state_dict['args'], dict):
-                print(f"  Sample args: {list(state_dict['args'].keys())[:10]}")
+        state_dict_meta = metadata.state_dict_metadata
+        
+        # Count parameters by module
+        student_params = [k for k in state_dict_meta.keys() if k.startswith('student.')]
+        teacher_params = [k for k in state_dict_meta.keys() if k.startswith('teacher.')]
+        optimizer_params = [k for k in state_dict_meta.keys() if k.startswith('optimizer_')]
+        prototype_params = [k for k in state_dict_meta.keys() if k.startswith('prototype_bank.')]
+        
+        print(f"Model components:")
+        print(f"  Student parameters: {len(student_params)}")
+        print(f"  Teacher parameters: {len(teacher_params)}")
+        print(f"  Optimizer states: {len(optimizer_params)}")
+        print(f"  Prototype bank: {len(prototype_params)}")
+        
+        # Show student structure
+        print(f"\nStudent model structure (top-level modules):")
+        student_modules = {}
+        for key in student_params:
+            parts = key.split('.')
+            if len(parts) >= 2:
+                module = parts[1]  # After 'student.'
+                student_modules[module] = student_modules.get(module, 0) + 1
+        
+        for module, count in sorted(student_modules.items()):
+            print(f"  student.{module}: {count} parameters")
+        
+        print(f"\nCheckpoint successfully analyzed!")
+        print(f"Note: Full parameter inspection requires loading with actual model objects")
         
     except Exception as e:
-        print(f"❌ Error loading with DCP: {e}")
+        print(f"❌ Error: {e}")
         import traceback
         traceback.print_exc()
     finally:
