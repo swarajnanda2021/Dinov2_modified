@@ -12,6 +12,7 @@ import submitit
 
 from configs import get_args_parser
 from training import train_dinov2
+from training.helpers import calculate_total_student_views
 
 
 def parse_args():
@@ -208,6 +209,9 @@ def main():
     print(f"Job name: {job_name}")
     print(f"Logs and checkpoints: {args.output_dir}")
     
+    # Calculate total views
+    total_views = calculate_total_student_views(args)
+
     print("\n" + "="*80)
     print("Configuration Summary:")
     print(f"  Architecture: ViT-L/{args.patch_size}")
