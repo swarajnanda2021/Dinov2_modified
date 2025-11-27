@@ -9,7 +9,7 @@ from .vision_transformer.modern_vit import VisionTransformer as ModernViT
 from .vision_transformer.auxiliary_models import (
     DINOHead,
     TMEHead,
-    MaskModel_SpectralNorm,
+    ADIOSMaskModel,
     MaskModel,
     CellViT,
 )
@@ -20,7 +20,7 @@ __all__ = [
     'ModernViT',
     'DINOHead',
     'TMEHead',
-    'MaskModel_SpectralNorm',
+    'ADIOSMaskModel',
     'MaskModel',
     'CellViT',
 ]

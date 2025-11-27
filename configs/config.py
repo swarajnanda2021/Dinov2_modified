@@ -46,6 +46,9 @@ def get_args_parser():
     # ========== Adversarial mask model parameters ==========
     parser.add_argument('--use_adversarial_mask_augmentation', default=False, type=utils.bool_flag,
                     help='Enable adversarial mask-based augmentation (3-channel semantic masks)')
+    parser.add_argument('--mask_model_arch', default='unet', type=str,
+                    choices=['unet', 'vit_unet'],
+                    help='Mask model architecture: unet (ADIOS) or vit_unet')
     parser.add_argument('--mask_checkpoint', type=str,
                         help='Path to pre-trained mask model checkpoint')
     

@@ -17,45 +17,64 @@ import random
 from models.vision_transformer.auxiliary_models import MaskModel_SpectralNorm
 
 
-def load_pretrained_mask_model(checkpoint_path, num_masks=3):
+
+def load_pretrained_mask_model(checkpoint_path, num_masks=3, mask_model_arch='unet', mask_encoder_dim=192):
     """
     Load pre-trained mask model from checkpoint.
     
     Args:
         checkpoint_path: Path to checkpoint file
         num_masks: Number of masks
+        mask_model_arch: 'unet' for ADIOSMaskModel, 'vit_unet' for MaskModel
+        mask_encoder_dim: Encoder dimension (only used for vit_unet)
         
     Returns:
         Loaded mask model
     """
     print(f"Loading pre-trained mask model from: {checkpoint_path}")
+    print(f"Architecture: {mask_model_arch}")
     
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
     
-    from models.vision_transformer.modern_vit import VisionTransformer
+    if mask_model_arch == 'unet':
+        from models.vision_transformer.auxiliary_models import ADIOSMaskModel
+        
+        mask_model = ADIOSMaskModel(
+            num_masks=num_masks,
+            img_size=224,
+            filter_start=32,
+            norm='gn'
+        )
     
-    mask_encoder = VisionTransformer(
-        img_size=224,
-        patch_size=16,
-        embed_dim=192,
-        depth=12,
-        num_heads=3,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        qk_norm=False,
-        dual_norm=False,
-        drop_path_rate=0.1,
-        pre_norm=False,
-        num_register_tokens=4,
-    )
+    elif mask_model_arch == 'vit_unet':
+        from models.vision_transformer.modern_vit import VisionTransformer
+        from models.vision_transformer.auxiliary_models import MaskModel
+        
+        mask_encoder = VisionTransformer(
+            img_size=224,
+            patch_size=16,
+            embed_dim=mask_encoder_dim,
+            depth=12,
+            num_heads=max(mask_encoder_dim // 64, 3),
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            qk_norm=False,
+            dual_norm=False,
+            drop_path_rate=0.1,
+            pre_norm=False,
+            num_register_tokens=4,
+        )
+        
+        mask_model = MaskModel(
+            encoder=mask_encoder,
+            num_masks=num_masks,
+            encoder_dim=mask_encoder_dim,
+            drop_rate=0.2
+        )
     
-    mask_model = MaskModel_SpectralNorm(
-        encoder=mask_encoder,
-        num_masks=num_masks,
-        encoder_dim=192,
-        drop_rate=0.2
-    )
+    else:
+        raise ValueError(f"Unknown mask_model_arch: {mask_model_arch}")
     
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     

@@ -97,7 +97,12 @@ def train_dinov2(args):
         if args.num_masks <= 0:
             raise ValueError("--use_adversarial_mask_augmentation is True but --num_masks must be > 0")
         
-        mask_model_frozen = load_pretrained_mask_model(args.mask_checkpoint, args.num_masks)
+        mask_model_frozen = load_pretrained_mask_model(
+                                                        args.mask_checkpoint, 
+                                                        args.num_masks,
+                                                        mask_model_arch=args.mask_model_arch,
+                                                        mask_encoder_dim=getattr(args, 'mask_encoder_dim', 192)
+                                                    )
         mask_model_frozen = mask_model_frozen.cuda()
         mask_model_frozen.eval()
         
