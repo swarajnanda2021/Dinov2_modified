@@ -14,8 +14,6 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import random
 
-from models.vision_transformer.auxiliary_models import MaskModel_SpectralNorm
-
 
 
 def load_pretrained_mask_model(checkpoint_path, num_masks=3, mask_model_arch='unet', mask_encoder_dim=192):
