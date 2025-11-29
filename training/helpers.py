@@ -89,6 +89,9 @@ def load_pretrained_mask_model(checkpoint_path, num_masks=3, mask_model_arch='un
             cleaned_state_dict[k] = v
     
     mask_model.load_state_dict(cleaned_state_dict, strict=False)
+
+    # Convert to bfloat16 for memory efficiency
+    mask_model = mask_model.to(torch.bfloat16)
     
     print(f"Successfully loaded mask model weights")
     
