@@ -491,8 +491,9 @@ def train_dinov2(args):
 
         if args.use_adversarial_mask_augmentation and mask_model_frozen is not None:
             with torch.no_grad():
-                mask_output = mask_model_frozen(original_images)
-                masks = mask_output['masks']
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+                    mask_output = mask_model_frozen(original_images)
+                    masks = mask_output['masks'].float()  # Cast back to float32 for downstream ops
             
             # Apply masks to create masked global views
             masked_images = apply_masks_to_images(original_images, masks)
