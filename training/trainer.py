@@ -852,7 +852,8 @@ def train_dinov2(args):
             if args.use_adversarial_mask_augmentation and mask_model_frozen is not None:
                 sample_image = original_images[:1]
                 with torch.no_grad():
-                    vis_masks = mask_model_frozen(sample_image)['masks']
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+                        vis_masks = mask_model_frozen(sample_image)['masks']
                     save_iteration_masks_efficient(
                         sample_image,
                         vis_masks,
