@@ -1,4 +1,4 @@
-# TME-DINOv2: Tissue Microenvironment as Prior for Self-Supervised Learning in Histopathology
+# TME-DINOv2: Improving Cancer Mutation Predictions using Vision Encoders by Enforcing Tissue Microenvironment Priors
 
 This repository contains the official implementation of TME-DINOv2, a self-supervised learning framework that incorporates tissue microenvironment (TME) priors through semantic masking augmentations for histopathology image analysis.
 
