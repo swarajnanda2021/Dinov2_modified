@@ -159,14 +159,6 @@ def main():
     args.ibot_loss_weight = 1.0
     args.token_mask_ratio = 0.4
     
-    # Prototype clustering
-    args.use_prototype_clustering = False
-    args.clustering_mode = 'visible'
-    args.num_prototypes = 16384
-    args.clustering_weight = 1.0
-    args.clustering_teacher_temp = 0.07
-    args.clustering_student_temp = 0.1
-    
     # Teacher parameters
     args.momentum_teacher = 0.996
     args.teacher_temp = 0.07

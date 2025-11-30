@@ -4,7 +4,6 @@ Exports all model components for easy importing.
 """
 
 from .dinov2_model import CombinedModelDINO
-from .prototype_bank import LinearPrototypeBank
 from .vision_transformer.modern_vit import VisionTransformer as ModernViT
 from .vision_transformer.auxiliary_models import (
     DINOHead,
@@ -16,7 +15,6 @@ from .vision_transformer.auxiliary_models import (
 
 __all__ = [
     'CombinedModelDINO',
-    'LinearPrototypeBank',
     'ModernViT',
     'DINOHead',
     'TMEHead',

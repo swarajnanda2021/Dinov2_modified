@@ -12,5 +12,4 @@ __all__ = [
     'DINOLoss',
     'iBOTPatchLoss',
     'KoLeoLoss',
-    'PatchPrototypeLoss',
 ]

@@ -83,20 +83,6 @@ def get_args_parser():
                         help='Weight for iBOT patch loss')
     parser.add_argument('--token_mask_ratio', default=0.4, type=float,
                         help='Ratio of tokens to mask for iBOT')
-    
-    # ========== Patch Prototype Clustering parameters ==========
-    parser.add_argument('--clustering_mode', type=str, default='visible',
-                   choices=['masked', 'visible', 'separate'])
-    parser.add_argument('--use_prototype_clustering', default=True, type=utils.bool_flag,
-                    help='Enable patch prototype clustering loss')
-    parser.add_argument('--num_prototypes', default=8192, type=int,
-                        help='Number of prototypes for clustering')
-    parser.add_argument('--clustering_weight', default=1.0, type=float,
-                        help='Weight for prototype clustering loss')
-    parser.add_argument('--clustering_teacher_temp', default=0.07, type=float,
-                        help='Teacher temperature for clustering')
-    parser.add_argument('--clustering_student_temp', default=0.1, type=float,
-                        help='Student temperature for clustering')
 
     # ========== Training parameters ==========
     parser.add_argument('--batch_size_per_gpu', default=32, type=int,
