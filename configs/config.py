@@ -43,9 +43,32 @@ def get_args_parser():
     parser.add_argument('--crops_per_mask', default=1, type=int,
                         help='Number of local crops per mask')
     
-    # ========== Mask model parameters ==========
+    # ========== Adversarial mask model parameters ==========
+    parser.add_argument('--use_adversarial_mask_augmentation', default=False, type=utils.bool_flag,
+                        help='Enable adversarial mask-based augmentation (3-channel semantic masks)')
+    parser.add_argument('--mask_model_arch', default='unet', type=str,
+                        choices=['unet', 'vit_unet'],
+                        help='Mask model architecture: unet (ADIOS) or vit_unet')
     parser.add_argument('--mask_checkpoint', type=str,
                         help='Path to pre-trained mask model checkpoint')
+    parser.add_argument('--mask_encoder_dim', default=192, type=int,
+                        help='Encoder dimension for vit_unet mask model')
+    
+    # ========== CellViT augmentation parameters ==========
+    parser.add_argument('--use_cellvit_augmentation', default=False, type=utils.bool_flag,
+                        help='Enable CellViT-B based nuclei/background augmentation')
+    parser.add_argument('--cellvit_checkpoint', type=str, default=None,
+                        help='Path to trained CellViT model checkpoint')
+    parser.add_argument('--cellvit_crops_per_channel', default=1, type=int,
+                        help='Number of crops per channel (nuclei/background)')
+    
+    # ========== Random Masking augmentation parameters ==========
+    parser.add_argument('--use_random_mask_augmentation', default=False, type=utils.bool_flag,
+                        help='Enable random rectangular mask-based augmentation')
+    parser.add_argument('--random_num_masks', default=2, type=int,
+                        help='Number of random rectangular masks to generate')
+    parser.add_argument('--random_crops_per_mask', default=1, type=int,
+                        help='Number of local crops per random mask')
     
     # ========== Loss parameters ==========
     parser.add_argument('--momentum_teacher', default=0.996, type=float,
@@ -65,9 +88,9 @@ def get_args_parser():
     
     # ========== Patch Prototype Clustering parameters ==========
     parser.add_argument('--clustering_mode', type=str, default='masked',
-                   choices=['masked', 'visible', 'separate'])
+                        choices=['masked', 'visible', 'separate'])
     parser.add_argument('--use_prototype_clustering', default=True, type=utils.bool_flag,
-                    help='Enable patch prototype clustering loss')
+                        help='Enable patch prototype clustering loss')
     parser.add_argument('--num_prototypes', default=8192, type=int,
                         help='Number of prototypes for clustering')
     parser.add_argument('--clustering_weight', default=1.0, type=float,
@@ -99,11 +122,11 @@ def get_args_parser():
     parser.add_argument('--weight_decay_end', type=float, default=0.4,
                         help='Final weight decay')
     parser.add_argument('--grad_checkpointing', default=False, type=utils.bool_flag,
-                    help='Enable gradient checkpointing to reduce memory at cost of ~40% speed')
+                        help='Enable gradient checkpointing to reduce memory at cost of ~40% speed')
     
     # ========== Dataset and I/O ==========
     parser.add_argument('--dataset_sources', type=str, nargs='+',
-                   help='Dataset sources in format NAME:BASE_DIR:INDEX_FILE')
+                        help='Dataset sources in format NAME:BASE_DIR:INDEX_FILE')
     parser.add_argument('--output_dir', default=".", type=str,
                         help='Output directory for checkpoints and logs')
     parser.add_argument('--save_checkpoint_freq', default=2000, type=int,

@@ -7,14 +7,16 @@ from .modern_vit import VisionTransformer
 from .auxiliary_models import (
     DINOHead,
     TMEHead,
-    MaskModel_SpectralNorm,
+    ADIOSMaskModel,
     MaskModel,
+    CellViT,
 )
 
 __all__ = [
     'VisionTransformer',
     'DINOHead',
     'TMEHead',
-    'MaskModel_SpectralNorm',
+    'ADIOSMaskModel',
     'MaskModel',
+    'CellViT',
 ]
