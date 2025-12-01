@@ -1,5 +1,6 @@
 """
 Main training loop for DINOv2 with iBOT and prototype clustering.
+FSDP2 version with multi-augmentation support.
 """
 
 import os
@@ -26,9 +27,13 @@ from losses import DINOLoss, iBOTPatchLoss, KoLeoLoss, PatchPrototypeLoss
 from data import ProportionalMultiDatasetWrapper
 from .helpers import (
     load_pretrained_mask_model,
+    load_pretrained_cellvit_model,
     apply_masks_to_images,
+    apply_cellvit_masks,
     extract_local_crops_from_masked,
+    extract_crops_from_cellvit_channel,
     generate_random_token_masks,
+    generate_random_image_masks,
     calculate_total_student_views,
     save_iteration_masks_efficient,
     worker_init_fn,
@@ -43,6 +48,7 @@ from .param_groups_fsdp2 import get_params_groups_fsdp2
 def train_dinov2(args):
     """
     Main training function for DINOv2 with iBOT and prototype clustering.
+    FSDP2 version with multi-augmentation support.
     
     Args:
         args: Training arguments namespace
@@ -61,28 +67,79 @@ def train_dinov2(args):
     print(f"Global views (teacher/student): {args.global_views}")
     print(f"Standard local crops: {args.n_standard_local_crops}")
     print(f"Local crop size: {args.local_crop_size}x{args.local_crop_size}")
-    print(f"Number of masks: {args.num_masks}")
-    print(f"Crops per mask: {args.crops_per_mask}")
+
+    # Adversarial mask augmentation
+    if args.use_adversarial_mask_augmentation:
+        print(f"\nAdversarial Mask Augmentation: ENABLED")
+        print(f"  Number of masks: {args.num_masks}")
+        print(f"  Crops per mask: {args.crops_per_mask}")
+        print(f"  Architecture: {args.mask_model_arch}")
+    else:
+        print(f"\nAdversarial Mask Augmentation: DISABLED")
+
+    # CellViT augmentation
+    if args.use_cellvit_augmentation:
+        print(f"\nCellViT Augmentation: ENABLED")
+        print(f"  Crops per channel: {args.cellvit_crops_per_channel}")
+    else:
+        print(f"\nCellViT Augmentation: DISABLED")
+
+    # Random mask augmentation
+    if args.use_random_mask_augmentation:
+        print(f"\nRandom Mask Augmentation: ENABLED")
+        print(f"  Number of masks: {args.random_num_masks}")
+        print(f"  Crops per mask: {args.random_crops_per_mask}")
+    else:
+        print(f"\nRandom Mask Augmentation: DISABLED")
+
     total_student_views = calculate_total_student_views(args)
-    print(f"Total student views: {total_student_views}")
+    print(f"\nTotal student views: {total_student_views}")
     print("================================================\n")
     
-    # ============ Load pre-trained mask model ============
+    # ============ Load pre-trained adversarial mask model (if enabled) ============
     mask_model_frozen = None
-    if args.num_masks > 0:
-        mask_model_frozen = load_pretrained_mask_model(args.mask_checkpoint, args.num_masks)
+    if args.use_adversarial_mask_augmentation:
+        if args.mask_checkpoint is None:
+            raise ValueError("--use_adversarial_mask_augmentation is True but --mask_checkpoint not provided")
+        
+        if args.num_masks <= 0:
+            raise ValueError("--use_adversarial_mask_augmentation is True but --num_masks must be > 0")
+        
+        mask_model_frozen = load_pretrained_mask_model(
+            args.mask_checkpoint, 
+            args.num_masks,
+            mask_model_arch=args.mask_model_arch,
+            mask_encoder_dim=getattr(args, 'mask_encoder_dim', 192)
+        )
         mask_model_frozen = mask_model_frozen.cuda()
         mask_model_frozen.eval()
         
         for param in mask_model_frozen.parameters():
             param.requires_grad = False
         
-        print(f"Loaded and froze mask model with {args.num_masks} masks")
+        print(f"Loaded and froze adversarial mask model with {args.num_masks} masks")
+        print(f"  Crops per mask: {args.crops_per_mask}")
     else:
-        print("No mask model loaded (num_masks=0)")
+        print("Adversarial mask augmentation disabled (--use_adversarial_mask_augmentation=False)")
+    
+    # ============ Load pre-trained CellViT model (if enabled) ============
+    cellvit_model_frozen = None
+    if args.use_cellvit_augmentation:
+        if args.cellvit_checkpoint is None:
+            raise ValueError("--use_cellvit_augmentation is True but --cellvit_checkpoint not provided")
+        
+        cellvit_model_frozen = load_pretrained_cellvit_model(args.cellvit_checkpoint, device='cuda')
+        cellvit_model_frozen.eval()
+        
+        for param in cellvit_model_frozen.parameters():
+            param.requires_grad = False
+        
+        print(f"Loaded and froze CellViT model for nuclei/background segmentation")
+        print(f"  CellViT crops per channel: {args.cellvit_crops_per_channel}")
+    else:
+        print("CellViT augmentation disabled (--use_cellvit_augmentation=False)")
 
     # ============ Create dataset ============
-    # Parse dataset sources from args
     dataset_configs = []
     for source in args.dataset_sources:
         parts = source.split(':')
@@ -192,12 +249,9 @@ def train_dinov2(args):
         print(f"Created LinearPrototypeBank with {args.num_prototypes} soft prototypes")
     else:
         print("Prototype clustering disabled (--use_prototype_clustering=False)")
-    
-    print(f"Created LinearPrototypeBank with {args.num_prototypes} soft prototypes")
 
     student = student.cuda()
     teacher = teacher.cuda()
-
 
     if utils.has_batchnorms(student):
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
@@ -215,7 +269,6 @@ def train_dinov2(args):
         prototype_bank = nn.parallel.DistributedDataParallel(prototype_bank, device_ids=[args.gpu])
 
     print("FSDP2 wrapping complete")
-
 
     # Disable gradients for teacher
     for param in teacher.parameters():
@@ -318,12 +371,12 @@ def train_dinov2(args):
             checkpoint_dir,
             student,
             teacher,
-            prototype_bank,  # Can be None
+            prototype_bank,
             optimizer_student,
-            optimizer_prototypes,  # Can be None
+            optimizer_prototypes,
             args,
             dino_class_loss=dino_class_loss,
-            patch_prototype_loss=patch_prototype_loss,  # Can be None
+            patch_prototype_loss=patch_prototype_loss,
             fp16_scaler=fp16_scaler,
         )
         to_restore["iteration"] = current_iteration
@@ -411,14 +464,15 @@ def train_dinov2(args):
         # Get original images for masking and iBOT
         original_images = batch_data[-1].cuda(non_blocking=True)
         
-        # 3. Generate masks and masked views if configured
+        # 3. Generate adversarial masked views if configured
         masked_global_crops = []
         masked_local_crops_all = []
-        
-        if args.num_masks > 0 and mask_model_frozen is not None:
+
+        if args.use_adversarial_mask_augmentation and mask_model_frozen is not None:
             with torch.no_grad():
-                mask_output = mask_model_frozen(original_images)
-                masks = mask_output['masks']
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+                    mask_output = mask_model_frozen(original_images)
+                    masks = mask_output['masks'].float()
             
             # Apply masks to create masked global views
             masked_images = apply_masks_to_images(original_images, masks)
@@ -439,8 +493,119 @@ def train_dinov2(args):
                 
                 # Add masked local crops to student views
                 student_all_crops.extend(masked_local_crops_all)
-        
 
+        # 4. Generate CellViT (Nuclei/Background) masks and masked views if configured
+        cellvit_nuclei_global = None
+        cellvit_background_global = None
+        cellvit_nuclei_crops = []
+        cellvit_background_crops = []
+
+        if args.use_cellvit_augmentation and cellvit_model_frozen is not None:
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
+                    cellvit_output = cellvit_model_frozen(original_images)
+                    cellvit_masks = cellvit_output['masks'].float()
+            
+            del cellvit_output
+            
+            # Apply masks to create nuclei and background views
+            nuclei_images, background_images = apply_cellvit_masks(original_images, cellvit_masks)
+            del cellvit_masks
+            
+            # Global views (224x224)
+            cellvit_nuclei_global = nuclei_images.clone()
+            cellvit_background_global = background_images.clone()
+            
+            # Add global views to student crops
+            student_all_crops.append(cellvit_nuclei_global)
+            student_all_crops.append(cellvit_background_global)
+            
+            # Extract local crops (96x96) from each channel
+            if args.cellvit_crops_per_channel > 0:
+                nuclei_crops = extract_crops_from_cellvit_channel(
+                    nuclei_images,
+                    n_crops=args.cellvit_crops_per_channel,
+                    crop_size=args.local_crop_size
+                )
+                background_crops = extract_crops_from_cellvit_channel(
+                    background_images,
+                    n_crops=args.cellvit_crops_per_channel,
+                    crop_size=args.local_crop_size
+                )
+                
+                # Add to student views
+                cellvit_nuclei_crops = nuclei_crops
+                cellvit_background_crops = background_crops
+                student_all_crops.extend(nuclei_crops)
+                student_all_crops.extend(background_crops)
+                
+                del nuclei_crops, background_crops
+            
+            del nuclei_images, background_images
+        
+        # 5. Generate Random Rectangular Masks if configured
+        random_masked_global_crops = []
+        random_masked_local_crops = []
+        
+        if args.use_random_mask_augmentation:
+            # Generate random rectangular masks
+            random_masks = generate_random_image_masks(
+                batch_size=original_images.shape[0],
+                num_masks=args.random_num_masks,
+                height=224,
+                width=224,
+                device=original_images.device,
+            )
+            
+            # Apply masks to create masked global views
+            random_masked_images = apply_masks_to_images(original_images, random_masks)
+            random_masked_global_crops = random_masked_images
+            
+            # Add masked global crops to student views
+            student_all_crops.extend(random_masked_global_crops)
+            
+            # Extract local crops from masked images
+            if args.random_crops_per_mask > 0:
+                for masked_img in random_masked_images:
+                    crops = extract_local_crops_from_masked(
+                        masked_img,
+                        n_crops=args.random_crops_per_mask,
+                        crop_size=args.local_crop_size
+                    )
+                    random_masked_local_crops.extend(crops)
+                
+                # Add masked local crops to student views
+                student_all_crops.extend(random_masked_local_crops)
+        
+        # ========== Debug: Print shapes on first iteration ==========
+        if current_iteration == 0 and utils.is_main_process():
+            print("\n=== Crop Organization (First Iteration) ===")
+            print(f"Teacher global crops: {len(teacher_global_crops)} crops")
+            for i, crop in enumerate(teacher_global_crops):
+                print(f"  Teacher crop {i}: {crop.shape}")
+            print(f"Student total crops: {len(student_all_crops)} crops")
+            for i, crop in enumerate(student_all_crops):
+                print(f"  Student crop {i}: {crop.shape}")
+            print(f"Original images: {original_images.shape}")
+            
+            if args.use_adversarial_mask_augmentation:
+                print(f"\nAdversarial Mask Augmentation:")
+                print(f"  Masked global crops: {len(masked_global_crops)}")
+                print(f"  Masked local crops: {len(masked_local_crops_all)}")
+            
+            if args.use_cellvit_augmentation:
+                print(f"\nCellViT Augmentation:")
+                print(f"  Nuclei global: {cellvit_nuclei_global.shape if cellvit_nuclei_global is not None else 'None'}")
+                print(f"  Background global: {cellvit_background_global.shape if cellvit_background_global is not None else 'None'}")
+                print(f"  Nuclei crops: {len(cellvit_nuclei_crops)} x {cellvit_nuclei_crops[0].shape if cellvit_nuclei_crops else 'None'}")
+                print(f"  Background crops: {len(cellvit_background_crops)} x {cellvit_background_crops[0].shape if cellvit_background_crops else 'None'}")
+            
+            if args.use_random_mask_augmentation:
+                print(f"\nRandom Mask Augmentation:")
+                print(f"  Random masked global crops: {len(random_masked_global_crops)}")
+                print(f"  Random masked local crops: {len(random_masked_local_crops)}")
+            
+            print("="*50 + "\n")
         
         # ========== Update learning rates ==========
         for i, param_group in enumerate(optimizer_student.param_groups):
@@ -477,7 +642,11 @@ def train_dinov2(args):
             )
             
             # ========== KoLeo Loss on Global CLS Tokens ==========
-            num_global_total = args.global_views + args.num_masks
+            # Count global views including adversarial masks
+            num_global_total = args.global_views
+            if args.use_adversarial_mask_augmentation:
+                num_global_total += args.num_masks
+            
             global_features_list = student_output['features_list'][:num_global_total]
             global_cls_tokens = [feat_dict['clstoken'] for feat_dict in global_features_list]
             
@@ -509,7 +678,7 @@ def train_dinov2(args):
                 student_patch_outputs,
                 teacher_patch_outputs,
                 random_token_masks,
-                n_masked_patches_tensor = random_token_masks.sum(),
+                n_masked_patches_tensor=random_token_masks.sum(),
                 teacher_temp=dino_class_loss.teacher_temp_schedule(current_iteration)
             )
 
@@ -593,7 +762,6 @@ def train_dinov2(args):
                 args.clustering_weight * clustering_loss
             )
 
-
         # ========== Backward and optimizer steps ==========
         if fp16_scaler is None:
             # ===== NON-MIXED PRECISION =====
@@ -672,7 +840,56 @@ def train_dinov2(args):
         # ========== Clean cache periodically ==========
         if current_iteration % 100 == 0:
             torch.cuda.empty_cache()
- 
+        
+        # ========== Visualize masks ==========
+        if current_iteration % args.visualization_freq == 0 and current_iteration < 5000:
+            # Visualize adversarial masks
+            if args.use_adversarial_mask_augmentation and mask_model_frozen is not None:
+                sample_image = original_images[:1]
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+                        vis_masks = mask_model_frozen(sample_image)['masks']
+                    save_iteration_masks_efficient(
+                        sample_image,
+                        vis_masks,
+                        current_iteration,
+                        os.path.join(args.output_dir, 'adversarial_mask_visualizations'),
+                        num_samples=1
+                    )
+            
+            # Visualize CellViT masks
+            if args.use_cellvit_augmentation and cellvit_model_frozen is not None:
+                sample_image = original_images[:1]
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
+                        cellvit_vis = cellvit_model_frozen(sample_image)
+                        cellvit_vis_masks = cellvit_vis['masks']
+
+                    save_iteration_masks_efficient(
+                        sample_image,
+                        cellvit_vis_masks,
+                        current_iteration,
+                        os.path.join(args.output_dir, 'cellvit_mask_visualizations'),
+                        num_samples=1
+                    )
+            
+            # Visualize Random masks
+            if args.use_random_mask_augmentation:
+                sample_image = original_images[:1]
+                random_vis_masks = generate_random_image_masks(
+                    batch_size=1,
+                    num_masks=args.random_num_masks,
+                    height=224,
+                    width=224,
+                    device=sample_image.device,
+                )
+                save_iteration_masks_efficient(
+                    sample_image,
+                    random_vis_masks,
+                    current_iteration,
+                    os.path.join(args.output_dir, 'random_mask_visualizations'),
+                    num_samples=1
+                )
         
         # ========== Logging ==========
         metric_logger.update(student_loss=student_loss.item())
@@ -712,8 +929,14 @@ def train_dinov2(args):
                 'augmentation_config': {
                     'global_views': args.global_views,
                     'n_standard_local_crops': args.n_standard_local_crops,
-                    'num_masks': args.num_masks,
-                    'crops_per_mask': args.crops_per_mask,
+                    'adversarial_mask_augmentation': args.use_adversarial_mask_augmentation,
+                    'num_masks': args.num_masks if args.use_adversarial_mask_augmentation else 0,
+                    'crops_per_mask': args.crops_per_mask if args.use_adversarial_mask_augmentation else 0,
+                    'cellvit_augmentation': args.use_cellvit_augmentation,
+                    'cellvit_crops_per_channel': args.cellvit_crops_per_channel if args.use_cellvit_augmentation else 0,
+                    'random_mask_augmentation': args.use_random_mask_augmentation,
+                    'random_num_masks': args.random_num_masks if args.use_random_mask_augmentation else 0,
+                    'random_crops_per_mask': args.random_crops_per_mask if args.use_random_mask_augmentation else 0,
                     'total_student_views': total_student_views,
                 }
             }
@@ -722,7 +945,6 @@ def train_dinov2(args):
                 f.write(json.dumps(log_stats) + "\n")
         
         # ========== Save checkpoints ==========
-        # Don't save at iteration 0, and add better logging
         if current_iteration % args.save_checkpoint_freq == 0:
             if utils.is_main_process():
                 print(f"Preparing to save checkpoint at iteration {current_iteration}...")
