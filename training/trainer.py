@@ -668,7 +668,9 @@ def train_dinov2(args):
             )
             
             # ========== KoLeo Loss on Global CLS Tokens ==========
-            num_global_total = args.global_views + args.num_masks
+            num_global_total = args.global_views
+            if args.use_adversarial_mask_augmentation:
+                num_global_total += args.num_masks
             global_features_list = student_output['features_list'][:num_global_total]
             global_cls_tokens = [feat_dict['clstoken'] for feat_dict in global_features_list]
             
