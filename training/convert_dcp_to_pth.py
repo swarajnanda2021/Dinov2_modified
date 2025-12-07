@@ -3,130 +3,201 @@
 Convert DCP checkpoints to regular PyTorch checkpoints (DDP format).
 
 Usage:
-    python convert_dcp_to_pth.py --iteration 8000
+    python convert_dcp_to_pth.py                  # convert all (subprocess per checkpoint)
+    python convert_dcp_to_pth.py --iteration 8000 # convert single (worker mode)
 """
 
 import os
 import sys
 import argparse
-import pickle
+import ast
 import gc
+import subprocess
 from pathlib import Path
 from copy import deepcopy
-import torch
-import torch.distributed as dist
 
 # Add project root to path
 script_dir = Path(__file__).resolve().parent
 project_root = script_dir.parent
 sys.path.insert(0, str(project_root))
 
-# Import DCP utilities
-try:
-    from torch.distributed.checkpoint import FileSystemReader
-    import torch.distributed.checkpoint as dcp
-    from torch.distributed.checkpoint.state_dict import get_model_state_dict
-except ImportError:
-    print("ERROR: torch.distributed.checkpoint not available (need PyTorch 2.0+)")
-    sys.exit(1)
 
-# Import model components
-try:
-    from models import CombinedModelDINO, ModernViT, DINOHead
-except ImportError as e:
-    print(f"ERROR: Could not import models: {e}")
-    sys.exit(1)
-
-
-def init_distributed():
-    """Initialize minimal distributed context."""
-    if not dist.is_initialized():
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = '12357'
-        os.environ['RANK'] = '0'
-        os.environ['WORLD_SIZE'] = '1'
-        dist.init_process_group(backend='gloo', rank=0, world_size=1)
-
-
-def clean_fsdp_key(key: str) -> str:
-    """Remove FSDP2/compile prefixes from parameter names."""
-    key = key.replace("_fsdp_wrapped_module.", "")
-    key = key.replace("_checkpoint_wrapped_module.", "")
-    key = key.replace("parametrizations.", "")
-    key = key.replace("_orig_mod.", "")
-    key = key.removesuffix(".original")
-    return key
-
-
-def tensor_to_regular(tensor):
-    """Convert DTensor or any tensor to regular torch.Tensor on CPU."""
-    # Check if it's a DTensor
-    if hasattr(tensor, 'full_tensor'):
-        # DTensor - get full tensor
-        tensor = tensor.full_tensor()
-    elif hasattr(tensor, 'to_local'):
-        # Alternative DTensor method
-        tensor = tensor.to_local()
-    
-    # Move to CPU and ensure it's a regular tensor
-    if hasattr(tensor, 'cpu'):
-        tensor = tensor.cpu()
-    
-    # Clone to ensure it's a standalone tensor
-    if isinstance(tensor, torch.Tensor):
-        tensor = tensor.clone().detach()
-    
-    return tensor
-
-
-def convert_state_dict_to_ddp_format(fsdp_state_dict: dict) -> dict:
+def parse_config_file(logs_dir: Path) -> argparse.Namespace:
     """
-    Convert FSDP2 state dict to DDP format.
-    - Cleans FSDP prefixes
-    - Adds 'module.' prefix (DDP wrapping)
-    - Converts DTensor to regular torch.Tensor
+    Parse the latest *_config.txt file from logs directory.
+    Returns argparse.Namespace with all training args.
     """
-    ddp_state_dict = {}
+    config_files = sorted(logs_dir.glob("*_config.txt"), key=lambda p: p.stat().st_mtime)
+    if not config_files:
+        raise FileNotFoundError(f"No *_config.txt found in {logs_dir}")
     
-    for key, value in fsdp_state_dict.items():
-        # Handle nested FSDP state format
-        if isinstance(value, dict) and "state" in value:
-            inner = value["state"]
-            if isinstance(inner, dict):
-                for inner_key, inner_value in inner.items():
-                    clean_key = clean_fsdp_key(inner_key)
-                    ddp_key = f"module.{clean_key}"
-                    ddp_state_dict[ddp_key] = tensor_to_regular(inner_value)
+    config_path = config_files[-1]
+    print(f"  Parsing args from: {config_path.name}")
+    
+    args_dict = {}
+    with open(config_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or ':' not in line:
+                continue
+            key, value = line.split(':', 1)
+            key = key.strip()
+            value = value.strip()
+            
+            if value.lower() == 'true':
+                args_dict[key] = True
+            elif value.lower() == 'false':
+                args_dict[key] = False
+            elif value.startswith('[') and value.endswith(']'):
+                args_dict[key] = ast.literal_eval(value)
             else:
-                clean_key = clean_fsdp_key(key)
-                ddp_key = f"module.{clean_key}"
-                ddp_state_dict[ddp_key] = tensor_to_regular(inner)
+                try:
+                    args_dict[key] = int(value)
+                except ValueError:
+                    try:
+                        args_dict[key] = float(value)
+                    except ValueError:
+                        args_dict[key] = value
+    
+    return argparse.Namespace(**args_dict)
+
+
+def get_pending_checkpoints(logs_dir: Path, output_dir: Path):
+    """Find DCP checkpoints that haven't been converted yet."""
+    checkpoint_dir = logs_dir / "checkpoint_fsdp2"
+    if not checkpoint_dir.exists():
+        return []
+    
+    dcp_checkpoints = sorted(checkpoint_dir.glob("dcp_iter_*"))
+    
+    pending = []
+    for dcp_dir in dcp_checkpoints:
+        iteration = int(dcp_dir.name.replace("dcp_iter_", ""))
+        output_path = output_dir / f"checkpoint_iter_{iteration:08d}.pth"
+        if not output_path.exists():
+            pending.append(iteration)
+    
+    return pending
+
+
+def run_orchestrator(output_dir: Path):
+    """Orchestrator mode: spawn subprocess per checkpoint."""
+    logs_dir = project_root / "logs"
+    
+    pending = get_pending_checkpoints(logs_dir, output_dir)
+    
+    if not pending:
+        print("All checkpoints already converted")
+        return
+    
+    print(f"Found {len(pending)} checkpoint(s) to convert: {pending}")
+    print(f"Output: {output_dir}")
+    print()
+    
+    success = 0
+    failed = []
+    
+    for iteration in pending:
+        print(f"{'='*70}")
+        print(f"Spawning subprocess for iteration {iteration}")
+        print(f"{'='*70}")
+        
+        cmd = [
+            sys.executable,
+            str(script_dir / "convert_dcp_to_pth.py"),
+            "--iteration", str(iteration),
+            "--output_dir", str(output_dir)
+        ]
+        
+        result = subprocess.run(cmd)
+        
+        if result.returncode == 0:
+            success += 1
+            print(f"✓ Iteration {iteration} completed\n")
         else:
-            clean_key = clean_fsdp_key(key)
-            ddp_key = f"module.{clean_key}"
-            ddp_state_dict[ddp_key] = tensor_to_regular(value)
+            failed.append(iteration)
+            print(f"✗ Iteration {iteration} failed (exit code {result.returncode})\n")
     
-    return ddp_state_dict
+    print(f"{'='*70}")
+    print(f"Summary: {success}/{len(pending)} converted successfully")
+    if failed:
+        print(f"Failed iterations: {failed}")
+    print(f"{'='*70}")
 
 
-def dict_to_namespace(d: dict) -> argparse.Namespace:
-    """Convert dict to argparse.Namespace."""
-    return argparse.Namespace(**d)
-
-
-def cleanup_gpu_memory():
-    """Aggressively clean up GPU memory."""
-    gc.collect()
-    torch.cuda.empty_cache()
-    gc.collect()
+def run_worker(iteration: int, output_dir: Path):
+    """Worker mode: convert single checkpoint."""
+    import torch
+    import torch.distributed as dist
     
-    # Force synchronization
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-
-def apply_fsdp_wrapping(student, teacher):
-    """Apply FSDP2 wrapping to match checkpoint structure."""
+    try:
+        from torch.distributed.checkpoint import FileSystemReader
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict
+    except ImportError:
+        print("ERROR: torch.distributed.checkpoint not available")
+        sys.exit(1)
+    
+    try:
+        from models import CombinedModelDINO, ModernViT, DINOHead
+    except ImportError as e:
+        print(f"ERROR: Could not import models: {e}")
+        sys.exit(1)
+    
+    logs_dir = project_root / "logs"
+    dcp_dir = logs_dir / "checkpoint_fsdp2" / f"dcp_iter_{iteration}"
+    output_path = output_dir / f"checkpoint_iter_{iteration:08d}.pth"
+    
+    if not dcp_dir.exists():
+        print(f"ERROR: DCP checkpoint not found: {dcp_dir}")
+        sys.exit(1)
+    
+    if output_path.exists():
+        print(f"Already converted: {output_path.name}")
+        sys.exit(0)
+    
+    print(f"Converting iteration {iteration}")
+    
+    # Parse config
+    args = parse_config_file(logs_dir)
+    
+    # Initialize distributed
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12357'
+    os.environ['RANK'] = '0'
+    os.environ['WORLD_SIZE'] = '1'
+    dist.init_process_group(backend='gloo', rank=0, world_size=1)
+    
+    # Create models
+    print(f"  Architecture: ViT embed_dim={args.embeddingdim}, depth={args.vitdepth}, heads={args.vitheads}")
+    
+    student_encoder = ModernViT(
+        img_size=224, patch_size=args.patch_size, embed_dim=args.embeddingdim,
+        depth=args.vitdepth, num_heads=args.vitheads, mlp_ratio=4.0, qkv_bias=True,
+        qk_norm=False, dual_norm=False, drop_path_rate=0.4,
+        pre_norm=False, num_register_tokens=4
+    )
+    teacher_encoder = deepcopy(student_encoder)
+    
+    student = CombinedModelDINO(
+        backbone=student_encoder,
+        classhead=DINOHead(args.embeddingdim, args.out_dim, use_bn=args.use_bn_in_head, 
+                          norm_last_layer=args.norm_last_layer),
+        patchhead=DINOHead(args.embeddingdim, args.out_dim, use_bn=args.use_bn_in_head,
+                          norm_last_layer=args.norm_last_layer),
+        num_masks=args.num_masks,
+        patch_size=args.patch_size
+    ).cuda()
+    
+    teacher = CombinedModelDINO(
+        backbone=teacher_encoder,
+        classhead=DINOHead(args.embeddingdim, args.out_dim, use_bn=args.use_bn_in_head),
+        patchhead=DINOHead(args.embeddingdim, args.out_dim, use_bn=args.use_bn_in_head),
+        num_masks=args.num_masks,
+        patch_size=args.patch_size
+    ).cuda()
+    
+    # Apply FSDP2 wrapping
     from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
     from torch.distributed.device_mesh import init_device_mesh
     
@@ -134,252 +205,103 @@ def apply_fsdp_wrapping(student, teacher):
     mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
     fsdp_config = {"mesh": world_mesh, "mp_policy": mp_policy, "reshard_after_forward": True}
     
-    # Wrap student
     for block in student.backbone.blocks:
-        block = fully_shard(block, **fsdp_config)
-    student.backbone = fully_shard(student.backbone, **fsdp_config)
-    student.classhead = fully_shard(student.classhead, **fsdp_config)
-    student.patchhead = fully_shard(student.patchhead, **fsdp_config)
+        fully_shard(block, **fsdp_config)
+    fully_shard(student.backbone, **fsdp_config)
+    fully_shard(student.classhead, **fsdp_config)
+    fully_shard(student.patchhead, **fsdp_config)
     
-    # Wrap teacher
     for block in teacher.backbone.blocks:
-        block = fully_shard(block, **fsdp_config)
-    teacher.backbone = fully_shard(teacher.backbone, **fsdp_config)
-    teacher.classhead = fully_shard(teacher.classhead, **fsdp_config)
-    teacher.patchhead = fully_shard(teacher.patchhead, **fsdp_config)
+        fully_shard(block, **fsdp_config)
+    fully_shard(teacher.backbone, **fsdp_config)
+    fully_shard(teacher.classhead, **fsdp_config)
+    fully_shard(teacher.patchhead, **fsdp_config)
     
-    return student, teacher
-
-
-def create_models(dcp_dir):
-    """Create models with architecture from checkpoint."""
-    # Try loading args
-    state_dict = {"iteration": 0, "args": {}}
-    dcp.load(state_dict, storage_reader=FileSystemReader(str(dcp_dir)))
+    # Load checkpoint
+    print("  Loading from DCP...")
+    to_load = {
+        "iteration": 0,
+        "args": {},
+        "student": get_model_state_dict(student),
+        "teacher": get_model_state_dict(teacher),
+    }
+    dcp.load(to_load, storage_reader=FileSystemReader(str(dcp_dir)))
     
-    iteration = state_dict.get("iteration", 0)
-    args = state_dict.get("args", {})
+    # Convert to DDP format
+    print("  Converting to DDP format...")
     
-    # Default to ViT-L if no args
-    if len(args) == 0:
-        print(f"  No args in checkpoint, using ViT-L defaults")
-        args = {
-            'patch_size': 16, 'embeddingdim': 1024, 'vitheads': 16, 
-            'vitdepth': 24, 'out_dim': 65536, 'norm_last_layer': True,
-            'use_bn_in_head': False, 'num_masks': 0
-        }
+    def clean_fsdp_key(key: str) -> str:
+        key = key.replace("_fsdp_wrapped_module.", "")
+        key = key.replace("_checkpoint_wrapped_module.", "")
+        key = key.replace("parametrizations.", "")
+        key = key.replace("_orig_mod.", "")
+        if key.endswith(".original"):
+            key = key[:-9]
+        return key
     
-    # Extract architecture params
-    patch_size = args.get('patch_size', 16)
-    embed_dim = args.get('embeddingdim', 1024)
-    num_heads = args.get('vitheads', 16)
-    depth = args.get('vitdepth', 24)
-    out_dim = args.get('out_dim', 65536)
+    def tensor_to_regular(tensor):
+        if hasattr(tensor, 'full_tensor'):
+            tensor = tensor.full_tensor()
+        elif hasattr(tensor, 'to_local'):
+            tensor = tensor.to_local()
+        if hasattr(tensor, 'cpu'):
+            tensor = tensor.cpu()
+        if isinstance(tensor, torch.Tensor):
+            tensor = tensor.clone().detach()
+        return tensor
     
-    print(f"  Architecture: ViT embed_dim={embed_dim}, depth={depth}, heads={num_heads}")
+    def convert_state_dict(fsdp_state_dict):
+        ddp_state_dict = {}
+        for key, value in fsdp_state_dict.items():
+            if isinstance(value, dict) and "state" in value:
+                inner = value["state"]
+                if isinstance(inner, dict):
+                    for inner_key, inner_value in inner.items():
+                        clean_key = clean_fsdp_key(inner_key)
+                        ddp_state_dict[f"module.{clean_key}"] = tensor_to_regular(inner_value)
+                else:
+                    clean_key = clean_fsdp_key(key)
+                    ddp_state_dict[f"module.{clean_key}"] = tensor_to_regular(inner)
+            else:
+                clean_key = clean_fsdp_key(key)
+                ddp_state_dict[f"module.{clean_key}"] = tensor_to_regular(value)
+        return ddp_state_dict
     
-    # Create models
-    student_encoder = ModernViT(
-        img_size=224, patch_size=patch_size, embed_dim=embed_dim,
-        depth=depth, num_heads=num_heads, mlp_ratio=4.0, qkv_bias=True,
-        qk_norm=False, dual_norm=False, drop_path_rate=0.4,
-        pre_norm=False, num_register_tokens=4
-    )
+    student_state = convert_state_dict(to_load["student"])
+    teacher_state = convert_state_dict(to_load["teacher"])
     
-    teacher_encoder = deepcopy(student_encoder)
+    checkpoint = {
+        "iteration": to_load["iteration"],
+        "args": args,
+        "student": student_state,
+        "teacher": teacher_state,
+    }
     
-    student = CombinedModelDINO(
-        backbone=student_encoder,
-        classhead=DINOHead(embed_dim, out_dim, use_bn=args.get('use_bn_in_head', False), 
-                          norm_last_layer=args.get('norm_last_layer', True)),
-        patchhead=DINOHead(embed_dim, out_dim, use_bn=args.get('use_bn_in_head', False),
-                          norm_last_layer=args.get('norm_last_layer', True)),
-        num_masks=args.get('num_masks', 0),
-        patch_size=patch_size
-    )
+    # Save
+    print("  Saving...")
+    torch.save(checkpoint, output_path)
     
-    teacher = CombinedModelDINO(
-        backbone=teacher_encoder,
-        classhead=DINOHead(embed_dim, out_dim, use_bn=args.get('use_bn_in_head', False)),
-        patchhead=DINOHead(embed_dim, out_dim, use_bn=args.get('use_bn_in_head', False)),
-        num_masks=args.get('num_masks', 0),
-        patch_size=patch_size
-    )
+    size_gb = output_path.stat().st_size / (1024**3)
+    print(f"  ✓ Saved: {output_path.name} ({size_gb:.2f} GB)")
+    print(f"    Iteration: {checkpoint['iteration']}")
+    print(f"    Parameters: {len(student_state)} student, {len(teacher_state)} teacher")
     
-    if torch.cuda.is_available():
-        student = student.cuda()
-        teacher = teacher.cuda()
-    
-    return student, teacher, iteration, args
-
-
-def convert_checkpoint(dcp_dir, output_dir):
-    """Convert DCP checkpoint to regular PyTorch checkpoint (DDP format)."""
-    iteration = int(dcp_dir.name.replace("dcp_iter_", ""))
-    output_path = output_dir / f"checkpoint_iter_{iteration:08d}.pth"
-    
-    print(f"\n{'='*70}")
-    print(f"Converting iteration {iteration}")
-    print(f"{'='*70}")
-    
-    if output_path.exists():
-        print(f"  Output exists: {output_path.name}")
-        response = input("  Overwrite? [y/N]: ")
-        if response.lower() != 'y':
-            return True
-    
-    # Variables to track for cleanup
-    student = None
-    teacher = None
-    to_load = None
-    student_state = None
-    teacher_state = None
-    checkpoint = None
-    
-    try:
-        # Initialize
-        init_distributed()
-        
-        # Create models
-        print("  Creating models...")
-        student, teacher, checkpoint_iter, args = create_models(dcp_dir)
-        
-        # Apply FSDP2
-        print("  Applying FSDP2 wrapping...")
-        student, teacher = apply_fsdp_wrapping(student, teacher)
-        
-        # Load checkpoint
-        print("  Loading from DCP...")
-        to_load = {
-            "iteration": 0,
-            "args": {},
-            "student": get_model_state_dict(student),
-            "teacher": get_model_state_dict(teacher),
-        }
-        dcp.load(to_load, storage_reader=FileSystemReader(str(dcp_dir)))
-        
-        # Convert to DDP format (including DTensor -> Tensor conversion)
-        print("  Converting to DDP format (DTensor -> Tensor)...")
-        student_state = convert_state_dict_to_ddp_format(to_load["student"])
-        teacher_state = convert_state_dict_to_ddp_format(to_load["teacher"])
-        
-        # Verify tensors are regular torch.Tensor
-        sample_key = list(student_state.keys())[0]
-        sample_tensor = student_state[sample_key]
-        print(f"    Tensor type check: {type(sample_tensor)}")
-        assert isinstance(sample_tensor, torch.Tensor), f"Expected torch.Tensor, got {type(sample_tensor)}"
-        assert not hasattr(sample_tensor, 'full_tensor'), "Tensor is still a DTensor!"
-        
-        # Convert args dict to Namespace
-        args_dict = to_load.get("args", args)
-        if isinstance(args_dict, dict):
-            args_namespace = dict_to_namespace(args_dict)
-        else:
-            args_namespace = args_dict
-        
-        checkpoint = {
-            "iteration": to_load["iteration"],
-            "args": args_namespace,
-            "student": student_state,
-            "teacher": teacher_state,
-        }
-        
-        # Clear references before saving to free GPU memory
-        del to_load
-        del student
-        del teacher
-        student = None
-        teacher = None
-        to_load = None
-        cleanup_gpu_memory()
-        
-        # Save
-        print("  Saving...")
-        torch.save(checkpoint, output_path)
-        
-        size_gb = output_path.stat().st_size / (1024**3)
-        print(f"  ✓ Saved: {output_path.name} ({size_gb:.2f} GB)")
-        print(f"    Iteration: {checkpoint['iteration']}")
-        print(f"    Parameters: {len(checkpoint['student'])} student, {len(checkpoint['teacher'])} teacher")
-        
-        # Print sample keys to verify format
-        sample_keys = list(checkpoint['student'].keys())[:5]
-        print(f"    Sample keys: {sample_keys}")
-        
-        # Final cleanup
-        del student_state, teacher_state, checkpoint
-        cleanup_gpu_memory()
-        print("  ✓ GPU memory cleaned up")
-        
-        return True
-        
-    except Exception as e:
-        print(f"  ✗ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Cleanup on error
-        if student is not None:
-            del student
-        if teacher is not None:
-            del teacher
-        if to_load is not None:
-            del to_load
-        if student_state is not None:
-            del student_state
-        if teacher_state is not None:
-            del teacher_state
-        if checkpoint is not None:
-            del checkpoint
-        cleanup_gpu_memory()
-        print("  ✓ GPU memory cleaned up after error")
-        
-        return False
+    dist.destroy_process_group()
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Convert DCP to PyTorch checkpoints (DDP format)')
-    parser.add_argument('--iteration', type=int, help='Specific iteration to convert')
+    parser = argparse.ArgumentParser(description='Convert DCP to PyTorch checkpoints')
+    parser.add_argument('--iteration', type=int, help='Specific iteration (worker mode)')
     parser.add_argument('--output_dir', type=str, help='Output directory (default: ../logs/)')
-    args = parser.parse_args()
+    cli_args = parser.parse_args()
     
-    # Setup paths
-    output_dir = Path(args.output_dir) if args.output_dir else project_root / "logs"
+    output_dir = Path(cli_args.output_dir) if cli_args.output_dir else project_root / "logs"
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    checkpoint_dir = project_root / "logs" / "checkpoint_fsdp2"
-    if not checkpoint_dir.exists():
-        print(f"ERROR: No checkpoint directory: {checkpoint_dir}")
-        return
-    
-    # Find checkpoints
-    dcp_checkpoints = sorted(checkpoint_dir.glob("dcp_iter_*"))
-    if not dcp_checkpoints:
-        print("No DCP checkpoints found")
-        return
-    
-    # Filter by iteration
-    if args.iteration:
-        dcp_checkpoints = [d for d in dcp_checkpoints if int(d.name.replace("dcp_iter_", "")) == args.iteration]
-        if not dcp_checkpoints:
-            print(f"No checkpoint found for iteration {args.iteration}")
-            return
-    
-    print(f"Found {len(dcp_checkpoints)} checkpoint(s)")
-    print(f"Output: {output_dir}")
-    
-    # Convert
-    success = 0
-    for dcp_dir in dcp_checkpoints:
-        if convert_checkpoint(dcp_dir, output_dir):
-            success += 1
-    
-    print(f"\n{'='*70}")
-    print(f"Converted {success}/{len(dcp_checkpoints)} checkpoints")
-    print(f"{'='*70}\n")
-    
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    if cli_args.iteration is not None:
+        run_worker(cli_args.iteration, output_dir)
+    else:
+        run_orchestrator(output_dir)
 
 
 if __name__ == "__main__":
