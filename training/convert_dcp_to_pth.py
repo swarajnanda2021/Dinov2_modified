@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Convert DCP checkpoints to regular PyTorch checkpoints.
+Convert DCP checkpoints to regular PyTorch checkpoints (DDP format).
 
 Usage:
     python convert_dcp_to_pth.py --iteration 8000
@@ -45,6 +45,50 @@ def init_distributed():
         os.environ['RANK'] = '0'
         os.environ['WORLD_SIZE'] = '1'
         dist.init_process_group(backend='gloo', rank=0, world_size=1)
+
+
+def clean_fsdp_key(key: str) -> str:
+    """Remove FSDP2/compile prefixes from parameter names."""
+    key = key.replace("_fsdp_wrapped_module.", "")
+    key = key.replace("_checkpoint_wrapped_module.", "")
+    key = key.replace("parametrizations.", "")
+    key = key.replace("_orig_mod.", "")
+    key = key.removesuffix(".original")
+    return key
+
+
+def convert_state_dict_to_ddp_format(fsdp_state_dict: dict) -> dict:
+    """
+    Convert FSDP2 state dict to DDP format.
+    - Cleans FSDP prefixes
+    - Adds 'module.' prefix (DDP wrapping)
+    """
+    ddp_state_dict = {}
+    
+    for key, value in fsdp_state_dict.items():
+        # Handle nested FSDP state format
+        if isinstance(value, dict) and "state" in value:
+            inner = value["state"]
+            if isinstance(inner, dict):
+                for inner_key, inner_value in inner.items():
+                    clean_key = clean_fsdp_key(inner_key)
+                    ddp_key = f"module.{clean_key}"
+                    ddp_state_dict[ddp_key] = inner_value
+            else:
+                clean_key = clean_fsdp_key(key)
+                ddp_key = f"module.{clean_key}"
+                ddp_state_dict[ddp_key] = inner
+        else:
+            clean_key = clean_fsdp_key(key)
+            ddp_key = f"module.{clean_key}"
+            ddp_state_dict[ddp_key] = value
+    
+    return ddp_state_dict
+
+
+def dict_to_namespace(d: dict) -> argparse.Namespace:
+    """Convert dict to argparse.Namespace."""
+    return argparse.Namespace(**d)
 
 
 def apply_fsdp_wrapping(student, teacher):
@@ -136,7 +180,7 @@ def create_models(dcp_dir):
 
 
 def convert_checkpoint(dcp_dir, output_dir):
-    """Convert DCP checkpoint to regular PyTorch checkpoint."""
+    """Convert DCP checkpoint to regular PyTorch checkpoint (DDP format)."""
     iteration = int(dcp_dir.name.replace("dcp_iter_", ""))
     output_path = output_dir / f"checkpoint_iter_{iteration:08d}.pth"
     
@@ -172,33 +216,21 @@ def convert_checkpoint(dcp_dir, output_dir):
         }
         dcp.load(to_load, storage_reader=FileSystemReader(str(dcp_dir)))
         
-        # Unwrap FSDP2 state dicts
-        print("  Unwrapping state dicts...")
-        student_state = {}
-        for key, value in to_load["student"].items():
-            if isinstance(value, dict) and "state" in value:
-                inner = value["state"]
-                if isinstance(inner, dict):
-                    student_state.update(inner)
-                else:
-                    student_state[key] = inner
-            else:
-                student_state[key] = value
+        # Convert to DDP format
+        print("  Converting to DDP format...")
+        student_state = convert_state_dict_to_ddp_format(to_load["student"])
+        teacher_state = convert_state_dict_to_ddp_format(to_load["teacher"])
         
-        teacher_state = {}
-        for key, value in to_load["teacher"].items():
-            if isinstance(value, dict) and "state" in value:
-                inner = value["state"]
-                if isinstance(inner, dict):
-                    teacher_state.update(inner)
-                else:
-                    teacher_state[key] = inner
-            else:
-                teacher_state[key] = value
+        # Convert args dict to Namespace
+        args_dict = to_load.get("args", args)
+        if isinstance(args_dict, dict):
+            args_namespace = dict_to_namespace(args_dict)
+        else:
+            args_namespace = args_dict
         
         checkpoint = {
             "iteration": to_load["iteration"],
-            "args": to_load.get("args", args),
+            "args": args_namespace,
             "student": student_state,
             "teacher": teacher_state,
         }
@@ -212,6 +244,10 @@ def convert_checkpoint(dcp_dir, output_dir):
         print(f"    Iteration: {checkpoint['iteration']}")
         print(f"    Parameters: {len(checkpoint['student'])} student, {len(checkpoint['teacher'])} teacher")
         
+        # Print sample keys to verify format
+        sample_keys = list(checkpoint['student'].keys())[:5]
+        print(f"    Sample keys: {sample_keys}")
+        
         return True
         
     except Exception as e:
@@ -222,7 +258,7 @@ def convert_checkpoint(dcp_dir, output_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Convert DCP to PyTorch checkpoints')
+    parser = argparse.ArgumentParser(description='Convert DCP to PyTorch checkpoints (DDP format)')
     parser.add_argument('--iteration', type=int, help='Specific iteration to convert')
     parser.add_argument('--output_dir', type=str, help='Output directory (default: ../logs/)')
     args = parser.parse_args()
