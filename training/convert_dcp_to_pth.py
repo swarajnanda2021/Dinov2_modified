@@ -10,6 +10,7 @@ import os
 import sys
 import argparse
 import pickle
+import gc
 from pathlib import Path
 from copy import deepcopy
 import torch
@@ -89,6 +90,12 @@ def convert_state_dict_to_ddp_format(fsdp_state_dict: dict) -> dict:
 def dict_to_namespace(d: dict) -> argparse.Namespace:
     """Convert dict to argparse.Namespace."""
     return argparse.Namespace(**d)
+
+
+def cleanup_gpu_memory():
+    """Clean up GPU memory."""
+    torch.cuda.empty_cache()
+    gc.collect()
 
 
 def apply_fsdp_wrapping(student, teacher):
@@ -194,6 +201,14 @@ def convert_checkpoint(dcp_dir, output_dir):
         if response.lower() != 'y':
             return True
     
+    # Variables to track for cleanup
+    student = None
+    teacher = None
+    to_load = None
+    student_state = None
+    teacher_state = None
+    checkpoint = None
+    
     try:
         # Initialize
         init_distributed()
@@ -248,12 +263,34 @@ def convert_checkpoint(dcp_dir, output_dir):
         sample_keys = list(checkpoint['student'].keys())[:5]
         print(f"    Sample keys: {sample_keys}")
         
+        # Cleanup GPU memory
+        del student, teacher, to_load, student_state, teacher_state, checkpoint
+        cleanup_gpu_memory()
+        print("  ✓ GPU memory cleaned up")
+        
         return True
         
     except Exception as e:
         print(f"  ✗ Error: {e}")
         import traceback
         traceback.print_exc()
+        
+        # Cleanup on error
+        if student is not None:
+            del student
+        if teacher is not None:
+            del teacher
+        if to_load is not None:
+            del to_load
+        if student_state is not None:
+            del student_state
+        if teacher_state is not None:
+            del teacher_state
+        if checkpoint is not None:
+            del checkpoint
+        cleanup_gpu_memory()
+        print("  ✓ GPU memory cleaned up after error")
+        
         return False
 
 
