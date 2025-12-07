@@ -58,11 +58,33 @@ def clean_fsdp_key(key: str) -> str:
     return key
 
 
+def tensor_to_regular(tensor):
+    """Convert DTensor or any tensor to regular torch.Tensor on CPU."""
+    # Check if it's a DTensor
+    if hasattr(tensor, 'full_tensor'):
+        # DTensor - get full tensor
+        tensor = tensor.full_tensor()
+    elif hasattr(tensor, 'to_local'):
+        # Alternative DTensor method
+        tensor = tensor.to_local()
+    
+    # Move to CPU and ensure it's a regular tensor
+    if hasattr(tensor, 'cpu'):
+        tensor = tensor.cpu()
+    
+    # Clone to ensure it's a standalone tensor
+    if isinstance(tensor, torch.Tensor):
+        tensor = tensor.clone().detach()
+    
+    return tensor
+
+
 def convert_state_dict_to_ddp_format(fsdp_state_dict: dict) -> dict:
     """
     Convert FSDP2 state dict to DDP format.
     - Cleans FSDP prefixes
     - Adds 'module.' prefix (DDP wrapping)
+    - Converts DTensor to regular torch.Tensor
     """
     ddp_state_dict = {}
     
@@ -74,15 +96,15 @@ def convert_state_dict_to_ddp_format(fsdp_state_dict: dict) -> dict:
                 for inner_key, inner_value in inner.items():
                     clean_key = clean_fsdp_key(inner_key)
                     ddp_key = f"module.{clean_key}"
-                    ddp_state_dict[ddp_key] = inner_value
+                    ddp_state_dict[ddp_key] = tensor_to_regular(inner_value)
             else:
                 clean_key = clean_fsdp_key(key)
                 ddp_key = f"module.{clean_key}"
-                ddp_state_dict[ddp_key] = inner
+                ddp_state_dict[ddp_key] = tensor_to_regular(inner)
         else:
             clean_key = clean_fsdp_key(key)
             ddp_key = f"module.{clean_key}"
-            ddp_state_dict[ddp_key] = value
+            ddp_state_dict[ddp_key] = tensor_to_regular(value)
     
     return ddp_state_dict
 
@@ -93,9 +115,14 @@ def dict_to_namespace(d: dict) -> argparse.Namespace:
 
 
 def cleanup_gpu_memory():
-    """Clean up GPU memory."""
+    """Aggressively clean up GPU memory."""
+    gc.collect()
     torch.cuda.empty_cache()
     gc.collect()
+    
+    # Force synchronization
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 def apply_fsdp_wrapping(student, teacher):
@@ -231,10 +258,17 @@ def convert_checkpoint(dcp_dir, output_dir):
         }
         dcp.load(to_load, storage_reader=FileSystemReader(str(dcp_dir)))
         
-        # Convert to DDP format
-        print("  Converting to DDP format...")
+        # Convert to DDP format (including DTensor -> Tensor conversion)
+        print("  Converting to DDP format (DTensor -> Tensor)...")
         student_state = convert_state_dict_to_ddp_format(to_load["student"])
         teacher_state = convert_state_dict_to_ddp_format(to_load["teacher"])
+        
+        # Verify tensors are regular torch.Tensor
+        sample_key = list(student_state.keys())[0]
+        sample_tensor = student_state[sample_key]
+        print(f"    Tensor type check: {type(sample_tensor)}")
+        assert isinstance(sample_tensor, torch.Tensor), f"Expected torch.Tensor, got {type(sample_tensor)}"
+        assert not hasattr(sample_tensor, 'full_tensor'), "Tensor is still a DTensor!"
         
         # Convert args dict to Namespace
         args_dict = to_load.get("args", args)
@@ -250,6 +284,15 @@ def convert_checkpoint(dcp_dir, output_dir):
             "teacher": teacher_state,
         }
         
+        # Clear references before saving to free GPU memory
+        del to_load
+        del student
+        del teacher
+        student = None
+        teacher = None
+        to_load = None
+        cleanup_gpu_memory()
+        
         # Save
         print("  Saving...")
         torch.save(checkpoint, output_path)
@@ -263,8 +306,8 @@ def convert_checkpoint(dcp_dir, output_dir):
         sample_keys = list(checkpoint['student'].keys())[:5]
         print(f"    Sample keys: {sample_keys}")
         
-        # Cleanup GPU memory
-        del student, teacher, to_load, student_state, teacher_state, checkpoint
+        # Final cleanup
+        del student_state, teacher_state, checkpoint
         cleanup_gpu_memory()
         print("  ✓ GPU memory cleaned up")
         
