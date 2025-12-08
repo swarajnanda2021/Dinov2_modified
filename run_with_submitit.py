@@ -23,13 +23,13 @@ def parse_args():
     )
     
     # Submitit specific arguments
-    parser.add_argument("--ngpus", default=4, type=int, 
+    parser.add_argument("--ngpus", default=8, type=int, 
                         help="Number of GPUs per node")
     parser.add_argument("--nodes", default=1, type=int, 
                         help="Number of nodes")
     parser.add_argument("--timeout", default=10000, type=int, 
                         help="Job duration in minutes")
-    parser.add_argument("--partition", default="vanderbc_gpu", type=str, 
+    parser.add_argument("--partition", default="all", type=str, 
                         help="Partition name")
     
     return parser.parse_args()
@@ -37,7 +37,7 @@ def parse_args():
 
 def get_shared_folder() -> Path:
     """Get shared folder for logs and checkpoints."""
-    p = Path("/data1/vanderbc/nandas1/FoundationModel_ViT-B_p16_b1024_adios/logs")
+    p = Path("/data1/hpcadmin/komurcc1/software/Dinov2_modified/logs")
     p.mkdir(exist_ok=True)
     return p
 
@@ -105,7 +105,7 @@ def main():
         slurm_partition=args.partition,
         slurm_signal_delay_s=120,
         slurm_gres=f'gpu:{args.ngpus}',
-        slurm_constraint='h100',
+        slurm_constraint='h200',
         slurm_setup=[
             f'export OMP_NUM_THREADS=8',
             f'export NCCL_DEBUG=INFO',
@@ -187,9 +187,14 @@ def main():
     args.use_fp16 = True
     args.clip_grad = 1.0
     args.save_checkpoint_freq = 2_000
-    args.num_workers = 10
+    args.num_workers = 4
     args.visualization_freq = 10000
     args.grad_checkpointing = True
+
+    # Profiling
+    args.profile = True
+    args.profile_active = 100 #/data1/hpcadmin/komurcc1/software/Dinov2_modified/logs/trace.json
+    args.profile_skip = 20
     
     # Dataset
     args.dataset_sources = [

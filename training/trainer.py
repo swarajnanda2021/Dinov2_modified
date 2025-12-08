@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
+from torch.profiler import profile, ProfilerActivity, schedule
 
 import utils
 from models import CombinedModelDINO, LinearPrototypeBank, ModernViT, DINOHead
@@ -87,6 +88,20 @@ def train_dinov2(args):
     total_student_views = calculate_total_student_views(args)
     print(f"\nTotal student views: {total_student_views}")
     print("================================================\n")
+    
+    # ============ Profiling configuration ============
+    profiling_enabled = getattr(args, 'profile', False)
+    profile_skip = getattr(args, 'profile_skip', 10)
+    profile_active = getattr(args, 'profile_active', 5)
+    
+    if profiling_enabled:
+        print("\n========== Profiling Configuration ==========")
+        print(f"Profiling: ENABLED")
+        print(f"  Skip iterations (warmup): {profile_skip}")
+        print(f"  Active profiling iterations: {profile_active}")
+        print(f"  Trace output: {os.path.join(args.output_dir, 'trace.json')}")
+        print("  Training will EXIT after profiling completes.")
+        print("==============================================\n")
     
     # ============ Load pre-trained adversarial mask model (if enabled) ============
     mask_model_frozen = None
@@ -438,6 +453,31 @@ def train_dinov2(args):
     
     if utils.is_main_process():
         print(f"Starting training at iteration {current_iteration}")
+    
+    # ============ Setup profiler (if enabled) ============
+    profiler_schedule = None
+    prof = None
+    
+    if profiling_enabled:
+        # Schedule: skip warmup iterations, then profile active iterations
+        profiler_schedule = schedule(
+            skip_first=profile_skip,
+            wait=0,
+            warmup=1,
+            active=profile_active,
+            repeat=1
+        )
+        
+        prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=profiler_schedule,
+            on_trace_ready=None,  # We'll handle export manually
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+        prof.start()
+        print(f"Profiler started. Will profile iterations {profile_skip + 1} to {profile_skip + 1 + profile_active}")
     
     # ============ Training loop ============
     print("Starting training!")
@@ -986,6 +1026,51 @@ def train_dinov2(args):
             utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
         
         current_iteration += 1
+
+        # ========== Profiler step ==========
+        if profiling_enabled and prof is not None:
+            prof.step()
+            
+            # Check if profiling is complete
+            total_profile_iters = profile_skip + 1 + profile_active  # +1 for warmup
+            if current_iteration >= total_profile_iters:
+                prof.stop()
+                
+                # Export trace
+                if utils.is_main_process():
+                    trace_path = os.path.join(args.output_dir, 'trace.json')
+                    print(f"\n{'='*60}")
+                    print("PROFILING COMPLETE")
+                    print(f"{'='*60}")
+                    print(f"Exporting Chrome trace to: {trace_path}")
+                    prof.export_chrome_trace(trace_path)
+                    
+                    # Print summary table
+                    print(f"\n{'='*60}")
+                    print("TOP CUDA OPERATIONS BY TOTAL TIME")
+                    print(f"{'='*60}")
+                    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+                    
+                    print(f"\n{'='*60}")
+                    print("TOP OPERATIONS BY CPU TIME")
+                    print(f"{'='*60}")
+                    print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20))
+                    
+                    print(f"\n{'='*60}")
+                    print("TOP OPERATIONS BY MEMORY")
+                    print(f"{'='*60}")
+                    print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=20))
+                    
+                    print(f"\n{'='*60}")
+                    print(f"Trace saved to: {trace_path}")
+                    print("View in Chrome: chrome://tracing or https://ui.perfetto.dev")
+                    print(f"{'='*60}\n")
+                
+                # Synchronize and exit
+                if dist.is_initialized():
+                    dist.barrier()
+                print("Exiting after profiling.")
+                sys.exit(0)
 
         # Synchronize else might time out
         if current_iteration % 100 == 0:

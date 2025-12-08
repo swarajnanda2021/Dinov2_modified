@@ -135,6 +135,14 @@ def get_args_parser():
                         help='Random seed')
     parser.add_argument('--num_workers', default=10, type=int,
                         help='Number of data loading workers')
+
+    # ========== Profiling ==========
+    parser.add_argument('--profile', default=False, type=utils.bool_flag,
+                        help='Enable PyTorch profiler for performance analysis')
+    parser.add_argument('--profile_skip', default=10, type=int,
+                        help='Iterations to skip before profiling (warmup)')
+    parser.add_argument('--profile_active', default=5, type=int,
+                        help='Number of iterations to profile')
     
     # ========== Distributed training ==========
     parser.add_argument("--dist_url", default="env://", type=str,
