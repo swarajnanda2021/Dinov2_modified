@@ -88,7 +88,7 @@ class iBOTPatchLoss(nn.Module):
         loss_per_token = -torch.sum(teacher_normalized.detach() * student_log_probs, dim=-1)  # [M]
         
         # Weighted sum
-        weighted_loss = (loss_per_token * weights).sum()
+        weighted_loss = (loss_per_token * weights).mean()
         
         return weighted_loss
 
