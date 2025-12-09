@@ -1,5 +1,6 @@
 """
 iBOT patch-level loss for masked token prediction.
+Optimized: Vectorized masking eliminates per-sample loops.
 """
 
 import torch
@@ -31,13 +32,16 @@ class iBOTPatchLoss(nn.Module):
         teacher_temp=0.07
     ):
         """
-        Cross-entropy between teacher and student on masked patches.
+        Vectorized cross-entropy between teacher and student on masked patches.
+        
+        Key optimization: Single nonzero call instead of B calls.
+        This eliminates the GPU-CPU sync bottleneck from the original loop.
         
         Args:
             student_patch_tokens_masked: [B, N, D] student patch tokens
             teacher_patch_tokens_masked: [B, N, D] teacher patch tokens
             student_masks_flat: [B, N] boolean mask (True = masked)
-            n_masked_patches: Optional number of masked patches
+            n_masked_patches: Optional number of masked patches (unused, for compatibility)
             masks_weight: Optional per-token weights
             teacher_temp: Teacher temperature
             
@@ -45,47 +49,48 @@ class iBOTPatchLoss(nn.Module):
             Loss value
         """
         B, N, D = student_patch_tokens_masked.shape
+        device = student_patch_tokens_masked.device
+        dtype = student_patch_tokens_masked.dtype
         
-        all_student_tokens = []
-        all_teacher_tokens = []
-        all_weights = []
+        # Flatten everything for vectorized operations
+        student_flat = student_patch_tokens_masked.reshape(B * N, D)
+        teacher_flat = teacher_patch_tokens_masked.reshape(B * N, D)
+        mask_flat = student_masks_flat.reshape(-1)  # [B*N]
         
+        # SINGLE nonzero call (was B calls in the loop)
+        masked_indices = mask_flat.nonzero(as_tuple=True)[0]
+        
+        M = masked_indices.numel()
+        if M == 0:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+        
+        # Gather all masked tokens at once
+        student_masked = student_flat[masked_indices]  # [M, D]
+        teacher_masked = teacher_flat[masked_indices]  # [M, D]
+        
+        # Compute per-token weights
         if masks_weight is None:
-            masks_weight = (
-                (1 / student_masks_flat.sum(-1).clamp(min=1.0))
-                .unsqueeze(-1)
-                .expand_as(student_masks_flat)
-            )
+            # Per-sample normalization: weight = 1 / num_masked_in_sample
+            sample_idx = masked_indices // N  # Which sample each token belongs to [M]
+            num_masked_per_sample = mask_flat.reshape(B, N).sum(dim=1).clamp(min=1.0)  # [B]
+            weights = 1.0 / num_masked_per_sample[sample_idx]  # [M]
+        else:
+            weights_flat = masks_weight.reshape(-1)
+            weights = weights_flat[masked_indices]  # [M]
         
-        for b in range(B):
-            mask_indices = student_masks_flat[b]
-            num_masked = mask_indices.sum().item()
-            
-            if num_masked > 0:
-                student_tokens = student_patch_tokens_masked[b][mask_indices]
-                teacher_tokens = teacher_patch_tokens_masked[b][mask_indices]
-                weights = masks_weight[b][mask_indices]
-                
-                all_student_tokens.append(student_tokens)
-                all_teacher_tokens.append(teacher_tokens)
-                all_weights.append(weights)
+        # Sinkhorn-Knopp normalization on teacher
+        teacher_normalized = self.sinkhorn_knopp_normalization(teacher_masked, teacher_temp)
         
-        if len(all_student_tokens) == 0:
-            return torch.tensor(0.0, device=student_patch_tokens_masked.device)
+        # Student log probabilities
+        student_log_probs = F.log_softmax(student_masked / self.student_temp, dim=-1)
         
-        all_student_tokens = torch.cat(all_student_tokens, dim=0)
-        all_teacher_tokens = torch.cat(all_teacher_tokens, dim=0)
-        all_weights = torch.cat(all_weights, dim=0)
+        # Cross-entropy loss per token
+        loss_per_token = -torch.sum(teacher_normalized.detach() * student_log_probs, dim=-1)  # [M]
         
-        teacher_normalized = self.sinkhorn_knopp_normalization(all_teacher_tokens, teacher_temp)
+        # Weighted sum
+        weighted_loss = (loss_per_token * weights).mean()
         
-        student_log_probs = F.log_softmax(all_student_tokens / self.student_temp, dim=-1)
-        
-        loss_per_token = -torch.sum(teacher_normalized * student_log_probs, dim=-1)
-        
-        weighted_loss = loss_per_token * all_weights
-
-        return weighted_loss.mean()
+        return weighted_loss
 
     @torch.no_grad()
     def sinkhorn_knopp_normalization(self, teacher_output, teacher_temp, n_iterations=None):
