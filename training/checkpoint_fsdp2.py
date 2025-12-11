@@ -98,6 +98,14 @@ def save_checkpoint_fsdp2(
     print(f"[Rank {rank}] Checkpoint save completed successfully")
 
 
+def _extract_iteration_number(path: Path, prefix: str) -> int:
+    """Extract iteration number from checkpoint path for proper numerical sorting."""
+    try:
+        return int(path.name.replace(prefix, ""))
+    except ValueError:
+        return -1
+
+
 def load_checkpoint_fsdp2(
     ckpt_dir,
     student,
@@ -118,10 +126,16 @@ def load_checkpoint_fsdp2(
     """
     ckpt_dir = Path(ckpt_dir)
     
-    # Look for DCP checkpoints
-    dcp_checkpoints = sorted(ckpt_dir.glob("dcp_iter_*"))
+    # Look for DCP checkpoints - sort NUMERICALLY, not lexicographically
+    dcp_checkpoints = sorted(
+        ckpt_dir.glob("dcp_iter_*"),
+        key=lambda p: _extract_iteration_number(p, "dcp_iter_")
+    )
     if not dcp_checkpoints:
-        dcp_checkpoints = sorted(ckpt_dir.glob("iter_*"))
+        dcp_checkpoints = sorted(
+            ckpt_dir.glob("iter_*"),
+            key=lambda p: _extract_iteration_number(p, "iter_")
+        )
     
     if not dcp_checkpoints:
         print(f"No checkpoint found in {ckpt_dir}")
