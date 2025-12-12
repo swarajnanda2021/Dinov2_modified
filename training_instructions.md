@@ -14,6 +14,9 @@ This guide covers monitoring, managing, and post-processing self-supervised lear
 6. [Checkpoint Handling](#6-checkpoint-handling)
 7. [Crash Recovery](#7-crash-recovery)
 8. [Expected Training Times](#8-expected-training-times)
+9. [Post-Processing and Benchmarking](#9-post-processing-and-benchmarking)
+10. [Preparing Results for Papers](#10-preparing-results-for-papers)
+11. [Mutation Prediction (MIL)](#11-mutation-prediction-mil)
 
 ---
 
@@ -250,4 +253,129 @@ cd <folder> && python run_with_submitit.py
 
 ---
 
-*For post-processing and benchmarking procedures, see the next section of this guide.*
+*For post-processing and benchmarking procedures, see below.*
+
+---
+
+## 9. Post-Processing and Benchmarking
+
+### Overview
+
+Once training is complete (or at intermediate checkpoints), run benchmarking to evaluate model performance on downstream tasks. All post-processing happens in:
+
+```
+/data1/vanderbc/nandas1/PostProc_FoundationModels/
+```
+
+### Running Benchmarks
+
+Each model has a corresponding shell script. Submit with `sbatch`:
+
+```bash
+cd /data1/vanderbc/nandas1/PostProc_FoundationModels/
+sbatch run_FoundationModel_ViT-L_p16_b2048.sh
+```
+
+Benchmarks typically complete in **< 2 days** (often much faster) using a single GPU.
+
+### Benchmark Scripts by Paper
+
+| Script | Paper Target |
+|--------|--------------|
+| `run_FoundationModel_ViT-L_p16_b2048.sh` | **ICML + NeurIPS** |
+| `run_FoundationModel_ViT-L_p16_b2048_adios.sh` | **ICML only** |
+| `run_FoundationModel_ViT-L_p16_b2048_PatchReg.sh` | NeurIPS only |
+| `run_FoundationModel_ViT-H_p16_b2048.sh` | NeurIPS only |
+| `run_FoundationModel_ViT-H_p16_b2048_PatchReg.sh` | NeurIPS only |
+| `run_FoundationModel_ViT-B_p16_b1024_PatchReg.sh` | NeurIPS only |
+
+### Results Location
+
+Benchmark results are saved to:
+
+```
+/data1/vanderbc/nandas1/PostProc_FoundationModels/benchmark_results/<model_name>/
+```
+
+Example:
+```bash
+ls /data1/vanderbc/nandas1/PostProc_FoundationModels/benchmark_results/
+# FoundationModel_ViT-L_p16_b2048/
+# FoundationModel_ViT-L_p16_b2048_adios/
+# ...
+```
+
+---
+
+## 10. Preparing Results for Papers
+
+### ICML Paper
+
+#### Step 1: Generate `.dat` Files
+
+```bash
+cd /data1/vanderbc/nandas1/PostProc_FoundationModels/
+python convert_to_dat.py
+```
+
+This creates consolidated results in:
+```
+/data1/vanderbc/nandas1/PostProc_FoundationModels/dat_files/
+```
+
+#### Step 2: Update Overleaf
+
+Copy the entire `dat_files/` folder to the Overleaf document, replacing the existing folder.
+
+### NeurIPS Paper
+
+For NeurIPS, the set of models to include will differ. Modify `convert_to_dat.py` or create a new consolidation script to include/exclude the appropriate benchmark result folders.
+
+---
+
+## 11. Mutation Prediction (MIL)
+
+For mutation prediction experiments using Multiple Instance Learning (MIL), add these checkpoints to the MIL processing pipeline:
+
+### ICML Checkpoints
+
+| Model | Checkpoint Path |
+|-------|-----------------|
+| ViT-L (baseline) | `/data1/vanderbc/nandas1/FoundationModel_ViT-L_p16_b2048/logs/checkpoint_iter_00298000.pth` |
+| ViT-L + ADIOS | `/data1/vanderbc/nandas1/FoundationModel_ViT-L_p16_b2048_adios/logs/checkpoint_iter_00298000.pth` |
+
+Add these paths to your checkpoint list in the MIL code configuration.
+
+---
+
+## Quick Reference (Updated)
+
+```bash
+# Environment
+conda activate ssl-v1
+
+# Monitor jobs
+rsqueue
+
+# Check progress
+tail -f <folder>/logs/*0_log.out
+
+# Visualize losses
+cd <folder>/visualizations && python plot_and_save_loss.py
+
+# Convert FSDP checkpoints (in interactive session)
+get_interactive
+conda activate ssl-v1
+cd <folder>/training && python convert_dcp_to_pth.py
+
+# Resume crashed job
+cd <folder> && python run_with_submitit.py
+
+# Run benchmarks
+cd /data1/vanderbc/nandas1/PostProc_FoundationModels/
+sbatch run_FoundationModel_ViT-L_p16_b2048.sh
+
+# Generate paper results (ICML)
+python convert_to_dat.py
+# Then copy dat_files/ to Overleaf
+```
