@@ -701,7 +701,6 @@ def train_dinov2(args):
                         student_patch_features,
                         visible_mask,
                         prototype_bank,
-                        current_iteration,
                         current_teacher_temp
                     )
                 
@@ -719,7 +718,6 @@ def train_dinov2(args):
                         student_patch_features,
                         random_token_masks,  # True = masked positions
                         prototype_bank,
-                        current_iteration,
                         current_teacher_temp
                     )
                 
@@ -739,7 +737,6 @@ def train_dinov2(args):
                         student_cluster['features']['patchtokens'],
                         all_mask,  # All positions
                         prototype_bank,
-                        current_iteration,
                         current_teacher_temp
                     )
                     
