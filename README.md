@@ -9,25 +9,138 @@ This document outlines the differences between this implementation and the [offi
 | Aspect | Official | This Implementation |
 |--------|----------|---------------------|
 | **Mask type** | Block masking via `MaskingGenerator` | Independent Bernoulli per token |
-| **Mask ratio** | Variable per sample (`mask_ratio_min_max` tuple, e.g., 0.1–0.5) | Fixed ratio |
+| **Mask ratio** | Variable per sample (e.g., 0.1–0.5) | Fixed ratio |
 | **Mask probability** | `mask_sample_probability` — not all images masked | All images always masked |
 
-**Official approach**:
+### Official Implementation (`dinov2/data/masking.py`)
+
 ```python
+class MaskingGenerator:
+    def __init__(
+        self,
+        input_size,  # (H_patches, W_patches), e.g. (14, 14) for 224px with patch_size=16
+        num_masking_patches=None,
+        min_num_patches=4,
+        max_num_patches=None,
+        min_aspect=0.3,
+        max_aspect=None,  # defaults to 1/min_aspect
+    ):
+        self.height, self.width = input_size
+        self.num_patches = self.height * self.width
+        self.min_num_patches = min_num_patches
+        self.max_num_patches = max_num_patches or num_masking_patches
+        self.log_aspect_ratio = (math.log(min_aspect), math.log(1 / min_aspect))
+
+    def _mask(self, mask, max_mask_patches):
+        delta = 0
+        for _ in range(10):  # 10 attempts to place a block
+            # Sample block area
+            target_area = random.uniform(self.min_num_patches, max_mask_patches)
+            # Sample aspect ratio (log-uniform)
+            aspect_ratio = math.exp(random.uniform(*self.log_aspect_ratio))
+            # Compute block dimensions
+            h = int(round(math.sqrt(target_area * aspect_ratio)))
+            w = int(round(math.sqrt(target_area / aspect_ratio)))
+            # Clamp to grid
+            if h < self.height and w < self.width:
+                top = random.randint(0, self.height - h)
+                left = random.randint(0, self.width - w)
+                # Count newly masked patches
+                num_masked = mask[top:top+h, left:left+w].sum()
+                if 0 < h * w - num_masked <= max_mask_patches:
+                    # Place the block
+                    mask[top:top+h, left:left+w] = 1
+                    delta += h * w - num_masked
+                    if delta >= max_mask_patches:
+                        break
+        return delta
+
+    def __call__(self, num_masking_patches=None):
+        mask = np.zeros((self.height, self.width), dtype=bool)
+        mask_count = 0
+        while mask_count < num_masking_patches:
+            max_mask_patches = num_masking_patches - mask_count
+            delta = self._mask(mask, max_mask_patches)
+            if delta == 0:
+                break
+            mask_count += delta
+        return mask.flatten()  # Shape: (num_patches,)
+```
+
+### Official Collate Function (`dinov2/data/collate.py`)
+
+```python
+def collate_data_and_cast(...):
+    B = len(samples_list)
+    n_samples_masked = int(B * mask_sample_probability)  # e.g., 0.5 → half get masks
+    
+    # Variable mask ratio per sample
+    probs = torch.linspace(*mask_ratio_tuple, n_samples_masked + 1)
+    # e.g., mask_ratio_tuple = (0.1, 0.5) → probs = [0.1, 0.2, 0.3, 0.4, 0.5]
+    
+    masks_list = []
+    for i in range(n_samples_masked):
+        prob_min, prob_max = probs[i], probs[i + 1]
+        num_patches_to_mask = int(N * random.uniform(prob_min, prob_max))
+        masks_list.append(mask_generator(num_patches_to_mask))
+    
+    for i in range(n_samples_masked, B):
+        masks_list.append(np.zeros(N, dtype=bool))  # No mask
+    
+    random.shuffle(masks_list)
+    collated_masks = torch.stack([torch.from_numpy(m) for m in masks_list])
+    return collated_masks  # Shape: (B, num_patches)
+```
+
+### This Implementation (`training/helpers.py`)
+
+```python
+def generate_random_token_masks(batch_size, n_patches_h, n_patches_w, mask_ratio, device):
+    n_patches = n_patches_h * n_patches_w
+    token_masks = torch.bernoulli(
+        torch.ones(batch_size, n_patches) * mask_ratio
+    ).bool().to(device)
+    return token_masks
+```
+
+### What to Change
+
+Replace Bernoulli sampling with block masking:
+
+```python
+# New file: data/masking.py (copy MaskingGenerator from official)
+
+# In collate or training loop:
 mask_generator = MaskingGenerator(
-    input_size=(img_size // patch_size, img_size // patch_size),
-    max_num_patches=0.5 * n_patches,
+    input_size=(n_patches_h, n_patches_w),
+    min_num_patches=4,
+    max_num_patches=int(0.5 * n_patches_h * n_patches_w),
+    min_aspect=0.3,
 )
+
+def generate_block_masks(batch_size, n_patches_h, n_patches_w, 
+                         mask_ratio_min=0.1, mask_ratio_max=0.5,
+                         mask_sample_probability=0.5, device='cuda'):
+    n_patches = n_patches_h * n_patches_w
+    n_masked_samples = int(batch_size * mask_sample_probability)
+    
+    masks = []
+    for i in range(n_masked_samples):
+        # Variable ratio per sample
+        ratio = random.uniform(mask_ratio_min, mask_ratio_max)
+        num_to_mask = int(n_patches * ratio)
+        masks.append(mask_generator(num_to_mask))
+    
+    for i in range(n_masked_samples, batch_size):
+        masks.append(np.zeros(n_patches, dtype=bool))
+    
+    random.shuffle(masks)
+    return torch.tensor(np.stack(masks), dtype=torch.bool, device=device)
 ```
 
-**This implementation**:
-```python
-token_masks = torch.bernoulli(
-    torch.ones(batch_size, n_patches) * mask_ratio
-).bool()
-```
+### Impact
 
-**Impact**: Block masking creates spatially coherent masked regions, forcing the model to learn larger spatial context. Bernoulli masking creates independent salt-and-pepper noise patterns.
+Block masking creates spatially coherent rectangular regions (varying aspect ratios from 0.3 to 3.3). This forces the model to reconstruct contiguous spatial areas rather than isolated scattered patches, encouraging learning of larger-scale spatial structure.
 
 ---
 
