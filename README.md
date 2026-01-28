@@ -289,22 +289,6 @@ def cancel_gradients_last_layer(iteration, module, freeze_iters):
 
 Both achieve the same effect.
 
----
-
-## Summary Table
-
-| Feature | Official | This Impl | Priority to Fix |
-|---------|:--------:|:---------:|:---------------:|
-| Block masking for iBOT | ✅ | ❌ | Medium |
-| Variable mask ratio | ✅ | ❌ | Low |
-| Mask sample probability | ✅ | ❌ | Low |
-| Layer-wise LR decay | ✅ | ❌ | **High** |
-| Patch embed LR multiplier | ✅ | ❌ | Medium |
-| WD schedule all groups | ✅ | ❌ | **High** |
-| DINO CLS: Sinkhorn-Knopp | ✅ | ✅ | — |
-| iBOT centering | ✅ | ❌ | Low |
-
----
 
 ## References
 
