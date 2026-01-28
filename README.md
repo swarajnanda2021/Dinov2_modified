@@ -1,4 +1,4 @@
-# DINOv2 Implementation Differences (TO-DO List)
+# DINOv2 Implementation Differences
 
 This document outlines the differences between this implementation and the [official Meta DINOv2](https://github.com/facebookresearch/dinov2) codebase.
 
@@ -71,7 +71,31 @@ Typically `patch_embed_lr_mult < 1.0` to stabilize the input projection layer.
 
 ## 4. Weight Decay Schedule Application
 
-**Official** applies the WD schedule to all regularized parameter groups:
+### Param Group Structure
+
+**Official** creates per-parameter groups with explicit `wd_multiplier`:
+```python
+for name, param in model.named_parameters():
+    d = {"params": param, "wd_multiplier": 1.0, "name": name}
+    if name.endswith(".bias") or "norm" in name or "gamma" in name:
+        d.update({"wd_multiplier": 0.0})
+```
+
+**This implementation** groups by regularization status:
+```python
+# utils.get_params_groups returns 2 groups per module:
+# [{"params": regularized}, {"params": not_regularized, "weight_decay": 0.0}]
+
+optimizer = AdamW([
+    *get_params_groups(student.backbone),   # groups 0, 1
+    *get_params_groups(student.classhead),  # groups 2, 3
+    *get_params_groups(student.patchhead),  # groups 4, 5
+])
+```
+
+### The Bug
+
+**Official** applies WD schedule to ALL groups:
 ```python
 def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
     for param_group in optimizer.param_groups:
@@ -83,11 +107,23 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
 ```python
 for i, param_group in enumerate(optimizer_student.param_groups):
     param_group["lr"] = student_lr_schedule[current_iteration]
-    if i == 0:  # Only first group
+    if i == 0:  # BUG: Only backbone regularized group!
         param_group["weight_decay"] = wd_schedule[current_iteration]
 ```
 
-**Fix**:
+**Result** (with WD schedule 0.04 → 0.4):
+| Group | Module | WD Applied |
+|-------|--------|------------|
+| 0 | backbone (regularized) | schedule ✅ |
+| 1 | backbone (not regularized) | 0.0 ✅ |
+| 2 | classhead (regularized) | ~0.01 (AdamW default) ❌ |
+| 3 | classhead (not regularized) | 0.0 ✅ |
+| 4 | patchhead (regularized) | ~0.01 (AdamW default) ❌ |
+| 5 | patchhead (not regularized) | 0.0 ✅ |
+
+**Impact**: DINO/iBOT projection heads receive ~25× less regularization than intended at peak schedule.
+
+### Fix
 ```python
 for i, param_group in enumerate(optimizer_student.param_groups):
     param_group["lr"] = student_lr_schedule[current_iteration]
@@ -97,9 +133,15 @@ for i, param_group in enumerate(optimizer_student.param_groups):
 
 ---
 
-## 5. iBOT Loss Centering
+## 5. Teacher Normalization
 
-**Official** uses centering (subtracting a running mean from teacher outputs):
+### DINO CLS Loss
+Both implementations use **Sinkhorn-Knopp** normalization for teacher CLS tokens. ✅
+
+(The official code supports "centering" mode for backward compatibility with DINO v1, but DINOv2 defaults to `centering="sinkhorn_knopp"`.)
+
+### iBOT Patch Loss
+**Official** uses centering (subtracting a running mean from teacher patch outputs):
 ```python
 def __init__(self, patch_out_dim, student_temp=0.1, center_momentum=0.9):
     self.register_buffer("center", torch.zeros(1, 1, patch_out_dim))
@@ -109,7 +151,7 @@ def softmax_center_teacher(self, teacher_patch_tokens, teacher_temp):
     return F.softmax((teacher_patch_tokens - self.center) / teacher_temp, dim=-1)
 ```
 
-**This implementation**: Pure Sinkhorn-Knopp normalization without centering.
+**This implementation**: Sinkhorn-Knopp normalization for iBOT as well (no running mean centering).
 
 ---
 
@@ -146,6 +188,7 @@ Both achieve the same effect.
 | Layer-wise LR decay | ✅ | ❌ | **High** |
 | Patch embed LR multiplier | ✅ | ❌ | Medium |
 | WD schedule all groups | ✅ | ❌ | **High** |
+| DINO CLS: Sinkhorn-Knopp | ✅ | ✅ | — |
 | iBOT centering | ✅ | ❌ | Low |
 
 ---
