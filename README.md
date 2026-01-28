@@ -290,6 +290,48 @@ def cancel_gradients_last_layer(iteration, module, freeze_iters):
 Both achieve the same effect.
 
 
+## 7. Patch Prototype Loss: Per-Sample Normalization
+
+**Required when using variable mask ratios (0.1–0.5) with block masking.**
+
+### Problem
+
+With `clustering_mode='masked'` and variable mask ratios:
+- Sample A (50% masked): contributes ~98 tokens to loss
+- Sample B (10% masked): contributes ~20 tokens to loss
+
+Current implementation uses per-token normalization (`/ M_total`), causing samples with higher mask ratios to dominate the gradient. This creates inconsistent training signal and loss magnitude fluctuation across batches.
+
+### Current Implementation (`losses/prototype_loss.py`)
+
+```python
+M_total = student_norm_masked.shape[0]
+clustering_loss = -torch.sum(Q_tilde_masked * student_log_probs_masked) / M_total
+```
+
+### Required Change
+
+Add inverse weighting so each sample contributes equally, matching iBOT loss behavior:
+
+```python
+# Compute per-token weights based on how many tokens each sample contributes
+sample_idx = token_masks.nonzero(as_tuple=True)[0]  # Which sample each masked token belongs to
+num_masked_per_sample = token_masks.sum(dim=1).clamp(min=1.0)  # [B]
+weights = 1.0 / num_masked_per_sample[sample_idx]  # [M]
+
+# Per-token cross-entropy
+per_token_loss = -torch.sum(Q_tilde_masked * student_log_probs_masked, dim=-1)  # [M]
+
+# Weighted sum, normalized by batch size
+B = token_masks.shape[0]
+clustering_loss = (per_token_loss * weights).sum() / B
+```
+
+### Impact
+
+Ensures each sample in the batch contributes equally to the prototype clustering gradient regardless of its individual mask ratio, consistent with how iBOT patch loss handles variable masking.
+
+
 ## References
 
 - [Official DINOv2 Repository](https://github.com/facebookresearch/dinov2)
