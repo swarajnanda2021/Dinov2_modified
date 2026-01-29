@@ -246,51 +246,7 @@ for i, param_group in enumerate(optimizer_student.param_groups):
 
 ---
 
-## 5. Teacher Normalization
-
-### DINO CLS Loss
-Both implementations use **Sinkhorn-Knopp** normalization for teacher CLS tokens. ✅
-
-(The official code supports "centering" mode for backward compatibility with DINO v1, but DINOv2 defaults to `centering="sinkhorn_knopp"`.)
-
-### iBOT Patch Loss
-**Official** uses centering (subtracting a running mean from teacher patch outputs):
-```python
-def __init__(self, patch_out_dim, student_temp=0.1, center_momentum=0.9):
-    self.register_buffer("center", torch.zeros(1, 1, patch_out_dim))
-
-def softmax_center_teacher(self, teacher_patch_tokens, teacher_temp):
-    self.apply_center_update()
-    return F.softmax((teacher_patch_tokens - self.center) / teacher_temp, dim=-1)
-```
-
-**This implementation**: Sinkhorn-Knopp normalization for iBOT as well (no running mean centering).
-
----
-
-## 6. Last Layer Freezing
-
-**Official** sets last layer LR to exactly 0 during warmup:
-```python
-last_layer_lr_schedule.schedule[:freeze_epochs * epoch_length] = 0
-
-# Applied via:
-param_group["lr"] = (last_layer_lr if is_last_layer else lr) * lr_multiplier
-```
-
-**This implementation** zeros gradients instead:
-```python
-def cancel_gradients_last_layer(iteration, module, freeze_iters):
-    if iteration < freeze_iters:
-        for n, p in module.named_parameters():
-            if "last_layer" in n:
-                p.grad = None
-```
-
-Both achieve the same effect.
-
-
-## 7. Patch Prototype Loss: Per-Sample Normalization
+## 5. Patch Prototype Loss: Per-Sample Normalization
 
 **Required when using variable mask ratios (0.1–0.5) with block masking.**
 
