@@ -301,11 +301,29 @@ def train_dinov2(args):
     fp16_scaler = torch.cuda.amp.GradScaler() if args.use_fp16 else None
 
     # ============ Create optimizers ============
-    optimizer_student = torch.optim.AdamW([
-        *utils.get_params_groups(student.module.backbone),
-        *utils.get_params_groups(student.module.classhead),
-        *utils.get_params_groups(student.module.patchhead),
-    ])
+    # Get parameter groups with layer-wise LR decay for backbone
+    backbone_params = utils.get_params_groups_with_layer_decay(
+        student.module.backbone,
+        lr_decay_rate=args.lr_decay_rate,
+        num_layers=args.vitdepth,
+    )
+    
+    # Heads get full LR (no layer decay)
+    classhead_params = utils.get_params_groups_with_decay_for_heads(student.module.classhead)
+    patchhead_params = utils.get_params_groups_with_decay_for_heads(student.module.patchhead)
+    
+    all_param_groups = backbone_params + classhead_params + patchhead_params
+    
+    optimizer_student = torch.optim.AdamW(all_param_groups)
+    
+    # Log layer-wise LR info
+    if utils.is_main_process():
+        print(f"\n=== Layer-wise LR Decay (rate={args.lr_decay_rate}) ===")
+        for i, pg in enumerate(backbone_params):
+            print(f"  Group {i}: lr_mult={pg['lr_multiplier']:.4f}, wd_mult={pg['wd_multiplier']}, params={len(pg['params'])}")
+        print(f"  Head groups: {len(classhead_params) + len(patchhead_params)} groups with lr_mult=1.0")
+        print(f"  Total param groups: {len(all_param_groups)}")
+        print("=" * 50 + "\n")
     
     optimizer_prototypes = None
     if args.use_prototype_clustering:
@@ -635,9 +653,15 @@ def train_dinov2(args):
         
         # ========== Update learning rates ==========
         for i, param_group in enumerate(optimizer_student.param_groups):
-            param_group["lr"] = student_lr_schedule[current_iteration]
-            if i % 2 == 0:  # Even indices are regularized groups (0, 2, 4 for backbone, classhead, patchhead)
-                param_group["weight_decay"] = wd_schedule[current_iteration]
+            # Apply layer-wise LR multiplier
+            base_lr = student_lr_schedule[current_iteration]
+            lr_mult = param_group.get("lr_multiplier", 1.0)
+            param_group["lr"] = base_lr * lr_mult
+            
+            # Apply WD schedule to regularized groups
+            wd_mult = param_group.get("wd_multiplier", 1.0)
+            if wd_mult > 0:
+                param_group["weight_decay"] = wd_schedule[current_iteration] * wd_mult
 
         if args.use_prototype_clustering and optimizer_prototypes is not None:
             for param_group in optimizer_prototypes.param_groups:

@@ -123,6 +123,8 @@ def get_args_parser():
                         help='Initial weight decay')
     parser.add_argument('--weight_decay_end', type=float, default=0.4,
                         help='Final weight decay')
+    parser.add_argument('--lr_decay_rate', default=0.9, type=float,
+                        help='Layer-wise LR decay rate (1.0 = no decay, 0.9 = typical)')
     parser.add_argument('--grad_checkpointing', default=False, type=utils.bool_flag,
                     help='Enable gradient checkpointing to reduce memory at cost of ~40% speed')
     

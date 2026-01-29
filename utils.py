@@ -999,6 +999,108 @@ def get_params_groups(model):
             regularized.append(param)
     return [{'params': regularized}, {'params': not_regularized, 'weight_decay': 0.}]
 
+def get_params_groups_with_layer_decay(model, lr_decay_rate=0.9, num_layers=None):
+    """
+    Create parameter groups with layer-wise LR decay for Vision Transformers.
+    
+    Early layers get lower LR, later layers get higher LR.
+    LR multiplier = lr_decay_rate ** (num_layers + 1 - layer_id)
+    
+    Args:
+        model: Vision Transformer model
+        lr_decay_rate: Decay rate per layer (0.9 typical, 1.0 = no decay)
+        num_layers: Number of transformer blocks (auto-detected if None)
+        
+    Returns:
+        List of param group dicts with 'lr_multiplier' and 'wd_multiplier' keys
+    """
+    # Auto-detect number of layers
+    if num_layers is None:
+        num_layers = 0
+        for name, _ in model.named_parameters():
+            if "blocks." in name:
+                block_id = int(name.split("blocks.")[1].split(".")[0])
+                num_layers = max(num_layers, block_id + 1)
+    
+    param_groups = []
+    param_group_names = {}  # For debugging
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        
+        # Determine layer ID
+        if "patch_embed" in name or "cls_token" in name or "pos_embed" in name or "mask_token" in name or "register_tokens" in name:
+            layer_id = 0
+        elif "blocks." in name:
+            layer_id = int(name.split("blocks.")[1].split(".")[0]) + 1
+        else:
+            # norm, other components → top layer
+            layer_id = num_layers + 1
+        
+        # Compute LR multiplier
+        lr_mult = lr_decay_rate ** (num_layers + 1 - layer_id)
+        
+        # WD multiplier (0 for bias/norm, 1 for weights)
+        if name.endswith(".bias") or len(param.shape) == 1:
+            wd_mult = 0.0
+        else:
+            wd_mult = 1.0
+        
+        # Create group key
+        group_key = f"layer_{layer_id}_wd_{wd_mult}"
+        
+        if group_key not in param_group_names:
+            param_group_names[group_key] = {
+                "params": [],
+                "lr_multiplier": lr_mult,
+                "wd_multiplier": wd_mult,
+                "layer_id": layer_id,
+                "param_names": [],
+            }
+        
+        param_group_names[group_key]["params"].append(param)
+        param_group_names[group_key]["param_names"].append(name)
+    
+    # Convert to list, sorted by layer_id for readability
+    for key in sorted(param_group_names.keys()):
+        group = param_group_names[key]
+        param_groups.append({
+            "params": group["params"],
+            "lr_multiplier": group["lr_multiplier"],
+            "wd_multiplier": group["wd_multiplier"],
+            "weight_decay": 0.0 if group["wd_multiplier"] == 0.0 else None,  # Will be set by scheduler
+        })
+    
+    return param_groups
+
+
+def get_params_groups_with_decay_for_heads(model):
+    """
+    Create parameter groups for projection heads (no layer decay, full LR).
+    
+    Args:
+        model: DINOHead or similar projection head
+        
+    Returns:
+        List of param group dicts with lr_multiplier=1.0
+    """
+    regularized = []
+    not_regularized = []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.endswith(".bias") or len(param.shape) == 1:
+            not_regularized.append(param)
+        else:
+            regularized.append(param)
+    
+    return [
+        {"params": regularized, "lr_multiplier": 1.0, "wd_multiplier": 1.0},
+        {"params": not_regularized, "lr_multiplier": 1.0, "wd_multiplier": 0.0, "weight_decay": 0.0},
+    ]
+
 
 def has_batchnorms(model):
     bn_types = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm)

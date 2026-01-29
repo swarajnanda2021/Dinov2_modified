@@ -182,6 +182,7 @@ def main():
     args.min_lr = 1e-6
     args.weight_decay = 0.04
     args.weight_decay_end = 0.4
+    args.lr_decay_rate = 0.9
 
     # Training setup
     args.use_fp16 = True
