@@ -288,6 +288,101 @@ clustering_loss = (per_token_loss * weights).sum() / B
 Ensures each sample in the batch contributes equally to the prototype clustering gradient regardless of its individual mask ratio, consistent with how iBOT patch loss handles variable masking.
 
 
+## 6. iBOT Crop Selection Strategy
+
+| Aspect | Official | This Implementation |
+|--------|----------|---------------------|
+| **Selection method** | Random at crop level (~50% of all crops) | Random per-image (exactly 1 crop per image) |
+| **Semantic meaning** | ~50% of crops masked, ~25% images get both/neither masked | One randomly selected crop per image masked |
+| **Index tracking** | Implicit via shuffle | Explicit `ibot_crop_indices` |
+| **Forward passes** | All crops through teacher/student | Same (no extra passes) |
+| **Patch proto reuse** | N/A | Same indices used for consistency |
+
+### Official Implementation
+
+The official DINOv2 randomly masks crops at the batch level:
+```python
+# dinov2/data/collate.py
+B = len(collated_global_crops)  # e.g., 128 crops (64 images × 2)
+n_samples_masked = int(B * mask_sample_probability)  # e.g., 64 crops
+# ... generate masks for 64 randomly selected crops
+# ... give empty masks to remaining 64 crops
+random.shuffle(masks_list)
+```
+
+This results in a binomial distribution:
+- ~25% of images: both crops masked
+- ~50% of images: one crop masked
+- ~25% of images: neither crop masked
+
+### This Implementation
+
+Select exactly one global crop per image for iBOT and patch prototype loss:
+```python
+def collate_data_and_cast(...):
+    B = batch_size  # Number of images (not crops)
+    
+    # Randomly choose which global crop (0 or 1) to use per image
+    ibot_crop_indices = torch.randint(0, 2, (B,))  # [1, 0, 1, 1, 0, ...]
+    
+    # Convert to indices in flattened crop batch
+    # If we have 2 global crops per image: [crop0_img0, crop1_img0, crop0_img1, crop1_img1, ...]
+    crop_indices_in_batch = torch.arange(B) * 2 + ibot_crop_indices
+    
+    # Generate masks ONLY for the selected crops
+    masks = torch.zeros(2 * B, num_patches, dtype=torch.bool)
+    for i, crop_idx in enumerate(crop_indices_in_batch):
+        num_to_mask = random.randint(
+            int(num_patches * mask_ratio_min),
+            int(num_patches * mask_ratio_max)
+        )
+        masks[crop_idx] = mask_generator(num_to_mask)
+    
+    return {
+        'global_crops': collated_global_crops,
+        'masks': masks,
+        'ibot_crop_indices': crop_indices_in_batch,
+    }
+```
+
+### Usage in Training
+```python
+# Teacher forward (both crops for DINO)
+teacher_out = teacher(global_crops)
+
+# Student forward (masked selected crops)
+student_out = student(global_crops, masks=masks)
+
+# iBOT loss: use only selected crops
+teacher_ibot_patches = teacher_out['x_norm_patchtokens'].view(B, 2, N, D)
+teacher_ibot_patches = teacher_ibot_patches[torch.arange(B), ibot_crop_indices // 2]
+
+student_ibot_patches = student_out['x_norm_patchtokens'].view(B, 2, N, D)
+student_ibot_patches = student_ibot_patches[torch.arange(B), ibot_crop_indices // 2]
+
+ibot_loss = compute_ibot(student_ibot_patches, teacher_ibot_patches, masks[ibot_crop_indices])
+
+# Patch prototype loss: reuse same selection
+patch_proto_loss = compute_patch_proto(
+    student_ibot_patches,
+    masks[ibot_crop_indices]
+)
+```
+
+### Benefits
+
+1. **Clearer semantics**: "One random crop per image" vs "~50% of crops randomly"
+2. **Guaranteed coverage**: Every image participates in iBOT (not ~75%)
+3. **Explicit tracking**: `ibot_crop_indices` makes selection transparent
+4. **Code simplicity**: No shuffling, direct indexing
+5. **Consistency**: Same crop used for both iBOT and patch prototype loss
+6. **Same regularization**: Random crop choice per image provides equivalent dropout effect
+
+### Impact
+
+This approach provides equivalent regularization to the official implementation (50% dropout at crop level) while being more interpretable and easier to implement. The explicit indexing also enables reusing the same crop selection for multiple auxiliary losses without additional forward passes.
+
+
 ## References
 
 - [Official DINOv2 Repository](https://github.com/facebookresearch/dinov2)
