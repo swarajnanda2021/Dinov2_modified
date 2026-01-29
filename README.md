@@ -2,6 +2,7 @@
 
 This document outlines the differences between this implementation and the [official Meta DINOv2](https://github.com/facebookresearch/dinov2) codebase, and specifies the required changes to align with the official approach.
 
+
 ---
 
 ## Table of Contents
