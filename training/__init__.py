@@ -8,6 +8,8 @@ from .helpers import (
     apply_masks_to_images,
     extract_local_crops_from_masked,
     generate_random_token_masks,
+    generate_block_masks,
+    BlockMaskGenerator,
     calculate_total_student_views,
     save_iteration_masks_efficient,
     worker_init_fn,

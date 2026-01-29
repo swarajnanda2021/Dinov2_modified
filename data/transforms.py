@@ -76,29 +76,6 @@ class TMEDinoTransforms(object):
             transforms.Normalize(mean=mean, std=std),
         ])
 
-        # Global view 3 (for mask model input)
-        self.global_3 = transforms.Compose([
-            transforms.Resize((global_size, global_size), interpolation=Image.BICUBIC),
-            transforms.RandomResizedCrop(
-                size=global_size, 
-                scale=global_crop_scale, 
-                interpolation=Image.BICUBIC
-            ),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.3),
-            transforms.RandomApply([
-                transforms.ColorJitter(
-                    brightness=0.3,
-                    contrast=0.3,
-                    saturation=0.15,
-                    hue=0.05
-                )
-            ], p=0.8),
-            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.2)),
-            self.to_tensor,
-            transforms.Normalize(mean=mean, std=std),
-        ])
-
         # Local crops
         self.local = transforms.Compose([
             transforms.Resize((global_size, global_size), interpolation=Image.BICUBIC),
@@ -114,7 +91,7 @@ class TMEDinoTransforms(object):
         Apply all augmentation transforms.
         
         Returns:
-            List of augmented crops: [global1, global2, local1, ..., localN, original_aug]
+            List of augmented crops: [global1, global2, local1, ..., localN]
         """
         crops = []
         
@@ -125,8 +102,5 @@ class TMEDinoTransforms(object):
         # Local crops
         for _ in range(self.n_local_crops):
             crops.append(self.local(x))
-        
-        # Original normalized image for mask model
-        crops.append(self.global_3(x))
         
         return crops

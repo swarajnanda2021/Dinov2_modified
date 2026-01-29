@@ -81,8 +81,12 @@ def get_args_parser():
                         help='Weight for KoLeo regularization loss')
     parser.add_argument('--ibot_loss_weight', default=1.0, type=float,
                         help='Weight for iBOT patch loss')
-    parser.add_argument('--token_mask_ratio', default=0.4, type=float,
-                        help='Ratio of tokens to mask for iBOT')
+    parser.add_argument('--mask_ratio_min', default=0.1, type=float,
+                        help='Minimum mask ratio for iBOT block masking')
+    parser.add_argument('--mask_ratio_max', default=0.5, type=float,
+                        help='Maximum mask ratio for iBOT block masking')
+    parser.add_argument('--mask_sample_probability', default=0.5, type=float,
+                        help='Fraction of samples in batch to apply masking')
     
     # ========== Patch Prototype Clustering parameters ==========
     parser.add_argument('--clustering_mode', type=str, default='visible',

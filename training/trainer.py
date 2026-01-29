@@ -636,7 +636,7 @@ def train_dinov2(args):
         # ========== Update learning rates ==========
         for i, param_group in enumerate(optimizer_student.param_groups):
             param_group["lr"] = student_lr_schedule[current_iteration]
-            if i == 0:
+            if i % 2 == 0:  # Even indices are regularized groups (0, 2, 4 for backbone, classhead, patchhead)
                 param_group["weight_decay"] = wd_schedule[current_iteration]
 
         if args.use_prototype_clustering and optimizer_prototypes is not None:
