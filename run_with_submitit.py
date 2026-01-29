@@ -161,7 +161,6 @@ def main():
     
     # Prototype clustering
     args.use_prototype_clustering = False
-    args.clustering_mode = 'visible'
     args.num_prototypes = 16384
     args.clustering_weight = 1.0
     args.clustering_teacher_temp = 0.07

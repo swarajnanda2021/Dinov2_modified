@@ -32,6 +32,7 @@ from .helpers import (
     extract_local_crops_from_masked,
     extract_crops_from_cellvit_channel,
     generate_random_token_masks,
+    generate_block_masks,
     generate_random_image_masks,
     calculate_total_student_views,
     save_iteration_masks_efficient,
@@ -500,8 +501,29 @@ def train_dinov2(args):
             student_all_crops.append(crop)
             idx += 1
         
-        # Get original images for masking and iBOT
-        original_images = batch_data[-1].cuda(non_blocking=True)
+        # Use first global crop as input for mask models (adversarial, CellViT, random)
+        # This replaces the old original_images = batch_data[-1] pattern
+        mask_model_input = teacher_global_crops[0]
+        
+        # ========== Generate block masks for iBOT on global crops ==========
+        batch_size = teacher_global_crops[0].shape[0]
+        n_patches_h = n_patches_w = 224 // args.patch_size
+        
+        block_masks_1, masks_weight_1 = generate_block_masks(
+            batch_size, n_patches_h, n_patches_w,
+            mask_ratio_min=args.mask_ratio_min,
+            mask_ratio_max=args.mask_ratio_max,
+            mask_sample_probability=args.mask_sample_probability,
+            device=teacher_global_crops[0].device
+        )
+        
+        block_masks_2, masks_weight_2 = generate_block_masks(
+            batch_size, n_patches_h, n_patches_w,
+            mask_ratio_min=args.mask_ratio_min,
+            mask_ratio_max=args.mask_ratio_max,
+            mask_sample_probability=args.mask_sample_probability,
+            device=teacher_global_crops[0].device
+        )
         
         # 3. Generate adversarial masked views if configured
         masked_global_crops = []
@@ -510,11 +532,11 @@ def train_dinov2(args):
         if args.use_adversarial_mask_augmentation and mask_model_frozen is not None:
             with torch.no_grad():
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
-                    mask_output = mask_model_frozen(original_images)
+                    mask_output = mask_model_frozen(mask_model_input)
                     masks = mask_output['masks'].float()  # Cast back to float32 for downstream ops
             
             # Apply masks to create masked global views
-            masked_images = apply_masks_to_images(original_images, masks)
+            masked_images = apply_masks_to_images(mask_model_input, masks)
             masked_global_crops = masked_images
             
             # Add masked global crops to student views
@@ -540,15 +562,15 @@ def train_dinov2(args):
         cellvit_background_crops = []
 
         if args.use_cellvit_augmentation and cellvit_model_frozen is not None:
-            with torch.no_grad():  # Add this for clarity
+            with torch.no_grad():
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
-                    cellvit_output = cellvit_model_frozen(original_images)  # Remove .to() - autocast handles it
+                    cellvit_output = cellvit_model_frozen(mask_model_input)
                     cellvit_masks = cellvit_output['masks'].float()  # [B, 2, H, W]
             
             del cellvit_output
             
             # Apply masks to create nuclei and background views
-            nuclei_images, background_images = apply_cellvit_masks(original_images, cellvit_masks)
+            nuclei_images, background_images = apply_cellvit_masks(mask_model_input, cellvit_masks)
             del cellvit_masks
             
             # Global views (224x224) - store these BEFORE deleting
@@ -562,12 +584,12 @@ def train_dinov2(args):
             # Extract local crops (96x96) from each channel - do this BEFORE deleting
             if args.cellvit_crops_per_channel > 0:
                 nuclei_crops = extract_crops_from_cellvit_channel(
-                    nuclei_images,  # Still available here
+                    nuclei_images,
                     n_crops=args.cellvit_crops_per_channel,
                     crop_size=args.local_crop_size
                 )
                 background_crops = extract_crops_from_cellvit_channel(
-                    background_images,  # Still available here
+                    background_images,
                     n_crops=args.cellvit_crops_per_channel,
                     crop_size=args.local_crop_size
                 )
@@ -590,15 +612,15 @@ def train_dinov2(args):
         if args.use_random_mask_augmentation:
             # Generate random rectangular masks
             random_masks = generate_random_image_masks(
-                batch_size=original_images.shape[0],
+                batch_size=mask_model_input.shape[0],
                 num_masks=args.random_num_masks,
                 height=224,
                 width=224,
-                device=original_images.device,
+                device=mask_model_input.device,
             )
             
             # Apply masks to create masked global views
-            random_masked_images = apply_masks_to_images(original_images, random_masks)
+            random_masked_images = apply_masks_to_images(mask_model_input, random_masks)
             random_masked_global_crops = random_masked_images
             
             # Add masked global crops to student views
@@ -626,7 +648,9 @@ def train_dinov2(args):
             print(f"Student total crops: {len(student_all_crops)} crops")
             for i, crop in enumerate(student_all_crops):
                 print(f"  Student crop {i}: {crop.shape}")
-            print(f"Original images: {original_images.shape}")
+            print(f"Mask model input: {mask_model_input.shape}")
+            print(f"Block masks 1: {block_masks_1.shape}, masks_weight_1: {masks_weight_1.shape}")
+            print(f"Block masks 2: {block_masks_2.shape}, masks_weight_2: {masks_weight_2.shape}")
             
             # Adversarial mask augmentation debug info
             if args.use_adversarial_mask_augmentation:
@@ -647,7 +671,6 @@ def train_dinov2(args):
                 print(f"\nRandom Mask Augmentation:")
                 print(f"  Random masked global crops: {len(random_masked_global_crops)}")
                 print(f"  Random masked local crops: {len(random_masked_local_crops)}")
-            
             
             print("="*50 + "\n")
         
@@ -673,16 +696,28 @@ def train_dinov2(args):
                 
         # ========== Forward passes and loss computation ==========
         with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
-            # ========== DINO Loss with Sequence Packing ==========
+            # ========== DINO Loss with Sequence Packing (Unified Forward) ==========
             
-            # Teacher forward (only global crops, no masking)
+            # Build mask list for student: masks for global crops, None for all others
+            num_other_crops = len(student_all_crops) - 2  # Everything except the 2 global crops
+            student_masks = [block_masks_1, block_masks_2] + [None] * num_other_crops
+            
+            # Teacher forward (global crops only, NO masking - provides unmasked targets)
             with torch.no_grad():
-                teacher_output = teacher(teacher_global_crops, token_masks=None, mode='dino')
+                teacher_output = teacher(teacher_global_crops, token_masks=[None, None], mode='dino')
                 teacher_cls_outputs = teacher_output['cls_outputs']
+                
+                # Extract patch tokens for iBOT (teacher provides unmasked targets)
+                teacher_patch_tokens_g1 = teacher_output['features_list'][0]['patchtokens']  # [B, N, D]
+                teacher_patch_tokens_g2 = teacher_output['features_list'][1]['patchtokens']  # [B, N, D]
             
-            # Student forward (all crops, packed together)
-            student_output = student(student_all_crops, token_masks=None, mode='dino')
+            # Student forward (all crops, masks on global crops only)
+            student_output = student(student_all_crops, token_masks=student_masks, mode='dino')
             student_cls_outputs = student_output['cls_outputs']
+            
+            # Extract patch tokens for iBOT (student has mask_token at masked positions)
+            student_patch_tokens_g1 = student_output['features_list'][0]['patchtokens']  # [B, N, D]
+            student_patch_tokens_g2 = student_output['features_list'][1]['patchtokens']  # [B, N, D]
             
             # Compute DINO loss
             dino_class_loss_val = dino_class_loss(
@@ -702,94 +737,47 @@ def train_dinov2(args):
             if len(global_cls_tokens) > 0:
                 koleo_loss_val = sum(dino_koleo_loss(token) for token in global_cls_tokens) / len(global_cls_tokens)
             
-            # ========== iBOT Loss (Canonical) ==========
-            batch_size = original_images.shape[0]
-            n_patches_h = n_patches_w = 224 // args.patch_size
+            # ========== iBOT Loss (Unified - No Separate Forward) ==========
+            # Concatenate patch tokens from both global crops
+            teacher_patch_tokens = torch.cat([teacher_patch_tokens_g1, teacher_patch_tokens_g2], dim=0)  # [2B, N, D]
+            student_patch_tokens = torch.cat([student_patch_tokens_g1, student_patch_tokens_g2], dim=0)  # [2B, N, D]
             
-            # Generate random token masks
-            random_token_masks = generate_random_token_masks(
-                batch_size, n_patches_h, n_patches_w,
-                args.token_mask_ratio, original_images.device
-            )
+            # Concatenate masks and weights
+            combined_masks = torch.cat([block_masks_1, block_masks_2], dim=0)  # [2B, N]
+            combined_weights = torch.cat([masks_weight_1, masks_weight_2], dim=0)  # [2B]
             
-            # Teacher forward (no masking)
-            with torch.no_grad():
-                teacher_ibot_output = teacher(original_images, token_masks=None, mode='ibot')
-                teacher_patch_outputs = teacher_ibot_output['patch_outputs']
+            # Apply projection head to patch tokens
+            teacher_patch_outputs = teacher.module.patchhead(teacher_patch_tokens)  # [2B, N, out_dim]
+            student_patch_outputs = student.module.patchhead(student_patch_tokens)  # [2B, N, out_dim]
             
-            # Student forward (with masking)
-            student_ibot_output = student(original_images, token_masks=random_token_masks, mode='ibot')
-            student_patch_outputs = student_ibot_output['patch_outputs']
-            
-            # Compute iBOT loss
+            # Compute iBOT loss on masked positions
             ibot_loss_val = ibot_patch_loss.forward_masked(
                 student_patch_outputs,
                 teacher_patch_outputs,
-                random_token_masks,
+                combined_masks,
+                masks_weight=combined_weights,
                 teacher_temp=dino_class_loss.teacher_temp_schedule(current_iteration)
             )
 
         # ========== Patch Prototype Clustering ==========
         if args.use_prototype_clustering:
-            # Get current temperature (shared across all modes)
             current_teacher_temp = dino_class_loss.teacher_temp_schedule(current_iteration)
             
-            if args.clustering_mode == 'visible':
-                # Use visible patch tokens from ibot forward pass
-                teacher_patch_features = teacher_ibot_output['features']['patchtokens']
-                student_patch_features = student_ibot_output['features']['patchtokens']
-
-                # random_token_masks: [B, N] where True = masked, False = visible
-                visible_mask = ~random_token_masks  # [B, N] boolean
-                
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
-                    clustering_loss, teacher_proto_loss, koleo_proto_loss = patch_prototype_loss(
-                        teacher_patch_features,
-                        student_patch_features,
-                        visible_mask,
-                        prototype_bank,
-                        current_teacher_temp
-                    )
-                
-                # Combine prototype losses
-                prototype_loss = teacher_proto_loss + koleo_proto_loss
-                
-            elif args.clustering_mode == 'masked':
-                # Use masked patch tokens from ibot forward pass
-                teacher_patch_features = teacher_ibot_output['features']['patchtokens']
-                student_patch_features = student_ibot_output['features']['patchtokens']
-                
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
-                    clustering_loss, teacher_proto_loss, koleo_proto_loss = patch_prototype_loss(
-                        teacher_patch_features,
-                        student_patch_features,
-                        random_token_masks,  # True = masked positions
-                        prototype_bank,
-                        current_teacher_temp
-                    )
-                
-                # Combine prototype losses
-                prototype_loss = teacher_proto_loss + koleo_proto_loss
-
-            elif args.clustering_mode == 'separate':
-                # Do a separate forward pass and use all patch tokens
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
-                    student_cluster = student(original_images, token_masks=None, mode='ibot')
-                    with torch.no_grad():
-                        teacher_cluster = teacher(original_images, token_masks=None, mode='ibot')
-                    
-                    all_mask = torch.ones_like(random_token_masks, dtype=torch.bool)  # Cluster all
-                    clustering_loss, teacher_proto_loss, koleo_proto_loss = patch_prototype_loss(
-                        teacher_cluster['features']['patchtokens'],
-                        student_cluster['features']['patchtokens'],
-                        all_mask,  # All positions
-                        prototype_bank,
-                        current_teacher_temp
-                    )
-                    
-                    # Combine prototype losses
-                    prototype_loss = teacher_proto_loss + koleo_proto_loss
-                    
+            # Use patch tokens from unified forward (already extracted above)
+            # teacher_patch_tokens: [2B, N, D], student_patch_tokens: [2B, N, D]
+            # combined_masks: [2B, N], combined_weights: [2B]
+            
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+                clustering_loss, teacher_proto_loss, koleo_proto_loss = patch_prototype_loss(
+                    teacher_patch_tokens,  # [2B, N, D] - raw features, not projected
+                    student_patch_tokens,  # [2B, N, D] - raw features, not projected
+                    combined_masks,        # [2B, N] - True = masked positions
+                    prototype_bank,
+                    current_iteration,
+                    current_teacher_temp
+                )
+            
+            prototype_loss = teacher_proto_loss + koleo_proto_loss
         else:
             clustering_loss = torch.tensor(0.0).cuda()
             teacher_proto_loss = torch.tensor(0.0).cuda()
@@ -873,7 +861,7 @@ def train_dinov2(args):
         if current_iteration % args.visualization_freq == 0 and current_iteration < 5000:
             # Visualize adversarial masks
             if args.use_adversarial_mask_augmentation and mask_model_frozen is not None:
-                sample_image = original_images[:1]
+                sample_image = mask_model_input[:1]
                 with torch.no_grad():
                     with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
                         vis_masks = mask_model_frozen(sample_image)['masks']
@@ -887,7 +875,7 @@ def train_dinov2(args):
             
             # Visualize CellViT masks
             if args.use_cellvit_augmentation and cellvit_model_frozen is not None:
-                sample_image = original_images[:1]
+                sample_image = mask_model_input[:1]
                 with torch.no_grad():
                     
                     with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
@@ -904,7 +892,7 @@ def train_dinov2(args):
             
             # Visualize Random masks
             if args.use_random_mask_augmentation:
-                sample_image = original_images[:1]
+                sample_image = mask_model_input[:1]
                 random_vis_masks = generate_random_image_masks(
                     batch_size=1,
                     num_masks=args.random_num_masks,
