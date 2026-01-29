@@ -769,12 +769,13 @@ def train_dinov2(args):
             
             with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
                 clustering_loss, teacher_proto_loss, koleo_proto_loss = patch_prototype_loss(
-                    teacher_patch_tokens,  # [2B, N, D] - raw features, not projected
-                    student_patch_tokens,  # [2B, N, D] - raw features, not projected
-                    combined_masks,        # [2B, N] - True = masked positions
+                    teacher_patch_tokens,  # [2B, N, D]
+                    student_patch_tokens,  # [2B, N, D]
+                    combined_masks,        # [2B, N]
                     prototype_bank,
                     current_iteration,
-                    current_teacher_temp
+                    current_teacher_temp,
+                    masks_weight=combined_weights  # [2B] - ADD THIS
                 )
             
             prototype_loss = teacher_proto_loss + koleo_proto_loss

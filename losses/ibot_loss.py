@@ -34,15 +34,12 @@ class iBOTPatchLoss(nn.Module):
         """
         Vectorized cross-entropy between teacher and student on masked patches.
         
-        Key optimization: Single nonzero call instead of B calls.
-        This eliminates the GPU-CPU sync bottleneck from the original loop.
-        
         Args:
             student_patch_tokens_masked: [B, N, D] student patch tokens
             teacher_patch_tokens_masked: [B, N, D] teacher patch tokens
             student_masks_flat: [B, N] boolean mask (True = masked)
             n_masked_patches: Optional number of masked patches (unused, for compatibility)
-            masks_weight: Optional per-token weights
+            masks_weight: Optional [B] per-sample weights (1/num_masked per sample)
             teacher_temp: Teacher temperature
             
         Returns:
@@ -69,14 +66,16 @@ class iBOTPatchLoss(nn.Module):
         teacher_masked = teacher_flat[masked_indices]  # [M, D]
         
         # Compute per-token weights
+        # Which sample each masked token belongs to
+        sample_idx = masked_indices // N  # [M]
+        
         if masks_weight is None:
             # Per-sample normalization: weight = 1 / num_masked_in_sample
-            sample_idx = masked_indices // N  # Which sample each token belongs to [M]
             num_masked_per_sample = mask_flat.reshape(B, N).sum(dim=1).clamp(min=1.0)  # [B]
             weights = 1.0 / num_masked_per_sample[sample_idx]  # [M]
         else:
-            weights_flat = masks_weight.reshape(-1)
-            weights = weights_flat[masked_indices]  # [M]
+            # masks_weight is [B] per-sample weights, map to per-token
+            weights = masks_weight[sample_idx]  # [M]
         
         # Sinkhorn-Knopp normalization on teacher
         teacher_normalized = self.sinkhorn_knopp_normalization(teacher_masked, teacher_temp)
@@ -87,8 +86,8 @@ class iBOTPatchLoss(nn.Module):
         # Cross-entropy loss per token
         loss_per_token = -torch.sum(teacher_normalized.detach() * student_log_probs, dim=-1)  # [M]
         
-        # Weighted sum
-        weighted_loss = (loss_per_token * weights).mean()
+        # Weighted mean: sum(loss * weight) / B gives equal contribution per sample
+        weighted_loss = (loss_per_token * weights).sum() / B
         
         return weighted_loss
 

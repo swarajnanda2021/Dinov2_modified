@@ -157,7 +157,6 @@ def main():
     # DINOv2 parameters
     args.koleo_loss_weight = 0.1
     args.ibot_loss_weight = 1.0
-    args.token_mask_ratio = 0.4
     
     # Prototype clustering
     args.use_prototype_clustering = False

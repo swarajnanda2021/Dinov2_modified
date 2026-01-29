@@ -54,10 +54,20 @@ class PatchPrototypeLoss(nn.Module):
         self.last_usage_std = 0.0
         self.last_num_masked = 0
     
-    def forward(self, teacher_patch_tokens, student_patch_tokens, token_masks, prototype_bank, current_iteration, teacher_temp):
+    def forward(self, teacher_patch_tokens, student_patch_tokens, token_masks, 
+                prototype_bank, current_iteration, teacher_temp, masks_weight=None):
         """
-        Compute prototype clustering loss - now actually computes everything.
+        Compute prototype clustering loss with optional per-sample weighting.
         
+        Args:
+            teacher_patch_tokens: [B, N, D] teacher patch tokens
+            student_patch_tokens: [B, N, D] student patch tokens  
+            token_masks: [B, N] boolean mask (True = masked positions)
+            prototype_bank: LinearPrototypeBank module
+            current_iteration: Current training iteration
+            teacher_temp: Teacher temperature for Sinkhorn-Knopp
+            masks_weight: Optional [B] per-sample weights (1/num_masked per sample)
+            
         Returns:
             tuple: (student_clustering_loss, teacher_proto_loss, koleo_proto_loss)
         """
@@ -85,23 +95,36 @@ class PatchPrototypeLoss(nn.Module):
         koleo_proto_loss = self.koleo_loss(weight_normalized)
         
         # ========== Student path: Prediction loss ==========
-        Q_tilde_masked = Q_tilde_all[token_masks].detach()
-        student_norm_masked = student_norm[token_masks]
+        Q_tilde_masked = Q_tilde_all[token_masks].detach()  # [M, K]
+        student_norm_masked = student_norm[token_masks]  # [M, D]
         
-        if student_norm_masked.shape[0] == 0:
+        M_total = student_norm_masked.shape[0]
+        if M_total == 0:
             return torch.tensor(0.0, device=teacher_patch_tokens.device), \
                 torch.tensor(0.0, device=teacher_patch_tokens.device), \
                 torch.tensor(0.0, device=teacher_patch_tokens.device)
         
         # Student predictions
-        student_logits_masked = prototype_bank(student_norm_masked)
+        student_logits_masked = prototype_bank(student_norm_masked)  # [M, K]
         student_log_probs_masked = F.log_softmax(student_logits_masked / self.student_temp, dim=-1)
         
-        # Clustering loss (trains student)
-        M_total = student_norm_masked.shape[0]
-        clustering_loss = -torch.sum(Q_tilde_masked * student_log_probs_masked) / M_total
+        # Per-token cross-entropy
+        per_token_loss = -torch.sum(Q_tilde_masked * student_log_probs_masked, dim=-1)  # [M]
         
-        # Update metrics (same as before)
+        # Compute clustering loss with per-sample weighting
+        if masks_weight is not None:
+            # Map sample weights to per-token weights
+            # token_masks is [B, N], need to find which sample each masked token belongs to
+            sample_indices = token_masks.nonzero(as_tuple=True)[0]  # [M] - sample index for each masked token
+            per_token_weight = masks_weight[sample_indices]  # [M]
+            
+            # Weighted sum, normalized by batch size (not token count)
+            clustering_loss = (per_token_loss * per_token_weight).sum() / B
+        else:
+            # Fallback: simple mean over tokens
+            clustering_loss = per_token_loss.mean()
+        
+        # Update metrics
         with torch.no_grad():
             student_probs = torch.exp(student_log_probs_masked)
             entropy = -(student_probs * student_log_probs_masked).sum(dim=-1).mean()
