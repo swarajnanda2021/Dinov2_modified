@@ -36,8 +36,9 @@ def parse_args():
 
 
 def get_shared_folder() -> Path:
-    """Get shared folder for logs and checkpoints."""
-    p = Path("/data1/vanderbc/nandas1/FoundationModel_ViT-B_p16_b1024_adios/logs")
+    """Get shared folder for logs and checkpoints relative to script location."""
+    script_dir = Path(__file__).parent.resolve()
+    p = script_dir / "logs"
     p.mkdir(exist_ok=True)
     return p
 
@@ -134,9 +135,9 @@ def main():
     # Adversarial mask augmentation (3-channel semantic masks)
     args.use_adversarial_mask_augmentation = True
     args.mask_checkpoint = "/data1/vanderbc/nandas1/ADIOS-CellViT/logs/checkpoint_iter_00094000.pth"
-    args.num_masks = 1  # Only used if use_adversarial_mask_augmentation=True
+    args.num_masks = 3  # Only used if use_adversarial_mask_augmentation=True
     args.crops_per_mask = 0  # Only used if use_adversarial_mask_augmentation=True
-    args.mask_model_arch = 'unet'  # Options: 'unet' or 'vit_unet'
+    args.mask_model_arch = 'vit_unet'  # Options: 'unet' or 'vit_unet'
     args.mask_encoder_dim = 192    # Only used if mask_model_arch='vit_unet'
     
     # CellViT augmentation (2-channel nuclei/background)
