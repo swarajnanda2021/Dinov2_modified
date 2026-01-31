@@ -133,7 +133,7 @@ def main():
     args.local_crop_size = 96
     
     # Adversarial mask augmentation (3-channel semantic masks)
-    args.use_adversarial_mask_augmentation = True
+    args.use_adversarial_mask_augmentation = False
     args.mask_checkpoint = "/data1/vanderbc/nandas1/ADIOS-CellViT/logs/checkpoint_iter_00094000.pth"
     args.num_masks = 3  # Only used if use_adversarial_mask_augmentation=True
     args.crops_per_mask = 0  # Only used if use_adversarial_mask_augmentation=True
@@ -175,7 +175,7 @@ def main():
     # Optimization
     args.batch_size_per_gpu = 256
     args.warmup_iterations = 12_500
-    args.total_iterations = 150_000
+    args.total_iterations = 150_001
     args.freeze_last_layer_iters = 1_250
     args.lr = 5e-5
     args.min_lr = 1e-6
