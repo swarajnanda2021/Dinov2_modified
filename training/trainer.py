@@ -737,46 +737,71 @@ def train_dinov2(args):
             if len(global_cls_tokens) > 0:
                 koleo_loss_val = sum(dino_koleo_loss(token) for token in global_cls_tokens) / len(global_cls_tokens)
             
-            # ========== iBOT Loss (Unified - No Separate Forward) ==========
-            # Concatenate patch tokens from both global crops
-            teacher_patch_tokens = torch.cat([teacher_patch_tokens_g1, teacher_patch_tokens_g2], dim=0)  # [2B, N, D]
-            student_patch_tokens = torch.cat([student_patch_tokens_g1, student_patch_tokens_g2], dim=0)  # [2B, N, D]
+            # ========== iBOT Loss (Sequential per crop to halve peak memory) ==========
+            current_teacher_temp_ibot = dino_class_loss.teacher_temp_schedule(current_iteration)
             
-            # Concatenate masks and weights
-            combined_masks = torch.cat([block_masks_1, block_masks_2], dim=0)  # [2B, N]
-            combined_weights = torch.cat([masks_weight_1, masks_weight_2], dim=0)  # [2B]
+            # Process global crop 1
+            teacher_patch_out_g1 = teacher.module.patchhead(teacher_patch_tokens_g1)  # [B, N, out_dim]
+            student_patch_out_g1 = student.module.patchhead(student_patch_tokens_g1)  # [B, N, out_dim]
             
-            # Apply projection head to patch tokens
-            teacher_patch_outputs = teacher.module.patchhead(teacher_patch_tokens)  # [2B, N, out_dim]
-            student_patch_outputs = student.module.patchhead(student_patch_tokens)  # [2B, N, out_dim]
-            
-            # Compute iBOT loss on masked positions
-            ibot_loss_val = ibot_patch_loss.forward_masked(
-                student_patch_outputs,
-                teacher_patch_outputs,
-                combined_masks,
-                masks_weight=combined_weights,
-                teacher_temp=dino_class_loss.teacher_temp_schedule(current_iteration)
+            ibot_loss_g1 = ibot_patch_loss.forward_masked(
+                student_patch_out_g1,
+                teacher_patch_out_g1,
+                block_masks_1,
+                masks_weight=masks_weight_1,
+                teacher_temp=current_teacher_temp_ibot
             )
+            
+            # Free crop 1 patchhead outputs before allocating crop 2
+            del teacher_patch_out_g1, student_patch_out_g1
+            
+            # Process global crop 2
+            teacher_patch_out_g2 = teacher.module.patchhead(teacher_patch_tokens_g2)  # [B, N, out_dim]
+            student_patch_out_g2 = student.module.patchhead(student_patch_tokens_g2)  # [B, N, out_dim]
+            
+            ibot_loss_g2 = ibot_patch_loss.forward_masked(
+                student_patch_out_g2,
+                teacher_patch_out_g2,
+                block_masks_2,
+                masks_weight=masks_weight_2,
+                teacher_temp=current_teacher_temp_ibot
+            )
+            
+            del teacher_patch_out_g2, student_patch_out_g2
+            
+            # Average: mathematically identical to computing on concatenated tensors
+            ibot_loss_val = (ibot_loss_g1 + ibot_loss_g2) / 2.0
 
-        # ========== Patch Prototype Clustering ==========
+        # ========== Patch Prototype Clustering (Sequential per crop) ==========
         if args.use_prototype_clustering:
             current_teacher_temp = dino_class_loss.teacher_temp_schedule(current_iteration)
             
-            # Use patch tokens from unified forward (already extracted above)
-            # teacher_patch_tokens: [2B, N, D], student_patch_tokens: [2B, N, D]
-            # combined_masks: [2B, N], combined_weights: [2B]
-            
             with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
-                clustering_loss, teacher_proto_loss, koleo_proto_loss = patch_prototype_loss(
-                    teacher_patch_tokens,  # [2B, N, D]
-                    student_patch_tokens,  # [2B, N, D]
-                    combined_masks,        # [2B, N]
+                # Process global crop 1
+                clust_loss_g1, proto_loss_g1, koleo_proto_g1 = patch_prototype_loss(
+                    teacher_patch_tokens_g1,  # [B, N, D]
+                    student_patch_tokens_g1,  # [B, N, D]
+                    block_masks_1,            # [B, N]
                     prototype_bank,
                     current_iteration,
                     current_teacher_temp,
-                    masks_weight=combined_weights  # [2B] - ADD THIS
+                    masks_weight=masks_weight_1  # [B]
                 )
+                
+                # Process global crop 2
+                clust_loss_g2, proto_loss_g2, koleo_proto_g2 = patch_prototype_loss(
+                    teacher_patch_tokens_g2,  # [B, N, D]
+                    student_patch_tokens_g2,  # [B, N, D]
+                    block_masks_2,            # [B, N]
+                    prototype_bank,
+                    current_iteration,
+                    current_teacher_temp,
+                    masks_weight=masks_weight_2  # [B]
+                )
+                
+                clustering_loss = (clust_loss_g1 + clust_loss_g2) / 2.0
+                teacher_proto_loss = (proto_loss_g1 + proto_loss_g2) / 2.0
+                koleo_proto_loss = (koleo_proto_g1 + koleo_proto_g2) / 2.0
             
             prototype_loss = teacher_proto_loss + koleo_proto_loss
         else:
@@ -916,9 +941,9 @@ def train_dinov2(args):
         metric_logger.update(ibot_loss=ibot_loss_val.item())
 
         if args.use_prototype_clustering:
-            metric_logger.update(clustering_loss=patch_prototype_loss.last_prediction_loss)
-            metric_logger.update(proto_koleo_loss=patch_prototype_loss.last_koleo_loss)
-            metric_logger.update(teacher_proto_arrangement_loss=patch_prototype_loss.last_arrangement_loss)
+            metric_logger.update(clustering_loss=clustering_loss.item())
+            metric_logger.update(proto_koleo_loss=koleo_proto_loss.item())
+            metric_logger.update(teacher_proto_arrangement_loss=teacher_proto_loss.item())
             metric_logger.update(clustering_entropy=patch_prototype_loss.last_entropy)
 
         metric_logger.update(lr=optimizer_student.param_groups[0]["lr"])
