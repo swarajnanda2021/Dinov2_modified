@@ -42,7 +42,7 @@ class CombinedModelDINO(nn.Module):
         else:
             print(f"⚠ Warning: Backbone does not support gradient checkpointing")
 
-    def forward(self, crops, token_masks=None, mode='dino'):
+    def forward(self, crops, token_masks=None, mode='dino', return_bottleneck = False):
         """
         Unified forward supporting both DINO and iBOT modes.
         
@@ -55,6 +55,7 @@ class CombinedModelDINO(nn.Module):
                 - Single mask tensor [B, N] for iBOT
                 - None for no masking
             mode: 'dino' or 'ibot' (mostly for clarity)
+            return_bottleneck: We supply this to get the representations prior to self.last_layer in the DINOHead, i.e., the representations in the bottleneck dimension, so that we can assess typical-ness/typicality.
         
         Returns:
             Dictionary with keys depending on mode:
@@ -88,12 +89,21 @@ class CombinedModelDINO(nn.Module):
             cls_tokens_cat = torch.cat(all_cls_tokens, dim=0)
             
             # Apply DINO head
-            cls_outputs = self.classhead(cls_tokens_cat)
+            if return_bottleneck:
+                cls_outputs, bottleneck = self.classhead(cls_tokens_cat, return_bottleneck = True)
+            else:
+                cls_outputs = self.classhead(cls_tokens_cat)
             
-            return {
+            result =  {
                 'cls_outputs': cls_outputs,  # [total_crops, out_dim]
                 'features_list': outputs_list,  # List of dicts
             }
+
+            if return_bottleneck:
+                result['bottleneck'] = bottleneck
+
+            return result
+
         
         else:
             # ========== SINGLE IMAGE MODE (iBOT) ==========
