@@ -39,7 +39,8 @@ class DINOLoss(nn.Module):
         self.teacher_temp_schedule = lambda it: teacher_temp + (warmup_teacher_temp - teacher_temp) * \
             (1 + math.cos(math.pi * min(it, warmup_iters) / warmup_iters)) / 2
     
-    def forward(self, student_output, teacher_output, current_iteration):
+    def forward(self, student_output, teacher_output, current_iteration,
+            sample_temperatures=None, sample_weights=None):
         """
         Compute DINO loss.
         
@@ -47,6 +48,8 @@ class DINOLoss(nn.Module):
             student_output: Student predictions [B*ncrops, out_dim]
             teacher_output: Teacher predictions [B*2, out_dim] (2 global crops)
             current_iteration: Current training iteration
+            sample_temperatures: Optional [B] per-sample student temperatures (Variant I)
+            sample_weights: Optional [B] per-sample loss weights (Variant II)
             
         Returns:
             Loss value
@@ -56,7 +59,13 @@ class DINOLoss(nn.Module):
         normalized_teacher = self.sinkhorn_knopp_normalization(teacher_output, temp)
         normalized_teacher = normalized_teacher.detach().chunk(2)
         
-        student_out = student_output / self.student_temp
+        # Temperature: per-sample or scalar
+        if sample_temperatures is not None:
+            tau_repeated = sample_temperatures.repeat(self.ncrops)
+            student_out = student_output / tau_repeated.unsqueeze(1)
+        else:
+            student_out = student_output / self.student_temp
+        
         student_out = student_out.chunk(self.ncrops)
         
         total_loss = 0
@@ -66,7 +75,12 @@ class DINOLoss(nn.Module):
                 if v == iq:
                     continue
                 loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
-                total_loss += loss.mean()
+                
+                if sample_weights is not None:
+                    total_loss += (loss * sample_weights).sum() / sample_weights.sum()
+                else:
+                    total_loss += loss.mean()
+                
                 n_loss_terms += 1
         
         total_loss /= n_loss_terms
