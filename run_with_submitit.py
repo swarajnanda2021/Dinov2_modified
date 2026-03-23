@@ -165,6 +165,17 @@ def main():
     args.clustering_weight = 1.0
     args.clustering_teacher_temp = 0.07
     args.clustering_student_temp = 0.1
+
+    # Typicality dampening
+    args.use_typicality_dampening = False
+    args.typicality_K_prime = 256
+    args.typicality_bank_size = 8192
+    args.typicality_modulation = 'adaptive_temp'
+    args.typicality_alpha = 1.0
+    args.typicality_beta = 0.5
+    args.typicality_warmup_iters = 15_000
+    args.typicality_repr_lr = 1e-3
+    args.typicality_replace_fraction = 0.1
     
     # Teacher parameters
     args.momentum_teacher = 0.996

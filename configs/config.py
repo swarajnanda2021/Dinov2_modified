@@ -99,6 +99,27 @@ def get_args_parser():
                         help='Teacher temperature for clustering')
     parser.add_argument('--clustering_student_temp', default=0.1, type=float,
                         help='Student temperature for clustering')
+    
+    # ========== Typicality Dampening parameters ==========
+    parser.add_argument('--use_typicality_dampening', default=False, type=utils.bool_flag,
+                        help='Enable adaptive redundancy dampening for rare morphology preservation')
+    parser.add_argument('--typicality_K_prime', default=256, type=int,
+                        help='Number of representative prototypes (128=undercomplete, 256=complete, 512=overcomplete)')
+    parser.add_argument('--typicality_bank_size', default=8192, type=int,
+                        help='Bank capacity M (number of stored signatures)')
+    parser.add_argument('--typicality_modulation', default='adaptive_temp', type=str,
+                        choices=['adaptive_temp', 'weighted_loss'],
+                        help='Gradient modulation variant')
+    parser.add_argument('--typicality_alpha', default=1.0, type=float,
+                        help='Dampening strength for adaptive temperature variant')
+    parser.add_argument('--typicality_beta', default=0.5, type=float,
+                        help='Dampening strength for weighted loss variant')
+    parser.add_argument('--typicality_warmup_iters', default=15000, type=int,
+                        help='Iterations before typicality scores modulate the loss')
+    parser.add_argument('--typicality_repr_lr', default=1e-3, type=float,
+                        help='Fixed learning rate for representative prototype optimizer')
+    parser.add_argument('--typicality_replace_fraction', default=0.1, type=float,
+                        help='Fraction of bank to refresh per step')
 
     # ========== Training parameters ==========
     parser.add_argument('--batch_size_per_gpu', default=32, type=int,

@@ -39,6 +39,7 @@ from .helpers import (
     worker_init_fn,
     setup_ddp_model,
 )
+from typicality import RepresentativePrototypes, TypicalityBank, TypicalityScorer
 
 
 def train_dinov2(args):
@@ -243,7 +244,31 @@ def train_dinov2(args):
         print(f"Created LinearPrototypeBank with {args.num_prototypes} soft prototypes")
     else:
         print("Prototype clustering disabled (--use_prototype_clustering=False)")
-    
+
+    # ============ Create Typicality Dampening (Optional) ============
+    repr_protos = None
+    typicality_bank = None
+    if args.use_typicality_dampening:
+        repr_protos = RepresentativePrototypes(
+            K_prime=args.typicality_K_prime,
+            bottleneck_dim=256,  # DINOHead bottleneck_dim
+        )
+        repr_protos = repr_protos.cuda()
+        
+        typicality_bank = TypicalityBank(
+            M=args.typicality_bank_size,
+            K_prime=args.typicality_K_prime,
+            replace_fraction=args.typicality_replace_fraction,
+        )
+        typicality_bank = typicality_bank.cuda()
+        
+        print(f"Created Typicality Dampening:")
+        print(f"  K' = {args.typicality_K_prime}, Bank M = {args.typicality_bank_size}")
+        print(f"  Modulation: {args.typicality_modulation}")
+        print(f"  Warmup: {args.typicality_warmup_iters} iterations")
+    else:
+        print("Typicality dampening disabled (--use_typicality_dampening=False)")
+
     student = student.cuda()
     teacher = teacher.cuda()
 
@@ -339,6 +364,16 @@ def train_dinov2(args):
 
     print(f"Created optimizers")
 
+    # R optimizer for representative prototypes (typicality)
+    R_optimizer = None
+    if args.use_typicality_dampening and repr_protos is not None:
+        R_optimizer = torch.optim.AdamW(
+            repr_protos.parameters(),
+            lr=args.typicality_repr_lr,
+            weight_decay=0.0,
+        )
+        print(f"Created R optimizer (lr={args.typicality_repr_lr}, no weight decay)")
+
     # ============ Create schedulers ============
     student_lr_schedule = utils.cosine_scheduler(
         base_value=args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256.,
@@ -402,6 +437,12 @@ def train_dinov2(args):
         checkpoint_kwargs['optimizer_prototypes'] = optimizer_prototypes
         checkpoint_kwargs['patch_prototype_loss'] = patch_prototype_loss
 
+    # Add typicality-related modules only if enabled
+    if args.use_typicality_dampening:
+        checkpoint_kwargs['repr_protos'] = repr_protos
+        checkpoint_kwargs['R_optimizer'] = R_optimizer
+        checkpoint_kwargs['typicality_bank'] = typicality_bank
+
     utils.restart_from_checkpoint(
         os.path.join(args.output_dir, "checkpoint.pth"),
         run_variables=to_restore,
@@ -444,6 +485,8 @@ def train_dinov2(args):
             print(f"Prototype Bank Statistics:")
             print(f"  Weight norm mean: {proto_stats['weight_norm_mean']:.6f}")
             print(f"  Weight norm std: {proto_stats['weight_norm_std']:.6f}")
+        if args.use_typicality_dampening:
+            print(f"Typicality Bank: {typicality_bank.bank_filled.item()}/{typicality_bank.M} filled")
         print("="*50 + "\n")
     
     metric_logger = utils.IterationMetricLogger(total_iterations=args.total_iterations)
@@ -671,6 +714,13 @@ def train_dinov2(args):
                 print(f"\nRandom Mask Augmentation:")
                 print(f"  Random masked global crops: {len(random_masked_global_crops)}")
                 print(f"  Random masked local crops: {len(random_masked_local_crops)}")
+
+            # Typicality dampening debug info
+            if args.use_typicality_dampening:
+                print(f"\nTypicality Dampening:")
+                print(f"  K' = {args.typicality_K_prime}, Bank M = {args.typicality_bank_size}")
+                print(f"  Modulation: {args.typicality_modulation}")
+                print(f"  return_bottleneck = True")
             
             print("="*50 + "\n")
         
@@ -712,9 +762,43 @@ def train_dinov2(args):
                 teacher_patch_tokens_g2 = teacher_output['features_list'][1]['patchtokens']  # [B, N, D]
             
             # Student forward (all crops, masks on global crops only)
-            student_output = student(student_all_crops, token_masks=student_masks, mode='dino')
+            student_output = student(student_all_crops, token_masks=student_masks, mode='dino',
+                                     return_bottleneck=args.use_typicality_dampening)
             student_cls_outputs = student_output['cls_outputs']
+
+            # ========== Typicality Dampening ==========
+            typicality_temperatures = None
+            typicality_weights = None
+            bank_output = {'ready': False}
+            t = None
             
+            if args.use_typicality_dampening and repr_protos is not None:
+                with torch.no_grad():
+                    # Extract bottleneck from global crop 1: first B entries
+                    z_global1 = student_output['bottleneck'][:batch_size].detach()
+                    
+                    # Compute morphology signatures
+                    s_batch = repr_protos.compute_signatures(z_global1)
+                    
+                    # Bank update and scoring
+                    bank_output = typicality_bank.update_and_score(s_batch)
+                    
+                    if bank_output['ready'] and current_iteration >= args.typicality_warmup_iters:
+                        t = TypicalityScorer.compute_scores(
+                            bank_output['d'], bank_output['mu'], bank_output['sigma']
+                        )
+                        
+                        if args.typicality_modulation == 'adaptive_temp':
+                            typicality_temperatures = TypicalityScorer.adaptive_temperature(
+                                t, tau_base=dino_class_loss.student_temp, alpha=args.typicality_alpha
+                            )
+                        else:
+                            typicality_weights = TypicalityScorer.sample_weights(
+                                t, beta=args.typicality_beta
+                            )
+                    else:
+                        t = torch.zeros(batch_size, device=z_global1.device)
+
             # Extract patch tokens for iBOT (student has mask_token at masked positions)
             student_patch_tokens_g1 = student_output['features_list'][0]['patchtokens']  # [B, N, D]
             student_patch_tokens_g2 = student_output['features_list'][1]['patchtokens']  # [B, N, D]
@@ -723,7 +807,9 @@ def train_dinov2(args):
             dino_class_loss_val = dino_class_loss(
                 student_cls_outputs,
                 teacher_cls_outputs,
-                current_iteration
+                current_iteration,
+                sample_temperatures=typicality_temperatures,
+                sample_weights=typicality_weights,
             )
             
             # ========== KoLeo Loss on Global CLS Tokens ==========
@@ -862,6 +948,14 @@ def train_dinov2(args):
             fp16_scaler.step(optimizer_student)
             fp16_scaler.update()
 
+        # ========== Representative prototype update (typicality) ==========
+        if args.use_typicality_dampening and repr_protos is not None:
+            P = student.module.classhead.last_layer.weight.detach()
+            repr_loss, l_nn, l_cov = repr_protos.compute_loss(P)
+            R_optimizer.zero_grad()
+            repr_loss.backward()
+            R_optimizer.step()
+            repr_protos.project_to_sphere()
 
         # ========== EMA update teacher ==========
         with torch.no_grad():
@@ -946,6 +1040,16 @@ def train_dinov2(args):
             metric_logger.update(teacher_proto_arrangement_loss=teacher_proto_loss.item())
             metric_logger.update(clustering_entropy=patch_prototype_loss.last_entropy)
 
+        if args.use_typicality_dampening and repr_protos is not None:
+            metric_logger.update(repr_L_nn=l_nn.item())
+            metric_logger.update(repr_L_cov=l_cov.item())
+            if bank_output['ready']:
+                metric_logger.update(typicality_mu=bank_output['mu'].item())
+                metric_logger.update(typicality_sigma=bank_output['sigma'].item())
+                metric_logger.update(typicality_t_mean=t.mean().item())
+                metric_logger.update(typicality_t_std=t.std().item())
+                metric_logger.update(typicality_d_mean=bank_output['d'].mean().item())
+
         metric_logger.update(lr=optimizer_student.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer_student.param_groups[0]["weight_decay"])
         
@@ -983,6 +1087,7 @@ def train_dinov2(args):
                     'random_num_masks': args.random_num_masks if args.use_random_mask_augmentation else 0,
                     'random_crops_per_mask': args.random_crops_per_mask if args.use_random_mask_augmentation else 0,
                     'total_student_views': total_student_views,
+                    'typicality_dampening': args.use_typicality_dampening,
                 }
             }
             
@@ -1013,6 +1118,15 @@ def train_dinov2(args):
                     save_dict['patch_prototype_loss'] = patch_prototype_loss.state_dict()
                 if optimizer_prototypes is not None:
                     save_dict['optimizer_prototypes'] = optimizer_prototypes.state_dict()
+
+            # Add typicality-related state only if enabled
+            if args.use_typicality_dampening:
+                if repr_protos is not None:
+                    save_dict['repr_protos'] = repr_protos.state_dict()
+                if R_optimizer is not None:
+                    save_dict['R_optimizer'] = R_optimizer.state_dict()
+                if typicality_bank is not None:
+                    save_dict['typicality_bank'] = typicality_bank.state_dict()
 
             if fp16_scaler is not None:
                 save_dict['fp16_scaler'] = fp16_scaler.state_dict()
