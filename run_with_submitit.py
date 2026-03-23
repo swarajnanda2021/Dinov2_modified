@@ -18,20 +18,20 @@ from training.helpers import calculate_total_student_views
 def parse_args():
     """Parse submitit and training arguments."""
     parser = argparse.ArgumentParser(
-        "Submitit for DINOv2", 
+        "Submitit for DINOv2",
         parents=[get_args_parser()]
     )
-    
+
     # Submitit specific arguments
-    parser.add_argument("--ngpus", default=4, type=int, 
+    parser.add_argument("--ngpus", default=4, type=int,
                         help="Number of GPUs per node")
-    parser.add_argument("--nodes", default=1, type=int, 
+    parser.add_argument("--nodes", default=1, type=int,
                         help="Number of nodes")
-    parser.add_argument("--timeout", default=10000, type=int, 
+    parser.add_argument("--timeout", default=10000, type=int,
                         help="Job duration in minutes")
-    parser.add_argument("--partition", default="vanderbc_gpu", type=str, 
+    parser.add_argument("--partition", default="vanderbc_gpu", type=str,
                         help="Partition name")
-    
+
     return parser.parse_args()
 
 
@@ -81,10 +81,10 @@ class Trainer(object):
 def main():
     """Main submitit launcher."""
     args = parse_args()
-    
+
     # Set output directory
     args.output_dir = str(get_shared_folder())
-    
+
     # Setup executor
     executor = submitit.AutoExecutor(folder=args.output_dir, slurm_max_num_timeout=30)
 
@@ -115,7 +115,7 @@ def main():
             f'export WORLD_SIZE={num_gpus_per_node * nodes}',
         ]
     )
-    
+
     executor.update_parameters(name=job_name)
 
     args.dist_url = get_init_file().as_uri()
@@ -131,47 +131,42 @@ def main():
     args.global_views = 2
     args.n_standard_local_crops = 6
     args.local_crop_size = 96
-    
-    # Adversarial mask augmentation (3-channel semantic masks)
-    args.use_adversarial_mask_augmentation = False
-    args.mask_checkpoint = "/data1/vanderbc/nandas1/ADIOS-CellViT/logs/checkpoint_iter_00094000.pth"
-    args.num_masks = 3  # Only used if use_adversarial_mask_augmentation=True
-    args.crops_per_mask = 0  # Only used if use_adversarial_mask_augmentation=True
-    args.mask_model_arch = 'vit_unet'  # Options: 'unet' or 'vit_unet'
-    args.mask_encoder_dim = 192    # Only used if mask_model_arch='vit_unet'
-    
-    # CellViT augmentation (2-channel nuclei/background)
-    args.use_cellvit_augmentation = False
-    args.cellvit_checkpoint = "/data1/vanderbc/nandas1/CellViT_models/TCGA_Dinov2_ViT-B_run2/model.pth"
-    args.cellvit_crops_per_channel = 0  # Only used if use_cellvit_augmentation=True
 
-    # Random mask augmentation
-    args.use_random_mask_augmentation = False
-    args.random_num_masks = 2
-    args.random_crops_per_mask = 0
+    # Semantic iBOT
+    args.use_semantic_ibot = True
+    args.use_semantic_prototypes = True
+    args.semantic_ibot_weight = 1.0
+    args.semantic_clustering_weight = 1.0
+    args.semantic_masks_per_iteration = 1
+
+    # Mask model (used by semantic iBOT)
+    args.mask_checkpoint = "/data1/vanderbc/nandas1/ADIOS-CellViT/logs/checkpoint_iter_00094000.pth"
+    args.num_masks = 3
+    args.mask_model_arch = 'vit_unet'
+    args.mask_encoder_dim = 192
 
     # DINO parameters
     args.out_dim = 65536
     args.norm_last_layer = True
     args.use_bn_in_head = False
-    
+
     # DINOv2 parameters
     args.koleo_loss_weight = 0.1
     args.ibot_loss_weight = 1.0
-    
+
     # Prototype clustering
     args.use_prototype_clustering = False
     args.num_prototypes = 16384
     args.clustering_weight = 1.0
     args.clustering_teacher_temp = 0.07
     args.clustering_student_temp = 0.1
-    
+
     # Teacher parameters
     args.momentum_teacher = 0.996
     args.teacher_temp = 0.07
     args.warmup_teacher_temp = 0.04
     args.teacher_temp_warmup_iters = 37_500
-    
+
     # Optimization
     args.batch_size_per_gpu = 256
     args.warmup_iterations = 12_500
@@ -190,14 +185,14 @@ def main():
     args.num_workers = 10
     args.visualization_freq = 10000
     args.grad_checkpointing = True
-    
+
     # Dataset
     args.dataset_sources = [
         "TCGA:/data1/vanderbc/foundation_model_training_images/TCGA:TCGA_dataset_index.pkl",
         "CPTAC:/data1/vanderbc/foundation_model_training_images/CPTAC:CPTAC_dataset_index.pkl",
         "IMPACT:/data1/vanderbc/foundation_model_training_images/IMPACT:IMPACT_dataset_index.pkl"
     ]
-    
+
     # Save configuration
     with open(os.path.join(args.output_dir, f"{job_name}_config.txt"), "w") as f:
         for arg, value in sorted(vars(args).items()):
@@ -210,7 +205,7 @@ def main():
     print(f"Submitted job_id: {job.job_id}")
     print(f"Job name: {job_name}")
     print(f"Logs and checkpoints: {args.output_dir}")
-    
+
     # Calculate total views
     total_views = calculate_total_student_views(args)
 
@@ -220,16 +215,16 @@ def main():
     print(f"  Global crops: {args.global_views}")
     print(f"  Standard local crops: {args.n_standard_local_crops}")
 
-    if args.use_adversarial_mask_augmentation:
-        print(f"  Adversarial masked crops: {args.num_masks} global + {args.num_masks * args.crops_per_mask} local")
+    if args.use_semantic_ibot:
+        print(f"  Semantic iBOT: ENABLED")
+        print(f"    Mask model: {args.mask_model_arch}")
+        print(f"    Semantic channels: {args.num_masks}")
+        print(f"    Channels per iteration: {args.semantic_masks_per_iteration}")
+        print(f"    Semantic iBOT weight: {args.semantic_ibot_weight}")
+        if args.use_semantic_prototypes:
+            print(f"    Semantic prototype loss: ENABLED (weight={args.semantic_clustering_weight})")
 
-    if args.use_cellvit_augmentation:
-        print(f"  CellViT masked crops: 2 global + {2 * args.cellvit_crops_per_channel} local")
-
-    if args.use_random_mask_augmentation:
-        print(f"  Random masked crops: {args.random_num_masks} global + {args.random_num_masks * args.random_crops_per_mask} local")
-
-    print(f"  Total student views: {total_views}")
+    print(f"  Total student views (DINO CLS): {total_views}")
     print(f"  Batch size per GPU: {args.batch_size_per_gpu}")
     print(f"  Total GPUs: {args.ngpus * args.nodes}")
     print(f"  Effective batch size: {args.batch_size_per_gpu * args.ngpus * args.nodes}")

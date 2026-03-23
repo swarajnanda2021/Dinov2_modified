@@ -9,12 +9,12 @@ import utils
 def get_args_parser():
     """
     Create argument parser with all training configuration options.
-    
+
     Returns:
         ArgumentParser with all training arguments
     """
     parser = argparse.ArgumentParser('Semantic-DINOv2 with Sequence Packing', add_help=False)
-    
+
     # ========== Model parameters ==========
     parser.add_argument('--patch_size', default=16, type=int,
                         help='Patch size for vision transformer')
@@ -38,36 +38,37 @@ def get_args_parser():
                         help='Number of standard local crops')
     parser.add_argument('--local_crop_size', default=96, type=int,
                         help='Size of local crops')
-    parser.add_argument('--num_masks', default=3, type=int,
-                        help='Number of semantic masks')
-    parser.add_argument('--crops_per_mask', default=1, type=int,
-                        help='Number of local crops per mask')
-    
-    # ========== Adversarial mask model parameters ==========
-    parser.add_argument('--use_adversarial_mask_augmentation', default=False, type=utils.bool_flag,
-                    help='Enable adversarial mask-based augmentation (3-channel semantic masks)')
+
+    # ========== Mask model parameters ==========
     parser.add_argument('--mask_model_arch', default='unet', type=str,
                     choices=['unet', 'vit_unet'],
                     help='Mask model architecture: unet (ADIOS) or vit_unet')
     parser.add_argument('--mask_checkpoint', type=str,
                         help='Path to pre-trained mask model checkpoint')
-    
-    # ========== CellViT augmentation parameters ==========
-    parser.add_argument('--use_cellvit_augmentation', default=False, type=utils.bool_flag,
-                        help='Enable CellViT-B based nuclei/background augmentation')
-    parser.add_argument('--cellvit_checkpoint', type=str, default=None,
-                        help='Path to trained CellViT model checkpoint')
-    parser.add_argument('--cellvit_crops_per_channel', default=1, type=int,
-                        help='Number of crops per channel (nuclei/background)')
-    
-    # ========== Random Masking augmentation parameters ==========
-    parser.add_argument('--use_random_mask_augmentation', default=False, type=utils.bool_flag,
-                        help='Enable random rectangular mask-based augmentation')
-    parser.add_argument('--random_num_masks', default=2, type=int,
-                        help='Number of random rectangular masks to generate')
-    parser.add_argument('--random_crops_per_mask', default=1, type=int,
-                        help='Number of local crops per random mask')
-        
+    parser.add_argument('--num_masks', default=3, type=int,
+                        help='Number of semantic mask channels')
+    parser.add_argument('--mask_encoder_dim', default=192, type=int,
+                        help='Encoder dimension for vit_unet mask model architecture')
+
+    # ========== Semantic iBOT parameters ==========
+    parser.add_argument('--use_semantic_ibot', default=False, type=utils.bool_flag,
+                    help='Enable semantic masking in iBOT loss. When True, loads the adversarial '
+                         'mask model specified by --mask_checkpoint and --mask_model_arch, converts '
+                         'its soft masks to token-level binary masks, and adds a semantic iBOT loss '
+                         'term on global crop 1.')
+    parser.add_argument('--use_semantic_prototypes', default=False, type=utils.bool_flag,
+                    help='Enable semantic masking in prototype clustering loss. Requires '
+                         '--use_semantic_ibot=True (semantic masks must be generated). Adds a '
+                         'semantic prototype prediction term using the same semantic token masks.')
+    parser.add_argument('--semantic_ibot_weight', default=1.0, type=float,
+                        help='Weight multiplier for the semantic iBOT loss term')
+    parser.add_argument('--semantic_clustering_weight', default=1.0, type=float,
+                        help='Weight multiplier for the semantic prototype clustering loss term')
+    parser.add_argument('--semantic_masks_per_iteration', default=1, type=int,
+                        help='How many of the num_masks semantic channels to use per iteration. '
+                             '1 = randomly sample one channel each iteration (cheapest). '
+                             'num_masks = use all channels every iteration (most expensive).')
+
     # ========== Loss parameters ==========
     parser.add_argument('--momentum_teacher', default=0.996, type=float,
                         help='EMA momentum for teacher update')
@@ -87,7 +88,7 @@ def get_args_parser():
                         help='Maximum mask ratio for iBOT block masking')
     parser.add_argument('--mask_sample_probability', default=0.5, type=float,
                         help='Fraction of samples in batch to apply masking')
-    
+
     # ========== Patch Prototype Clustering parameters ==========
     parser.add_argument('--use_prototype_clustering', default=True, type=utils.bool_flag,
                     help='Enable patch prototype clustering loss')
@@ -125,7 +126,7 @@ def get_args_parser():
                         help='Layer-wise LR decay rate (1.0 = no decay, 0.9 = typical)')
     parser.add_argument('--grad_checkpointing', default=False, type=utils.bool_flag,
                     help='Enable gradient checkpointing to reduce memory at cost of ~40% speed')
-    
+
     # ========== Dataset and I/O ==========
     parser.add_argument('--dataset_sources', type=str, nargs='+',
                         help='Dataset sources in format NAME:BASE_DIR:INDEX_FILE')
@@ -139,7 +140,7 @@ def get_args_parser():
                         help='Random seed')
     parser.add_argument('--num_workers', default=10, type=int,
                         help='Number of data loading workers')
-    
+
     # ========== Distributed training ==========
     parser.add_argument("--dist_url", default="env://", type=str,
                         help='URL for distributed training setup')
@@ -147,5 +148,5 @@ def get_args_parser():
                         help='Local rank for distributed training')
     parser.add_argument('--gpu', default=0, type=int,
                         help='GPU id to use')
-    
+
     return parser

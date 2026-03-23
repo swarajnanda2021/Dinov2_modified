@@ -26,14 +26,11 @@ from losses import DINOLoss, iBOTPatchLoss, KoLeoLoss, PatchPrototypeLoss
 from data import DINOv2PathologyDataset, ProportionalMultiDatasetWrapper
 from .helpers import (
     load_pretrained_mask_model,
-    load_pretrained_cellvit_model,
     apply_masks_to_images,
-    apply_cellvit_masks,
     extract_local_crops_from_masked,
-    extract_crops_from_cellvit_channel,
     generate_random_token_masks,
     generate_block_masks,
-    generate_random_image_masks,
+    convert_semantic_masks_to_token_masks,
     calculate_total_student_views,
     save_iteration_masks_efficient,
     worker_init_fn,
@@ -44,7 +41,7 @@ from .helpers import (
 def train_dinov2(args):
     """
     Main training function for DINOv2 with iBOT and prototype clustering.
-    
+
     Args:
         args: Training arguments namespace
     """
@@ -54,83 +51,54 @@ def train_dinov2(args):
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
-    
+
     # Augmentation configuration
     augmentation_free_mode = (args.global_views == 0)
-    
+
     print("\n========== Augmentation Configuration ==========")
     print(f"Global views (teacher/student): {args.global_views}")
     print(f"Standard local crops: {args.n_standard_local_crops}")
     print(f"Local crop size: {args.local_crop_size}x{args.local_crop_size}")
 
-    # Adversarial mask augmentation
-    if args.use_adversarial_mask_augmentation:
-        print(f"\nAdversarial Mask Augmentation: ENABLED")
-        print(f"  Number of masks: {args.num_masks}")
-        print(f"  Crops per mask: {args.crops_per_mask}")
+    if args.use_semantic_ibot:
+        print("Semantic iBOT: ENABLED")
+        print(f"  Mask model: {args.mask_model_arch}")
+        print(f"  Semantic channels: {args.num_masks}")
+        print(f"  Channels per iteration: {args.semantic_masks_per_iteration}")
+        print(f"  Semantic iBOT weight: {args.semantic_ibot_weight}")
+        if args.use_semantic_prototypes:
+            print(f"  Semantic prototype loss: ENABLED (weight={args.semantic_clustering_weight})")
     else:
-        print(f"\nAdversarial Mask Augmentation: DISABLED")
-
-    # CellViT augmentation
-    if args.use_cellvit_augmentation:
-        print(f"\nCellViT Augmentation: ENABLED")
-        print(f"  Crops per channel: {args.cellvit_crops_per_channel}")
-    else:
-        print(f"\nCellViT Augmentation: DISABLED")
-
-    if args.use_random_mask_augmentation:
-        print(f"\nRandom Mask Augmentation: ENABLED")
-        print(f"  Number of masks: {args.random_num_masks}")
-        print(f"  Crops per mask: {args.random_crops_per_mask}")
-    else:
-        print(f"\nRandom Mask Augmentation: DISABLED")
+        print("Semantic iBOT: DISABLED")
 
     total_student_views = calculate_total_student_views(args)
     print(f"\nTotal student views: {total_student_views}")
     print("================================================\n")
-    
-    # ============ Load pre-trained adversarial mask model (if enabled) ============
+
+    # ============ Load pre-trained mask model for semantic iBOT (if enabled) ============
     mask_model_frozen = None
-    if args.use_adversarial_mask_augmentation:
+    if args.use_semantic_ibot:
         if args.mask_checkpoint is None:
-            raise ValueError("--use_adversarial_mask_augmentation is True but --mask_checkpoint not provided")
-        
+            raise ValueError("--use_semantic_ibot is True but --mask_checkpoint not provided")
+
         if args.num_masks <= 0:
-            raise ValueError("--use_adversarial_mask_augmentation is True but --num_masks must be > 0")
-        
+            raise ValueError("--use_semantic_ibot is True but --num_masks must be > 0")
+
         mask_model_frozen = load_pretrained_mask_model(
-                                                        args.mask_checkpoint, 
+                                                        args.mask_checkpoint,
                                                         args.num_masks,
                                                         mask_model_arch=args.mask_model_arch,
-                                                        mask_encoder_dim=getattr(args, 'mask_encoder_dim', 192)
+                                                        mask_encoder_dim=args.mask_encoder_dim
                                                     )
         mask_model_frozen = mask_model_frozen.cuda()
         mask_model_frozen.eval()
-        
+
         for param in mask_model_frozen.parameters():
             param.requires_grad = False
-        
-        print(f"Loaded and froze adversarial mask model with {args.num_masks} masks")
-        print(f"  Crops per mask: {args.crops_per_mask}")
+
+        print(f"Loaded and froze mask model with {args.num_masks} semantic channels for semantic iBOT")
     else:
-        print("Adversarial mask augmentation disabled (--use_adversarial_mask_augmentation=False)")
-    
-    # ============ Load pre-trained CellViT model (if enabled) ============
-    cellvit_model_frozen = None
-    if args.use_cellvit_augmentation:
-        if args.cellvit_checkpoint is None:
-            raise ValueError("--use_cellvit_augmentation is True but --cellvit_checkpoint not provided")
-        
-        cellvit_model_frozen = load_pretrained_cellvit_model(args.cellvit_checkpoint, device='cuda')
-        cellvit_model_frozen.eval()
-        
-        for param in cellvit_model_frozen.parameters():
-            param.requires_grad = False
-        
-        print(f"Loaded and froze CellViT model for nuclei/background segmentation")
-        print(f"  CellViT crops per channel: {args.cellvit_crops_per_channel}")
-    else:
-        print("CellViT augmentation disabled (--use_cellvit_augmentation=False)")
+        print("Semantic iBOT disabled (--use_semantic_ibot=False)")
 
     # ============ Create dataset ============
     # Parse dataset sources from args
@@ -145,7 +113,7 @@ def train_dinov2(args):
             'base_dir': base_dir,
             'index_file': index_file
         })
-    
+
     trainset = ProportionalMultiDatasetWrapper(
         dataset_configs=dataset_configs,
         batch_size_per_gpu=args.batch_size_per_gpu,
@@ -239,11 +207,11 @@ def train_dinov2(args):
             bias=True
         )
         prototype_bank = prototype_bank.cuda()
-        
+
         print(f"Created LinearPrototypeBank with {args.num_prototypes} soft prototypes")
     else:
         print("Prototype clustering disabled (--use_prototype_clustering=False)")
-    
+
     student = student.cuda()
     teacher = teacher.cuda()
 
@@ -253,7 +221,7 @@ def train_dinov2(args):
 
     student = setup_ddp_model(student, args, find_unused=True)
     teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
-    
+
     # Wrap prototype bank with DDP
     if args.use_prototype_clustering:
         prototype_bank = nn.parallel.DistributedDataParallel(prototype_bank, device_ids=[args.gpu])
@@ -282,17 +250,17 @@ def train_dinov2(args):
         student_temp=0.1,
         n_iterations=3,
     ).cuda()
-    
+
     dino_koleo_loss = KoLeoLoss().cuda()
-    
+
     patch_prototype_loss = None
     if args.use_prototype_clustering:
         patch_prototype_loss = PatchPrototypeLoss(
             num_prototypes=args.num_prototypes,
-            embed_dim=args.embeddingdim,  
+            embed_dim=args.embeddingdim,
             teacher_temp=args.clustering_teacher_temp,
             student_temp=args.clustering_student_temp,
-        ).cuda()   
+        ).cuda()
 
         print(f"Initialized PatchPrototypeLoss with {args.num_prototypes} prototypes")
     else:
@@ -308,15 +276,15 @@ def train_dinov2(args):
         lr_decay_rate=args.lr_decay_rate,
         num_layers=args.vitdepth,
     )
-    
+
     # Heads get full LR (no layer decay)
     classhead_params = utils.get_params_groups_with_decay_for_heads(student.module.classhead)
     patchhead_params = utils.get_params_groups_with_decay_for_heads(student.module.patchhead)
-    
+
     all_param_groups = backbone_params + classhead_params + patchhead_params
-    
+
     optimizer_student = torch.optim.AdamW(all_param_groups)
-    
+
     # Log layer-wise LR info
     if utils.is_main_process():
         print(f"\n=== Layer-wise LR Decay (rate={args.lr_decay_rate}) ===")
@@ -325,7 +293,7 @@ def train_dinov2(args):
         print(f"  Head groups: {len(classhead_params) + len(patchhead_params)} groups with lr_mult=1.0")
         print(f"  Total param groups: {len(all_param_groups)}")
         print("=" * 50 + "\n")
-    
+
     optimizer_prototypes = None
     if args.use_prototype_clustering:
         optimizer_prototypes = torch.optim.AdamW(
@@ -357,7 +325,7 @@ def train_dinov2(args):
             warmup_iters=args.warmup_iterations,
             start_warmup_value=0
         )
-    
+
     wd_schedule = utils.cosine_scheduler(
         base_value=args.weight_decay,
         final_value=args.weight_decay_end,
@@ -376,7 +344,7 @@ def train_dinov2(args):
 
     # ============ Load checkpoint ============
     to_restore = {"iteration": 0, "dataset_position": 0}
-    
+
     checkpoint_path = os.path.join(args.output_dir, "checkpoint.pth")
     loaded_checkpoint = None
     if os.path.exists(checkpoint_path):
@@ -435,7 +403,7 @@ def train_dinov2(args):
         else:
             print(f"WARNING: Checkpoint found but no RNG state. Re-seeding.")
         utils.fix_random_seeds(args.seed + utils.get_rank())
-    
+
     # ============ Verify checkpoint ============
     if utils.is_main_process() and current_iteration > 0:
         print(f"\n=== Checkpoint Loaded at Iteration {current_iteration} ===")
@@ -445,22 +413,22 @@ def train_dinov2(args):
             print(f"  Weight norm mean: {proto_stats['weight_norm_mean']:.6f}")
             print(f"  Weight norm std: {proto_stats['weight_norm_std']:.6f}")
         print("="*50 + "\n")
-    
+
     metric_logger = utils.IterationMetricLogger(total_iterations=args.total_iterations)
     metric_logger.start_time = time.time()
-    
+
     data_iterator = iter(train_loader)
-    
+
     loader_len = len(train_loader) if len(train_loader) > 0 else 1
     dataset_passes = dataset_position // loader_len
     max_passes = 5
-    
+
     if utils.is_main_process():
         print(f"Starting training at iteration {current_iteration}")
-    
+
     # ============ Training loop ============
     print("Starting training!")
-    
+
     while current_iteration < args.total_iterations:
         # ========== Get batch ==========
         try:
@@ -471,44 +439,35 @@ def train_dinov2(args):
             if dataset_passes >= max_passes:
                 print(f"Reached maximum passes ({max_passes}). Stopping.")
                 break
-                
+
             data_iterator = iter(train_loader)
             batch_data = next(data_iterator)
             dataset_position = dataset_passes * loader_len
             print(f"Starting pass {dataset_passes + 1} at iteration {current_iteration}")
-        
-        # ========== Organize Crops for Sequence Packing ==========
+
+        # === 1. Extract crops from batch ===
         idx = 0
-        
-        # 1. Teacher views (global crops only, no masking)
+
         teacher_global_crops = []
         for i in range(args.global_views):
             teacher_global_crops.append(batch_data[idx].cuda(non_blocking=True))
             idx += 1
-        
-        # 2. Student views - collect ALL crops in order
+
         student_all_crops = []
-        
-        # Add global crops (same as teacher)
         for crop in teacher_global_crops:
             student_all_crops.append(crop)
-        
-        # Add standard local crops
+
         student_local_crops = []
         for i in range(args.n_standard_local_crops):
             crop = batch_data[idx].cuda(non_blocking=True)
             student_local_crops.append(crop)
             student_all_crops.append(crop)
             idx += 1
-        
-        # Use first global crop as input for mask models (adversarial, CellViT, random)
-        # This replaces the old original_images = batch_data[-1] pattern
-        mask_model_input = teacher_global_crops[0]
-        
-        # ========== Generate block masks for iBOT on global crops ==========
+
+        # === 2. Generate block masks for standard iBOT ===
         batch_size = teacher_global_crops[0].shape[0]
         n_patches_h = n_patches_w = 224 // args.patch_size
-        
+
         block_masks_1, masks_weight_1 = generate_block_masks(
             batch_size, n_patches_h, n_patches_w,
             mask_ratio_min=args.mask_ratio_min,
@@ -516,7 +475,7 @@ def train_dinov2(args):
             mask_sample_probability=args.mask_sample_probability,
             device=teacher_global_crops[0].device
         )
-        
+
         block_masks_2, masks_weight_2 = generate_block_masks(
             batch_size, n_patches_h, n_patches_w,
             mask_ratio_min=args.mask_ratio_min,
@@ -524,121 +483,37 @@ def train_dinov2(args):
             mask_sample_probability=args.mask_sample_probability,
             device=teacher_global_crops[0].device
         )
-        
-        # 3. Generate adversarial masked views if configured
-        masked_global_crops = []
-        masked_local_crops_all = []
 
-        if args.use_adversarial_mask_augmentation and mask_model_frozen is not None:
+        # === 3. Generate semantic token masks (if enabled) ===
+        semantic_token_masks = None
+        semantic_masks_weights = None
+        selected_channels = None
+
+        if args.use_semantic_ibot and mask_model_frozen is not None:
             with torch.no_grad():
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
-                    mask_output = mask_model_frozen(mask_model_input)
-                    masks = mask_output['masks'].float()  # Cast back to float32 for downstream ops
-            
-            # Apply masks to create masked global views
-            masked_images = apply_masks_to_images(mask_model_input, masks)
-            masked_global_crops = masked_images
-            
-            # Add masked global crops to student views
-            student_all_crops.extend(masked_global_crops)
-            
-            # Extract local crops from masked images
-            if args.crops_per_mask > 0:
-                for masked_img in masked_images:
-                    crops = extract_local_crops_from_masked(
-                        masked_img, 
-                        n_crops=args.crops_per_mask,
-                        crop_size=args.local_crop_size
-                    )
-                    masked_local_crops_all.extend(crops)
-                
-                # Add masked local crops to student views
-                student_all_crops.extend(masked_local_crops_all)
+                    mask_output = mask_model_frozen(teacher_global_crops[0])
+                    soft_masks = mask_output['masks'].float()  # [B, 3, H, W]
 
-        # 4. Generate CellViT (Nuclei/Background) masks and masked views if configured
-        cellvit_nuclei_global = None
-        cellvit_background_global = None
-        cellvit_nuclei_crops = []
-        cellvit_background_crops = []
-
-        if args.use_cellvit_augmentation and cellvit_model_frozen is not None:
-            with torch.no_grad():
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
-                    cellvit_output = cellvit_model_frozen(mask_model_input)
-                    cellvit_masks = cellvit_output['masks'].float()  # [B, 2, H, W]
-            
-            del cellvit_output
-            
-            # Apply masks to create nuclei and background views
-            nuclei_images, background_images = apply_cellvit_masks(mask_model_input, cellvit_masks)
-            del cellvit_masks
-            
-            # Global views (224x224) - store these BEFORE deleting
-            cellvit_nuclei_global = nuclei_images.clone()
-            cellvit_background_global = background_images.clone()
-            
-            # Add global views to student crops
-            student_all_crops.append(cellvit_nuclei_global)
-            student_all_crops.append(cellvit_background_global)
-            
-            # Extract local crops (96x96) from each channel - do this BEFORE deleting
-            if args.cellvit_crops_per_channel > 0:
-                nuclei_crops = extract_crops_from_cellvit_channel(
-                    nuclei_images,
-                    n_crops=args.cellvit_crops_per_channel,
-                    crop_size=args.local_crop_size
-                )
-                background_crops = extract_crops_from_cellvit_channel(
-                    background_images,
-                    n_crops=args.cellvit_crops_per_channel,
-                    crop_size=args.local_crop_size
-                )
-                
-                # Add to student views
-                cellvit_nuclei_crops = nuclei_crops
-                cellvit_background_crops = background_crops
-                student_all_crops.extend(nuclei_crops)
-                student_all_crops.extend(background_crops)
-                
-                del nuclei_crops, background_crops
-            
-            # NOW delete nuclei_images and background_images after we're done with them
-            del nuclei_images, background_images
-        
-        # 5. Generate Random Rectangular Masks if configured
-        random_masked_global_crops = []
-        random_masked_local_crops = []
-        
-        if args.use_random_mask_augmentation:
-            # Generate random rectangular masks
-            random_masks = generate_random_image_masks(
-                batch_size=mask_model_input.shape[0],
-                num_masks=args.random_num_masks,
-                height=224,
-                width=224,
-                device=mask_model_input.device,
+            # Convert to token-level masks
+            all_token_masks, all_masks_weights = convert_semantic_masks_to_token_masks(
+                soft_masks, patch_size=args.patch_size
             )
-            
-            # Apply masks to create masked global views
-            random_masked_images = apply_masks_to_images(mask_model_input, random_masks)
-            random_masked_global_crops = random_masked_images
-            
-            # Add masked global crops to student views
-            student_all_crops.extend(random_masked_global_crops)
-            
-            # Extract local crops from masked images
-            if args.random_crops_per_mask > 0:
-                for masked_img in random_masked_images:
-                    crops = extract_local_crops_from_masked(
-                        masked_img,
-                        n_crops=args.random_crops_per_mask,
-                        crop_size=args.local_crop_size
-                    )
-                    random_masked_local_crops.extend(crops)
-                
-                # Add masked local crops to student views
-                student_all_crops.extend(random_masked_local_crops)
-        
+            # all_token_masks: [B, num_masks, N] boolean
+            # all_masks_weights: [B, num_masks] float
+
+            # Sample channels for this iteration
+            if args.semantic_masks_per_iteration >= args.num_masks:
+                selected_channels = list(range(args.num_masks))
+            else:
+                selected_channels = random.sample(
+                    range(args.num_masks), args.semantic_masks_per_iteration
+                )
+
+            semantic_token_masks = [all_token_masks[:, c, :] for c in selected_channels]
+            semantic_masks_weights = [all_masks_weights[:, c] for c in selected_channels]
+            # Each element: [B, N] boolean mask, [B] weight
+
         # ========== Debug: Print shapes on first iteration ==========
         if current_iteration == 0 and utils.is_main_process():
             print("\n=== Crop Organization (First Iteration) ===")
@@ -648,39 +523,25 @@ def train_dinov2(args):
             print(f"Student total crops: {len(student_all_crops)} crops")
             for i, crop in enumerate(student_all_crops):
                 print(f"  Student crop {i}: {crop.shape}")
-            print(f"Mask model input: {mask_model_input.shape}")
             print(f"Block masks 1: {block_masks_1.shape}, masks_weight_1: {masks_weight_1.shape}")
             print(f"Block masks 2: {block_masks_2.shape}, masks_weight_2: {masks_weight_2.shape}")
-            
-            # Adversarial mask augmentation debug info
-            if args.use_adversarial_mask_augmentation:
-                print(f"\nAdversarial Mask Augmentation:")
-                print(f"  Masked global crops: {len(masked_global_crops)}")
-                print(f"  Masked local crops: {len(masked_local_crops_all)}")
-            
-            # CellViT augmentation debug info
-            if args.use_cellvit_augmentation:
-                print(f"\nCellViT Augmentation:")
-                print(f"  Nuclei global: {cellvit_nuclei_global.shape if cellvit_nuclei_global is not None else 'None'}")
-                print(f"  Background global: {cellvit_background_global.shape if cellvit_background_global is not None else 'None'}")
-                print(f"  Nuclei crops: {len(cellvit_nuclei_crops)} x {cellvit_nuclei_crops[0].shape if cellvit_nuclei_crops else 'None'}")
-                print(f"  Background crops: {len(cellvit_background_crops)} x {cellvit_background_crops[0].shape if cellvit_background_crops else 'None'}")
-            
-            # Random mask augmentation debug info
-            if args.use_random_mask_augmentation:
-                print(f"\nRandom Mask Augmentation:")
-                print(f"  Random masked global crops: {len(random_masked_global_crops)}")
-                print(f"  Random masked local crops: {len(random_masked_local_crops)}")
-            
+
+            if args.use_semantic_ibot and semantic_token_masks is not None:
+                print(f"\nSemantic iBOT:")
+                print(f"  Selected channels: {selected_channels}")
+                for ch_idx, (sm, sw) in enumerate(zip(semantic_token_masks, semantic_masks_weights)):
+                    n_masked = sm.sum(dim=1).float().mean().item()
+                    print(f"  Channel {selected_channels[ch_idx]}: mask shape {sm.shape}, avg masked patches: {n_masked:.1f}")
+
             print("="*50 + "\n")
-        
+
         # ========== Update learning rates ==========
         for i, param_group in enumerate(optimizer_student.param_groups):
             # Apply layer-wise LR multiplier
             base_lr = student_lr_schedule[current_iteration]
             lr_mult = param_group.get("lr_multiplier", 1.0)
             param_group["lr"] = base_lr * lr_mult
-            
+
             # Apply WD schedule to regularized groups
             wd_mult = param_group.get("wd_multiplier", 1.0)
             if wd_mult > 0:
@@ -693,57 +554,52 @@ def train_dinov2(args):
         optimizer_student.zero_grad()
         if args.use_prototype_clustering and optimizer_prototypes is not None:
             optimizer_prototypes.zero_grad()
-                
+
         # ========== Forward passes and loss computation ==========
         with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
             # ========== DINO Loss with Sequence Packing (Unified Forward) ==========
-            
+
             # Build mask list for student: masks for global crops, None for all others
-            num_other_crops = len(student_all_crops) - 2  # Everything except the 2 global crops
-            student_masks = [block_masks_1, block_masks_2] + [None] * num_other_crops
-            
+            student_masks = [block_masks_1, block_masks_2] + [None] * len(student_local_crops)
+
             # Teacher forward (global crops only, NO masking - provides unmasked targets)
             with torch.no_grad():
                 teacher_output = teacher(teacher_global_crops, token_masks=[None, None], mode='dino')
                 teacher_cls_outputs = teacher_output['cls_outputs']
-                
+
                 # Extract patch tokens for iBOT (teacher provides unmasked targets)
                 teacher_patch_tokens_g1 = teacher_output['features_list'][0]['patchtokens']  # [B, N, D]
                 teacher_patch_tokens_g2 = teacher_output['features_list'][1]['patchtokens']  # [B, N, D]
-            
-            # Student forward (all crops, masks on global crops only)
+
+            # Student forward (all 8 crops, masks on global crops only)
             student_output = student(student_all_crops, token_masks=student_masks, mode='dino')
             student_cls_outputs = student_output['cls_outputs']
-            
+
             # Extract patch tokens for iBOT (student has mask_token at masked positions)
             student_patch_tokens_g1 = student_output['features_list'][0]['patchtokens']  # [B, N, D]
             student_patch_tokens_g2 = student_output['features_list'][1]['patchtokens']  # [B, N, D]
-            
-            # Compute DINO loss
+
+            # Compute DINO loss (8 views, unchanged)
             dino_class_loss_val = dino_class_loss(
                 student_cls_outputs,
                 teacher_cls_outputs,
                 current_iteration
             )
-            
-            # ========== KoLeo Loss on Global CLS Tokens ==========
-            num_global_total = args.global_views
-            if args.use_adversarial_mask_augmentation:
-                num_global_total += args.num_masks
-            global_features_list = student_output['features_list'][:num_global_total]
-            global_cls_tokens = [feat_dict['clstoken'] for feat_dict in global_features_list]
-            
+
+            # ========== KoLeo Loss on Global CLS Tokens Only ==========
+            global_cls_tokens = [student_output['features_list'][i]['clstoken'] for i in range(args.global_views)]
+
             koleo_loss_val = torch.tensor(0.0).cuda()
             if len(global_cls_tokens) > 0:
                 koleo_loss_val = sum(dino_koleo_loss(token) for token in global_cls_tokens) / len(global_cls_tokens)
-            
+
             # ========== iBOT Loss (Sequential per crop to halve peak memory) ==========
             current_teacher_temp_ibot = dino_class_loss.teacher_temp_schedule(current_iteration)
-            
+
             # Process global crop 1
             teacher_patch_out_g1 = teacher.module.patchhead(teacher_patch_tokens_g1)  # [B, N, out_dim]
             student_patch_out_g1 = student.module.patchhead(student_patch_tokens_g1)  # [B, N, out_dim]
-            
+
             ibot_loss_g1 = ibot_patch_loss.forward_masked(
                 student_patch_out_g1,
                 teacher_patch_out_g1,
@@ -751,14 +607,14 @@ def train_dinov2(args):
                 masks_weight=masks_weight_1,
                 teacher_temp=current_teacher_temp_ibot
             )
-            
+
             # Free crop 1 patchhead outputs before allocating crop 2
             del teacher_patch_out_g1, student_patch_out_g1
-            
+
             # Process global crop 2
             teacher_patch_out_g2 = teacher.module.patchhead(teacher_patch_tokens_g2)  # [B, N, out_dim]
             student_patch_out_g2 = student.module.patchhead(student_patch_tokens_g2)  # [B, N, out_dim]
-            
+
             ibot_loss_g2 = ibot_patch_loss.forward_masked(
                 student_patch_out_g2,
                 teacher_patch_out_g2,
@@ -766,16 +622,16 @@ def train_dinov2(args):
                 masks_weight=masks_weight_2,
                 teacher_temp=current_teacher_temp_ibot
             )
-            
+
             del teacher_patch_out_g2, student_patch_out_g2
-            
+
             # Average: mathematically identical to computing on concatenated tensors
             ibot_loss_val = (ibot_loss_g1 + ibot_loss_g2) / 2.0
 
         # ========== Patch Prototype Clustering (Sequential per crop) ==========
         if args.use_prototype_clustering:
             current_teacher_temp = dino_class_loss.teacher_temp_schedule(current_iteration)
-            
+
             with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
                 # Process global crop 1
                 clust_loss_g1, proto_loss_g1, koleo_proto_g1 = patch_prototype_loss(
@@ -787,7 +643,7 @@ def train_dinov2(args):
                     current_teacher_temp,
                     masks_weight=masks_weight_1  # [B]
                 )
-                
+
                 # Process global crop 2
                 clust_loss_g2, proto_loss_g2, koleo_proto_g2 = patch_prototype_loss(
                     teacher_patch_tokens_g2,  # [B, N, D]
@@ -798,11 +654,11 @@ def train_dinov2(args):
                     current_teacher_temp,
                     masks_weight=masks_weight_2  # [B]
                 )
-                
+
                 clustering_loss = (clust_loss_g1 + clust_loss_g2) / 2.0
                 teacher_proto_loss = (proto_loss_g1 + proto_loss_g2) / 2.0
                 koleo_proto_loss = (koleo_proto_g1 + koleo_proto_g2) / 2.0
-            
+
             prototype_loss = teacher_proto_loss + koleo_proto_loss
         else:
             clustering_loss = torch.tensor(0.0).cuda()
@@ -810,55 +666,122 @@ def train_dinov2(args):
             koleo_proto_loss = torch.tensor(0.0).cuda()
             prototype_loss = torch.tensor(0.0).cuda()
 
+        # ========== Semantic iBOT + Semantic Prototype Loss ==========
+        semantic_ibot_loss_val = torch.tensor(0.0, device='cuda')
+        semantic_clustering_loss = torch.tensor(0.0, device='cuda')
+        semantic_teacher_proto_loss = torch.tensor(0.0, device='cuda')
+        semantic_koleo_proto_loss = torch.tensor(0.0, device='cuda')
+
+        if args.use_semantic_ibot and semantic_token_masks is not None:
+            current_teacher_temp_ibot = dino_class_loss.teacher_temp_schedule(current_iteration)
+
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+                # Pre-compute teacher patchhead output once
+                teacher_patch_out_g1 = teacher.module.patchhead(teacher_patch_tokens_g1)
+
+                ibot_accum = 0.0
+                clust_accum = 0.0
+                proto_accum = 0.0
+                koleo_accum = 0.0
+
+                for sem_mask, sem_weight in zip(semantic_token_masks, semantic_masks_weights):
+                    # Single backbone forward
+                    sem_backbone_out = student.module.backbone(
+                        teacher_global_crops[0],
+                        token_masks=sem_mask
+                    )
+                    sem_patch_tokens_raw = sem_backbone_out['patchtokens']  # [B, N, D]
+
+                    # iBOT path: project through patchhead, compute loss
+                    sem_patch_tokens_proj = student.module.patchhead(sem_patch_tokens_raw)
+                    loss_ibot = ibot_patch_loss.forward_masked(
+                        sem_patch_tokens_proj, teacher_patch_out_g1,
+                        sem_mask, masks_weight=sem_weight,
+                        teacher_temp=current_teacher_temp_ibot
+                    )
+                    ibot_accum += loss_ibot
+
+                    # Prototype path (if enabled)
+                    if args.use_semantic_prototypes and patch_prototype_loss is not None:
+                        current_teacher_temp = dino_class_loss.teacher_temp_schedule(current_iteration)
+                        clust_ch, proto_ch, koleo_ch = patch_prototype_loss(
+                            teacher_patch_tokens_g1, sem_patch_tokens_raw,
+                            sem_mask, prototype_bank,
+                            current_iteration, current_teacher_temp,
+                            masks_weight=sem_weight
+                        )
+                        clust_accum += clust_ch
+                        proto_accum += proto_ch
+                        koleo_accum += koleo_ch
+
+                    del sem_backbone_out, sem_patch_tokens_raw, sem_patch_tokens_proj
+
+                n_ch = len(semantic_token_masks)
+                semantic_ibot_loss_val = ibot_accum / n_ch
+                if args.use_semantic_prototypes:
+                    semantic_clustering_loss = clust_accum / n_ch
+                    semantic_teacher_proto_loss = proto_accum / n_ch
+                    semantic_koleo_proto_loss = koleo_accum / n_ch
+
+                del teacher_patch_out_g1
+
         # ========== Compute Total Losses ==========
-        # Student loss: DINO + KoLeo + iBOT + Clustering prediction
+        # Student loss: DINO + KoLeo + iBOT + Clustering prediction + Semantic iBOT + Semantic Clustering
         student_loss = (
             dino_class_loss_val +
             args.koleo_loss_weight * koleo_loss_val +
             args.ibot_loss_weight * ibot_loss_val +
-            args.clustering_weight * clustering_loss
+            args.clustering_weight * clustering_loss +
+            args.semantic_ibot_weight * semantic_ibot_loss_val +
+            args.semantic_clustering_weight * semantic_clustering_loss
         )
+
+        # Prototype bank loss (separate optimizer)
+        if args.use_prototype_clustering:
+            prototype_loss = teacher_proto_loss + koleo_proto_loss
+            if args.use_semantic_prototypes:
+                prototype_loss = prototype_loss + semantic_teacher_proto_loss + semantic_koleo_proto_loss
 
         # ========== Backward and optimizer steps ==========
         if fp16_scaler is None:
             # ===== NON-MIXED PRECISION =====
-            
+
             # 1. Prototype backward (if enabled)
             if args.use_prototype_clustering and optimizer_prototypes is not None:
                 optimizer_prototypes.zero_grad()
                 prototype_loss.backward()
                 optimizer_prototypes.step()
-            
+
             # 2. Student backward
             optimizer_student.zero_grad()
             student_loss.backward()
-            
+
             if args.clip_grad:
                 utils.clip_gradients(student, args.clip_grad)
             utils.cancel_gradients_last_layer(current_iteration, student.module.classhead, args.freeze_last_layer_iters)
             utils.cancel_gradients_last_layer(current_iteration, student.module.patchhead, args.freeze_last_layer_iters)
-            
+
             optimizer_student.step()
-            
+
         else:
             # ===== MIXED PRECISION =====
-            
+
             # 1. Prototype backward (NO scaler - uses bfloat16 directly)
             if args.use_prototype_clustering and optimizer_prototypes is not None:
                 optimizer_prototypes.zero_grad()
                 prototype_loss.backward()
                 optimizer_prototypes.step()
-            
+
             # 2. Student backward (WITH scaler)
             optimizer_student.zero_grad()
             fp16_scaler.scale(student_loss).backward()
             fp16_scaler.unscale_(optimizer_student)
-            
+
             if args.clip_grad:
                 utils.clip_gradients(student, args.clip_grad)
             utils.cancel_gradients_last_layer(current_iteration, student.module.classhead, args.freeze_last_layer_iters)
             utils.cancel_gradients_last_layer(current_iteration, student.module.patchhead, args.freeze_last_layer_iters)
-            
+
             fp16_scaler.step(optimizer_student)
             fp16_scaler.update()
 
@@ -866,74 +789,58 @@ def train_dinov2(args):
         # ========== EMA update teacher ==========
         with torch.no_grad():
             m = momentum_schedule[current_iteration]
-            
+
             for param_q, param_k in zip(student.module.backbone.parameters(),
                                     teacher_without_ddp.backbone.parameters()):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
-            
+
             for param_q, param_k in zip(student.module.classhead.parameters(),
                                     teacher_without_ddp.classhead.parameters()):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
-            
+
             for param_q, param_k in zip(student.module.patchhead.parameters(),
                                     teacher_without_ddp.patchhead.parameters()):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
-        
+
         # ========== Clean cache periodically ==========
         if current_iteration % 100 == 0:
             torch.cuda.empty_cache()
-        
+
         # ========== Visualize masks ==========
         if current_iteration % args.visualization_freq == 0 and current_iteration < 5000:
-            # Visualize adversarial masks
-            if args.use_adversarial_mask_augmentation and mask_model_frozen is not None:
-                sample_image = mask_model_input[:1]
+            # Visualize semantic masks (soft pixel-level and token-level)
+            if args.use_semantic_ibot and mask_model_frozen is not None:
+                sample_image = teacher_global_crops[0][:1]
                 with torch.no_grad():
                     with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
                         vis_masks = mask_model_frozen(sample_image)['masks']
+                    # Save soft pixel-level masks
                     save_iteration_masks_efficient(
                         sample_image,
                         vis_masks,
                         current_iteration,
-                        os.path.join(args.output_dir, 'adversarial_mask_visualizations'),
+                        os.path.join(args.output_dir, 'semantic_mask_visualizations'),
                         num_samples=1
                     )
-            
-            # Visualize CellViT masks
-            if args.use_cellvit_augmentation and cellvit_model_frozen is not None:
-                sample_image = mask_model_input[:1]
-                with torch.no_grad():
-                    
-                    with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
-                        cellvit_vis = cellvit_model_frozen(sample_image)
-                        cellvit_vis_masks = cellvit_vis['masks']  # [1, 2, H, W]
-
+                    # Save token-level binary masks as upsampled images
+                    vis_token_masks, _ = convert_semantic_masks_to_token_masks(
+                        vis_masks.float(), patch_size=args.patch_size
+                    )
+                    # vis_token_masks: [1, num_masks, N] -> reshape to [1, num_masks, h, w]
+                    h_patches = w_patches = 224 // args.patch_size
+                    vis_token_grid = vis_token_masks.float().reshape(1, args.num_masks, h_patches, w_patches)
+                    # Upsample to image size for visualization
+                    vis_token_upsampled = F.interpolate(
+                        vis_token_grid, size=(224, 224), mode='nearest'
+                    )
                     save_iteration_masks_efficient(
                         sample_image,
-                        cellvit_vis_masks,
+                        vis_token_upsampled,
                         current_iteration,
-                        os.path.join(args.output_dir, 'cellvit_mask_visualizations'),
+                        os.path.join(args.output_dir, 'semantic_token_mask_visualizations'),
                         num_samples=1
                     )
-            
-            # Visualize Random masks
-            if args.use_random_mask_augmentation:
-                sample_image = mask_model_input[:1]
-                random_vis_masks = generate_random_image_masks(
-                    batch_size=1,
-                    num_masks=args.random_num_masks,
-                    height=224,
-                    width=224,
-                    device=sample_image.device,
-                )
-                save_iteration_masks_efficient(
-                    sample_image,
-                    random_vis_masks,
-                    current_iteration,
-                    os.path.join(args.output_dir, 'random_mask_visualizations'),
-                    num_samples=1
-                )
-        
+
         # ========== Logging ==========
         metric_logger.update(student_loss=student_loss.item())
         metric_logger.update(dino_class_loss=dino_class_loss_val.item())
@@ -946,24 +853,31 @@ def train_dinov2(args):
             metric_logger.update(teacher_proto_arrangement_loss=teacher_proto_loss.item())
             metric_logger.update(clustering_entropy=patch_prototype_loss.last_entropy)
 
+        if args.use_semantic_ibot:
+            metric_logger.update(semantic_ibot_loss=semantic_ibot_loss_val.item())
+        if args.use_semantic_prototypes:
+            metric_logger.update(semantic_clustering_loss=semantic_clustering_loss.item())
+            metric_logger.update(semantic_proto_arrangement=semantic_teacher_proto_loss.item())
+            metric_logger.update(semantic_proto_koleo=semantic_koleo_proto_loss.item())
+
         metric_logger.update(lr=optimizer_student.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer_student.param_groups[0]["weight_decay"])
-        
+
         if utils.is_main_process() and current_iteration % 10 == 0:
             elapsed = time.time() - metric_logger.start_time
             progress = current_iteration / args.total_iterations
             eta_seconds = elapsed / max(progress, 1e-8) * (1 - progress)
             eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
-            
+
             if torch.cuda.is_available():
                 memory = torch.cuda.max_memory_allocated() / (1024 * 1024)
             else:
                 memory = 0
-            
+
             metric_logger.synchronize_between_processes()
             print(f"It {current_iteration}/{args.total_iterations/1000:.0f}k (ETA {eta_string}), "
                 f"Progress: {progress*100:.1f}%, max mem: {memory/1000:.1f} GB : {metric_logger}")
-        
+
         # ========== Write to log file ==========
         if utils.is_main_process() and current_iteration % 100 == 0:
             log_stats = {
@@ -974,21 +888,19 @@ def train_dinov2(args):
                 'augmentation_config': {
                     'global_views': args.global_views,
                     'n_standard_local_crops': args.n_standard_local_crops,
-                    'adversarial_mask_augmentation': args.use_adversarial_mask_augmentation,
-                    'num_masks': args.num_masks if args.use_adversarial_mask_augmentation else 0,
-                    'crops_per_mask': args.crops_per_mask if args.use_adversarial_mask_augmentation else 0,
-                    'cellvit_augmentation': args.use_cellvit_augmentation,
-                    'cellvit_crops_per_channel': args.cellvit_crops_per_channel if args.use_cellvit_augmentation else 0,
-                    'random_mask_augmentation': args.use_random_mask_augmentation,
-                    'random_num_masks': args.random_num_masks if args.use_random_mask_augmentation else 0,
-                    'random_crops_per_mask': args.random_crops_per_mask if args.use_random_mask_augmentation else 0,
+                    'use_semantic_ibot': args.use_semantic_ibot,
+                    'use_semantic_prototypes': args.use_semantic_prototypes,
+                    'semantic_ibot_weight': args.semantic_ibot_weight if args.use_semantic_ibot else 0,
+                    'semantic_clustering_weight': args.semantic_clustering_weight if args.use_semantic_prototypes else 0,
+                    'semantic_masks_per_iteration': args.semantic_masks_per_iteration if args.use_semantic_ibot else 0,
+                    'num_masks': args.num_masks if args.use_semantic_ibot else 0,
                     'total_student_views': total_student_views,
                 }
             }
-            
+
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
-        
+
         # ========== Save checkpoints ==========
         if current_iteration % args.save_checkpoint_freq == 0:
             save_dict = {
@@ -1016,16 +928,16 @@ def train_dinov2(args):
 
             if fp16_scaler is not None:
                 save_dict['fp16_scaler'] = fp16_scaler.state_dict()
-            
+
             utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint_iter_{current_iteration:08d}.pth'))
             utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
-        
+
         current_iteration += 1
 
         # Synchronize else might time out
         if current_iteration % 100 == 0:
             if dist.is_initialized():
-                dist.barrier() 
+                dist.barrier()
 
 
     # ========== Final checkpoint and log ==========
@@ -1035,7 +947,7 @@ def train_dinov2(args):
             'iteration': args.total_iterations,
             'training_completed': True,
         }
-        
+
         with (Path(args.output_dir) / "log.txt").open("a") as f:
             f.write(json.dumps(final_log_stats) + "\n")
 
