@@ -91,6 +91,53 @@ class iBOTPatchLoss(nn.Module):
         
         return weighted_loss
 
+    def forward_gathered(
+        self,
+        student_proj,
+        teacher_proj,
+        weights,
+        batch_size,
+        teacher_temp=0.07
+    ):
+        """
+        Compute iBOT loss on pre-gathered, pre-projected masked tokens.
+        Use this when tokens have already been gathered and projected through
+        the patchhead externally (to avoid projecting all B*N tokens).
+        
+        Mathematically identical to forward_masked — just skips the internal
+        gather step since caller already did it.
+        
+        Args:
+            student_proj: [M, out_dim] student patchhead output for masked tokens
+            teacher_proj: [M, out_dim] teacher patchhead output for masked tokens
+            weights: [M] per-token weights (typically 1/num_masked_per_sample)
+            batch_size: int, B, for loss normalization
+            teacher_temp: Teacher temperature for Sinkhorn-Knopp
+            
+        Returns:
+            Loss value (scalar)
+        """
+        M = student_proj.shape[0]
+        device = student_proj.device
+        dtype = student_proj.dtype
+        
+        if M == 0:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+        
+        # Sinkhorn-Knopp normalization on teacher
+        teacher_normalized = self.sinkhorn_knopp_normalization(teacher_proj, teacher_temp)
+        
+        # Student log probabilities
+        student_log_probs = F.log_softmax(student_proj / self.student_temp, dim=-1)
+        
+        # Cross-entropy loss per token
+        loss_per_token = -torch.sum(teacher_normalized.detach() * student_log_probs, dim=-1)  # [M]
+        
+        # Weighted mean: sum(loss * weight) / B
+        weighted_loss = (loss_per_token * weights).sum() / batch_size
+        
+        return weighted_loss
+
     @torch.no_grad()
     def sinkhorn_knopp_normalization(self, teacher_output, teacher_temp, n_iterations=None):
         """Apply Sinkhorn-Knopp normalization to teacher outputs."""

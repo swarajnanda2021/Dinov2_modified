@@ -38,6 +38,43 @@ from .helpers import (
 )
 
 
+def _gather_and_compute_weights(patch_tokens, mask, masks_weight=None):
+    """
+    Gather masked tokens from [B, N, D] using boolean mask [B, N].
+    Returns gathered tokens [M, D], per-token weights [M], and batch size B.
+    
+    Args:
+        patch_tokens: [B, N, D] patch tokens
+        mask: [B, N] boolean mask (True = masked)
+        masks_weight: Optional [B] per-sample weights. If None, uses 1/num_masked.
+        
+    Returns:
+        gathered: [M, D] masked tokens
+        weights: [M] per-token weights
+        B: batch size
+    """
+    B, N, D = patch_tokens.shape
+    
+    mask_flat = mask.reshape(-1)  # [B*N]
+    masked_indices = mask_flat.nonzero(as_tuple=True)[0]  # [M]
+    M = masked_indices.numel()
+    
+    if M == 0:
+        return None, None, B
+    
+    gathered = patch_tokens.reshape(B * N, D)[masked_indices]  # [M, D]
+    
+    # Per-token weights
+    sample_idx = masked_indices // N  # [M]
+    if masks_weight is not None:
+        weights = masks_weight[sample_idx]  # [M]
+    else:
+        num_masked_per_sample = mask.sum(dim=1).float().clamp(min=1.0)  # [B]
+        weights = 1.0 / num_masked_per_sample[sample_idx]  # [M]
+    
+    return gathered, weights, B
+
+
 def train_dinov2(args):
     """
     Main training function for DINOv2 with iBOT and prototype clustering.
@@ -101,7 +138,6 @@ def train_dinov2(args):
         print("Semantic iBOT disabled (--use_semantic_ibot=False)")
 
     # ============ Create dataset ============
-    # Parse dataset sources from args
     dataset_configs = []
     for source in args.dataset_sources:
         parts = source.split(':')
@@ -222,7 +258,6 @@ def train_dinov2(args):
     student = setup_ddp_model(student, args, find_unused=True)
     teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
 
-    # Wrap prototype bank with DDP
     if args.use_prototype_clustering:
         prototype_bank = nn.parallel.DistributedDataParallel(prototype_bank, device_ids=[args.gpu])
 
@@ -270,14 +305,12 @@ def train_dinov2(args):
     fp16_scaler = torch.cuda.amp.GradScaler() if args.use_fp16 else None
 
     # ============ Create optimizers ============
-    # Get parameter groups with layer-wise LR decay for backbone
     backbone_params = utils.get_params_groups_with_layer_decay(
         student.module.backbone,
         lr_decay_rate=args.lr_decay_rate,
         num_layers=args.vitdepth,
     )
 
-    # Heads get full LR (no layer decay)
     classhead_params = utils.get_params_groups_with_decay_for_heads(student.module.classhead)
     patchhead_params = utils.get_params_groups_with_decay_for_heads(student.module.patchhead)
 
@@ -285,7 +318,6 @@ def train_dinov2(args):
 
     optimizer_student = torch.optim.AdamW(all_param_groups)
 
-    # Log layer-wise LR info
     if utils.is_main_process():
         print(f"\n=== Layer-wise LR Decay (rate={args.lr_decay_rate}) ===")
         for i, pg in enumerate(backbone_params):
@@ -304,8 +336,6 @@ def train_dinov2(args):
         print(f"Created optimizers (including prototype optimizer)")
     else:
         print(f"Created optimizer (student only)")
-
-    print(f"Created optimizers")
 
     # ============ Create schedulers ============
     student_lr_schedule = utils.cosine_scheduler(
@@ -355,7 +385,6 @@ def train_dinov2(args):
             print(f"Could not pre-load checkpoint. Starting fresh. Error: {e}")
             loaded_checkpoint = None
 
-    # Build checkpoint loading kwargs conditionally
     checkpoint_kwargs = {
         'student': student,
         'teacher': teacher,
@@ -364,7 +393,6 @@ def train_dinov2(args):
         'dino_class_loss': dino_class_loss,
     }
 
-    # Add prototype-related modules only if enabled
     if args.use_prototype_clustering:
         checkpoint_kwargs['prototype_bank'] = prototype_bank
         checkpoint_kwargs['optimizer_prototypes'] = optimizer_prototypes
@@ -493,16 +521,12 @@ def train_dinov2(args):
             with torch.no_grad():
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
                     mask_output = mask_model_frozen(teacher_global_crops[0])
-                    soft_masks = mask_output['masks'].float()  # [B, 3, H, W]
+                    soft_masks = mask_output['masks'].float()
 
-            # Convert to token-level masks
             all_token_masks, all_masks_weights = convert_semantic_masks_to_token_masks(
                 soft_masks, patch_size=args.patch_size
             )
-            # all_token_masks: [B, num_masks, N] boolean
-            # all_masks_weights: [B, num_masks] float
 
-            # Sample channels for this iteration
             if args.semantic_masks_per_iteration >= args.num_masks:
                 selected_channels = list(range(args.num_masks))
             else:
@@ -512,7 +536,6 @@ def train_dinov2(args):
 
             semantic_token_masks = [all_token_masks[:, c, :] for c in selected_channels]
             semantic_masks_weights = [all_masks_weights[:, c] for c in selected_channels]
-            # Each element: [B, N] boolean mask, [B] weight
 
         # ========== Debug: Print shapes on first iteration ==========
         if current_iteration == 0 and utils.is_main_process():
@@ -537,12 +560,10 @@ def train_dinov2(args):
 
         # ========== Update learning rates ==========
         for i, param_group in enumerate(optimizer_student.param_groups):
-            # Apply layer-wise LR multiplier
             base_lr = student_lr_schedule[current_iteration]
             lr_mult = param_group.get("lr_multiplier", 1.0)
             param_group["lr"] = base_lr * lr_mult
 
-            # Apply WD schedule to regularized groups
             wd_mult = param_group.get("wd_multiplier", 1.0)
             if wd_mult > 0:
                 param_group["weight_decay"] = wd_schedule[current_iteration] * wd_mult
@@ -557,115 +578,135 @@ def train_dinov2(args):
 
         # ========== Forward passes and loss computation ==========
         with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
-            # ========== DINO Loss with Sequence Packing (Unified Forward) ==========
+            # ========== DINO Loss with Sequence Packing ==========
 
-            # Build mask list for student: masks for global crops, None for all others
             student_masks = [block_masks_1, block_masks_2] + [None] * len(student_local_crops)
 
-            # Teacher forward (global crops only, NO masking - provides unmasked targets)
+            # Teacher forward (unmasked targets)
             with torch.no_grad():
                 teacher_output = teacher(teacher_global_crops, token_masks=[None, None], mode='dino')
                 teacher_cls_outputs = teacher_output['cls_outputs']
+                teacher_patch_tokens_g1 = teacher_output['features_list'][0]['patchtokens']
+                teacher_patch_tokens_g2 = teacher_output['features_list'][1]['patchtokens']
 
-                # Extract patch tokens for iBOT (teacher provides unmasked targets)
-                teacher_patch_tokens_g1 = teacher_output['features_list'][0]['patchtokens']  # [B, N, D]
-                teacher_patch_tokens_g2 = teacher_output['features_list'][1]['patchtokens']  # [B, N, D]
-
-            # Student forward (all crops, masks on global crops only)
+            # Student forward (all crops, masks on global crops)
             student_output = student(student_all_crops, token_masks=student_masks, mode='dino')
             student_cls_outputs = student_output['cls_outputs']
+            student_patch_tokens_g1 = student_output['features_list'][0]['patchtokens']
+            student_patch_tokens_g2 = student_output['features_list'][1]['patchtokens']
 
-            # Extract patch tokens for iBOT (student has mask_token at masked positions)
-            student_patch_tokens_g1 = student_output['features_list'][0]['patchtokens']  # [B, N, D]
-            student_patch_tokens_g2 = student_output['features_list'][1]['patchtokens']  # [B, N, D]
-
-            # Compute DINO loss
+            # DINO CLS loss
             dino_class_loss_val = dino_class_loss(
                 student_cls_outputs,
                 teacher_cls_outputs,
                 current_iteration
             )
 
-            # ========== KoLeo Loss on Global CLS Tokens Only ==========
+            # ========== KoLeo Loss ==========
             global_cls_tokens = [student_output['features_list'][i]['clstoken'] for i in range(args.global_views)]
 
             koleo_loss_val = torch.tensor(0.0).cuda()
             if len(global_cls_tokens) > 0:
                 koleo_loss_val = sum(dino_koleo_loss(token) for token in global_cls_tokens) / len(global_cls_tokens)
 
-            # ========== iBOT Loss (Sequential per crop to halve peak memory) ==========
-            # Semantic iBOT is integrated here — reuses teacher patchhead output.
+            # ================================================================
+            # iBOT Loss — gather-then-project to avoid [B, N, 65536] tensors.
+            # Projects only masked tokens (~7k) instead of all tokens (~50k).
+            # Semantic iBOT integrated here, reusing teacher backbone tokens.
+            # ================================================================
             current_teacher_temp_ibot = dino_class_loss.teacher_temp_schedule(current_iteration)
 
             semantic_ibot_loss_val = torch.tensor(0.0, device='cuda')
-            semantic_backbone_outputs = []  # Keep raw tokens for prototype section
+            semantic_backbone_outputs = []  # Raw [B, N, D] tokens for prototype section
 
-            # ---------- Global crop 1 ----------
-            teacher_patch_out_g1 = teacher.module.patchhead(teacher_patch_tokens_g1)  # [B, N, out_dim]
-            student_patch_out_g1 = student.module.patchhead(student_patch_tokens_g1)  # [B, N, out_dim]
-
-            ibot_loss_g1 = ibot_patch_loss.forward_masked(
-                student_patch_out_g1,
-                teacher_patch_out_g1,
-                block_masks_1,
-                masks_weight=masks_weight_1,
-                teacher_temp=current_teacher_temp_ibot
+            # ---------- Block iBOT: Global crop 1 ----------
+            s_gathered_1, weights_1, B = _gather_and_compute_weights(
+                student_patch_tokens_g1, block_masks_1, masks_weight_1
             )
 
-            del student_patch_out_g1  # Free student patchhead output
+            if s_gathered_1 is not None:
+                with torch.no_grad():
+                    t_gathered_1 = teacher_patch_tokens_g1.reshape(-1, teacher_patch_tokens_g1.shape[-1])[
+                        block_masks_1.reshape(-1).nonzero(as_tuple=True)[0]
+                    ]
+                    t_proj_1 = teacher.module.patchhead(t_gathered_1)
 
-            # Semantic iBOT on global crop 1 — reuse teacher_patch_out_g1
+                s_proj_1 = student.module.patchhead(s_gathered_1)
+
+                ibot_loss_g1 = ibot_patch_loss.forward_gathered(
+                    s_proj_1, t_proj_1, weights_1, B, current_teacher_temp_ibot
+                )
+                del s_proj_1, t_proj_1, s_gathered_1, t_gathered_1
+            else:
+                ibot_loss_g1 = torch.tensor(0.0, device='cuda')
+
+            # ---------- Semantic iBOT on global crop 1 ----------
             if args.use_semantic_ibot and semantic_token_masks is not None:
                 ibot_accum = 0.0
 
                 for sem_mask, sem_weight in zip(semantic_token_masks, semantic_masks_weights):
-                    # Single backbone forward with semantic mask tokens
+                    # Backbone forward with semantic mask tokens
                     sem_backbone_out = student.module.backbone(
-                        teacher_global_crops[0],
-                        token_masks=sem_mask
+                        teacher_global_crops[0], token_masks=sem_mask
                     )
-                    sem_patch_tokens_raw = sem_backbone_out['patchtokens']  # [B, N, D]
+                    sem_patch_raw = sem_backbone_out['patchtokens']  # [B, N, D]
 
-                    # Keep raw backbone tokens for prototype section
-                    semantic_backbone_outputs.append((sem_patch_tokens_raw, sem_mask, sem_weight))
+                    # Store for prototype section (backbone-dim, ~0.4 GB each)
+                    semantic_backbone_outputs.append((sem_patch_raw, sem_mask, sem_weight))
 
-                    # Project through patchhead and compute iBOT loss
-                    sem_patch_tokens_proj = student.module.patchhead(sem_patch_tokens_raw)
-                    loss_ibot = ibot_patch_loss.forward_masked(
-                        sem_patch_tokens_proj,
-                        teacher_patch_out_g1,
-                        sem_mask,
-                        masks_weight=sem_weight,
-                        teacher_temp=current_teacher_temp_ibot
+                    # Gather only masked tokens, then project
+                    sem_s_gathered, sem_weights, _ = _gather_and_compute_weights(
+                        sem_patch_raw, sem_mask, sem_weight
                     )
-                    ibot_accum += loss_ibot
 
-                    del sem_backbone_out, sem_patch_tokens_proj
+                    if sem_s_gathered is not None:
+                        with torch.no_grad():
+                            sem_t_gathered = teacher_patch_tokens_g1.reshape(-1, teacher_patch_tokens_g1.shape[-1])[
+                                sem_mask.reshape(-1).nonzero(as_tuple=True)[0]
+                            ]
+                            sem_t_proj = teacher.module.patchhead(sem_t_gathered)
+
+                        sem_s_proj = student.module.patchhead(sem_s_gathered)
+
+                        loss_ibot = ibot_patch_loss.forward_gathered(
+                            sem_s_proj, sem_t_proj, sem_weights, B, current_teacher_temp_ibot
+                        )
+                        ibot_accum += loss_ibot
+                        del sem_s_proj, sem_t_proj, sem_s_gathered, sem_t_gathered
+
+                    del sem_backbone_out
 
                 n_ch = len(semantic_token_masks)
                 semantic_ibot_loss_val = ibot_accum / n_ch
 
-            del teacher_patch_out_g1  # Now free teacher patchhead output
-
-            # ---------- Global crop 2 ----------
-            teacher_patch_out_g2 = teacher.module.patchhead(teacher_patch_tokens_g2)  # [B, N, out_dim]
-            student_patch_out_g2 = student.module.patchhead(student_patch_tokens_g2)  # [B, N, out_dim]
-
-            ibot_loss_g2 = ibot_patch_loss.forward_masked(
-                student_patch_out_g2,
-                teacher_patch_out_g2,
-                block_masks_2,
-                masks_weight=masks_weight_2,
-                teacher_temp=current_teacher_temp_ibot
+            # ---------- Block iBOT: Global crop 2 ----------
+            s_gathered_2, weights_2, _ = _gather_and_compute_weights(
+                student_patch_tokens_g2, block_masks_2, masks_weight_2
             )
 
-            del teacher_patch_out_g2, student_patch_out_g2
+            if s_gathered_2 is not None:
+                with torch.no_grad():
+                    t_gathered_2 = teacher_patch_tokens_g2.reshape(-1, teacher_patch_tokens_g2.shape[-1])[
+                        block_masks_2.reshape(-1).nonzero(as_tuple=True)[0]
+                    ]
+                    t_proj_2 = teacher.module.patchhead(t_gathered_2)
 
-            # Average block iBOT loss
+                s_proj_2 = student.module.patchhead(s_gathered_2)
+
+                ibot_loss_g2 = ibot_patch_loss.forward_gathered(
+                    s_proj_2, t_proj_2, weights_2, B, current_teacher_temp_ibot
+                )
+                del s_proj_2, t_proj_2, s_gathered_2, t_gathered_2
+            else:
+                ibot_loss_g2 = torch.tensor(0.0, device='cuda')
+
             ibot_loss_val = (ibot_loss_g1 + ibot_loss_g2) / 2.0
 
-        # ========== Patch Prototype Clustering (Sequential per crop) ==========
-        # Semantic prototype loss is integrated here — reuses semantic_backbone_outputs.
+        # ================================================================
+        # Patch Prototype Clustering
+        # Operates on backbone-dim [B, N, 768] — no memory concern.
+        # Semantic prototype loss integrated here.
+        # ================================================================
         semantic_clustering_loss = torch.tensor(0.0, device='cuda')
         semantic_teacher_proto_loss = torch.tensor(0.0, device='cuda')
         semantic_koleo_proto_loss = torch.tensor(0.0, device='cuda')
@@ -691,10 +732,10 @@ def train_dinov2(args):
                     proto_accum = 0.0
                     koleo_accum = 0.0
 
-                    for sem_patch_tokens_raw, sem_mask, sem_weight in semantic_backbone_outputs:
+                    for sem_patch_raw, sem_mask, sem_weight in semantic_backbone_outputs:
                         clust_ch, proto_ch, koleo_ch = patch_prototype_loss(
                             teacher_patch_tokens_g1,
-                            sem_patch_tokens_raw,
+                            sem_patch_raw,
                             sem_mask,
                             prototype_bank,
                             current_iteration,
@@ -710,7 +751,7 @@ def train_dinov2(args):
                     semantic_teacher_proto_loss = proto_accum / n_ch
                     semantic_koleo_proto_loss = koleo_accum / n_ch
 
-                # Free semantic backbone outputs now
+                # Free semantic backbone outputs
                 del semantic_backbone_outputs
                 semantic_backbone_outputs = []
 
@@ -733,7 +774,6 @@ def train_dinov2(args):
             if args.use_semantic_prototypes:
                 prototype_loss = prototype_loss + semantic_teacher_proto_loss + semantic_koleo_proto_loss
         else:
-            # Free semantic backbone outputs if prototypes disabled
             del semantic_backbone_outputs
 
             clustering_loss = torch.tensor(0.0).cuda()
@@ -753,15 +793,11 @@ def train_dinov2(args):
 
         # ========== Backward and optimizer steps ==========
         if fp16_scaler is None:
-            # ===== NON-MIXED PRECISION =====
-
-            # 1. Prototype backward (if enabled)
             if args.use_prototype_clustering and optimizer_prototypes is not None:
                 optimizer_prototypes.zero_grad()
                 prototype_loss.backward()
                 optimizer_prototypes.step()
 
-            # 2. Student backward
             optimizer_student.zero_grad()
             student_loss.backward()
 
@@ -773,15 +809,11 @@ def train_dinov2(args):
             optimizer_student.step()
 
         else:
-            # ===== MIXED PRECISION =====
-
-            # 1. Prototype backward (NO scaler - uses bfloat16 directly)
             if args.use_prototype_clustering and optimizer_prototypes is not None:
                 optimizer_prototypes.zero_grad()
                 prototype_loss.backward()
                 optimizer_prototypes.step()
 
-            # 2. Student backward (WITH scaler)
             optimizer_student.zero_grad()
             fp16_scaler.scale(student_loss).backward()
             fp16_scaler.unscale_(optimizer_student)
@@ -793,7 +825,6 @@ def train_dinov2(args):
 
             fp16_scaler.step(optimizer_student)
             fp16_scaler.update()
-
 
         # ========== EMA update teacher ==========
         with torch.no_grad():
@@ -822,7 +853,6 @@ def train_dinov2(args):
                 with torch.no_grad():
                     with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
                         vis_masks = mask_model_frozen(sample_image)['masks']
-                    # Save soft pixel-level masks
                     save_iteration_masks_efficient(
                         sample_image,
                         vis_masks,
@@ -830,7 +860,6 @@ def train_dinov2(args):
                         os.path.join(args.output_dir, 'semantic_mask_visualizations'),
                         num_samples=1
                     )
-                    # Save token-level binary masks as upsampled images
                     vis_token_masks, _ = convert_semantic_masks_to_token_masks(
                         vis_masks.float(), patch_size=args.patch_size
                     )
@@ -923,7 +952,6 @@ def train_dinov2(args):
                 'random_rng_state': random.getstate(),
             }
 
-            # Add prototype-related state only if enabled
             if args.use_prototype_clustering:
                 if prototype_bank is not None:
                     save_dict['prototype_bank'] = prototype_bank.state_dict()
@@ -940,11 +968,9 @@ def train_dinov2(args):
 
         current_iteration += 1
 
-        # Synchronize else might time out
         if current_iteration % 100 == 0:
             if dist.is_initialized():
                 dist.barrier()
-
 
     # ========== Final checkpoint and log ==========
     if utils.is_main_process():
