@@ -737,28 +737,19 @@ def train_dinov2(args):
 
                 # ---------- Semantic prototype on global crop 1 ----------
                 if args.use_semantic_prototypes and len(semantic_backbone_outputs) > 0:
-                    clust_accum = 0.0
-                    proto_accum = 0.0
-                    koleo_accum = 0.0
+                    # Randomly select one semantic channel for prototype loss (for economical reasons)
+                    sem_idx = random.randint(0, len(semantic_backbone_outputs) - 1)
+                    sem_patch_raw, sem_mask, sem_weight = semantic_backbone_outputs[sem_idx]
 
-                    for sem_patch_raw, sem_mask, sem_weight in semantic_backbone_outputs:
-                        clust_ch, proto_ch, koleo_ch = patch_prototype_loss(
-                            teacher_patch_tokens_g1,
-                            sem_patch_raw,
-                            sem_mask,
-                            prototype_bank,
-                            current_iteration,
-                            current_teacher_temp,
-                            masks_weight=sem_weight
-                        )
-                        clust_accum += clust_ch
-                        proto_accum += proto_ch
-                        koleo_accum += koleo_ch
-
-                    n_ch = len(semantic_backbone_outputs)
-                    semantic_clustering_loss = clust_accum / n_ch
-                    semantic_teacher_proto_loss = proto_accum / n_ch
-                    semantic_koleo_proto_loss = koleo_accum / n_ch
+                    semantic_clustering_loss, semantic_teacher_proto_loss, semantic_koleo_proto_loss = patch_prototype_loss(
+                        teacher_patch_tokens_g1,
+                        sem_patch_raw,
+                        sem_mask,
+                        prototype_bank,
+                        current_iteration,
+                        current_teacher_temp,
+                        masks_weight=sem_weight
+                    )
 
                 # Free semantic backbone outputs
                 del semantic_backbone_outputs
