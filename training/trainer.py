@@ -537,6 +537,15 @@ def train_dinov2(args):
             semantic_token_masks = [all_token_masks[:, c, :] for c in selected_channels]
             semantic_masks_weights = [all_masks_weights[:, c] for c in selected_channels]
 
+            # Apply mask_sample_probability gating (same as block masks)
+            for i in range(len(semantic_token_masks)):
+                keep = torch.rand(batch_size, device=semantic_token_masks[i].device) < args.mask_sample_probability
+                semantic_token_masks[i] = semantic_token_masks[i] & keep.unsqueeze(1)
+                num_masked = semantic_token_masks[i].sum(dim=1).float()
+                semantic_masks_weights[i] = torch.where(
+                    num_masked > 0, 1.0 / num_masked, torch.zeros_like(num_masked)
+                )
+
         # ========== Debug: Print shapes on first iteration ==========
         if current_iteration == 0 and utils.is_main_process():
             print("\n=== Crop Organization (First Iteration) ===")
