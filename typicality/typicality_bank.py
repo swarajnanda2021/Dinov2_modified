@@ -54,6 +54,7 @@ class TypicalityBank(nn.Module):
                 sigma: scalar std of bank_nn_dists
         """
         B = s_batch.shape[0]
+        s_batch = s_batch.float() # Convert to float for resolving autocast issues
         filled = self.bank_filled.item()
         
         # ---- Filling phase: bank not yet full ----
