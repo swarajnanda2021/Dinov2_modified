@@ -108,6 +108,7 @@ def main():
         slurm_gres=f'gpu:{args.ngpus}',
         slurm_constraint='h100',
         slurm_setup=[
+            'ulimit -l unlimited',
             f'export OMP_NUM_THREADS=8',
             f'export NCCL_DEBUG=INFO',
             f'export NCCL_SOCKET_IFNAME=ib,bond',
