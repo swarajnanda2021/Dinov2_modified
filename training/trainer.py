@@ -23,7 +23,7 @@ import torch.nn.functional as F
 import utils
 from models import CombinedModelDINO, LinearPrototypeBank, ModernViT, DINOHead
 from losses import DINOLoss, iBOTPatchLoss, KoLeoLoss, PatchPrototypeLoss
-from data import DINOv2PathologyDataset, ProportionalMultiDatasetWrapper
+from data import ProportionalMultiDatasetWrapper
 from .helpers import (
     load_pretrained_mask_model,
     load_pretrained_cellvit_model,
@@ -31,7 +31,6 @@ from .helpers import (
     apply_cellvit_masks,
     extract_local_crops_from_masked,
     extract_crops_from_cellvit_channel,
-    generate_random_token_masks,
     generate_random_image_masks,
     generate_block_masks,
     convert_semantic_masks_to_token_masks,

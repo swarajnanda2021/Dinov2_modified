@@ -29,11 +29,7 @@ class TypicalityBank(nn.Module):
         # Bank buffer — persists across steps, saved in checkpoints
         self.register_buffer('bank', torch.zeros(M, K_prime))
         self.register_buffer('bank_filled', torch.tensor(0, dtype=torch.long))
-    
-    @property
-    def is_full(self):
-        return self.bank_filled.item() >= self.M
-    
+
     @torch.no_grad()
     def update_and_score(self, s_batch):
         """

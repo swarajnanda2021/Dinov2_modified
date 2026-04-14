@@ -271,27 +271,6 @@ def extract_local_crops_from_masked(masked_img, n_crops, crop_size=96):
     return crops
 
 
-def generate_random_token_masks(batch_size, n_patches_h, n_patches_w, mask_ratio, device):
-    """
-    Generate random token masks for iBOT training.
-
-    Args:
-        batch_size: Batch size
-        n_patches_h: Number of patches in height
-        n_patches_w: Number of patches in width
-        mask_ratio: Ratio of tokens to mask
-        device: Device to create masks on
-
-    Returns:
-        Boolean mask where True indicates masked tokens [B, N]
-    """
-    n_patches = n_patches_h * n_patches_w
-    token_masks = torch.bernoulli(
-        torch.ones(batch_size, n_patches) * mask_ratio
-    ).bool().to(device)
-    return token_masks
-
-
 def generate_random_image_masks(batch_size, num_masks, height, width, device):
     """
     Generate random rectangular masks for image-level augmentation.

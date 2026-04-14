@@ -8,7 +8,6 @@ from .prototype_bank import LinearPrototypeBank
 from .vision_transformer.modern_vit import VisionTransformer as ModernViT
 from .vision_transformer.auxiliary_models import (
     DINOHead,
-    TMEHead,
     ADIOSMaskModel,
     MaskModel,
     CellViT,
@@ -19,7 +18,6 @@ __all__ = [
     'LinearPrototypeBank',
     'ModernViT',
     'DINOHead',
-    'TMEHead',
     'ADIOSMaskModel',
     'MaskModel',
     'CellViT',
