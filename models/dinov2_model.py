@@ -42,10 +42,10 @@ class CombinedModelDINO(nn.Module):
         else:
             print(f"⚠ Warning: Backbone does not support gradient checkpointing")
 
-    def forward(self, crops, token_masks=None, mode='dino'):
+    def forward(self, crops, token_masks=None, mode='dino', return_bottleneck=False):
         """
         Unified forward supporting both DINO and iBOT modes.
-        
+
         Args:
             crops: Either:
                 - List of tensors [crop1, crop2, ...] for multi-crop (DINO)
@@ -55,16 +55,19 @@ class CombinedModelDINO(nn.Module):
                 - Single mask tensor [B, N] for iBOT
                 - None for no masking
             mode: 'dino' or 'ibot' (mostly for clarity)
-        
+            return_bottleneck: If True (multi-crop / DINO path only), also return
+                the pre-prototype bottleneck representation from the classhead.
+                Used by the typicality dampening feature.
+
         Returns:
             Dictionary with keys depending on mode:
-            - DINO: {'cls_outputs': tensor, 'features_list': list of dicts}
+            - DINO: {'cls_outputs': tensor, 'features_list': list of dicts[, 'bottleneck': tensor]}
             - iBOT: {'patch_outputs': tensor, 'features': dict, 'cls_output': tensor}
         """
-        
+
         # Determine if we're doing multi-crop (list input) or single image
         is_multi_crop = isinstance(crops, list)
-        
+
         if is_multi_crop:
             # ========== MULTI-CROP MODE (DINO) ==========
             # Ensure masks is also a list
@@ -73,27 +76,33 @@ class CombinedModelDINO(nn.Module):
             elif not isinstance(token_masks, list):
                 # Single mask provided, assume it's for first crop
                 token_masks = [token_masks] + [None] * (len(crops) - 1)
-            
+
             # Forward through backbone with packing
             # backbone.forward() will detect list and call forward_features_list()
             outputs_list = self.backbone(crops, token_masks=token_masks)
             # outputs_list: [{'clstoken': [B,D], 'patchtokens': [B,N,D], ...}, ...]
-            
+
             # Collect all CLS tokens and apply head
             all_cls_tokens = []
             for output_dict in outputs_list:
                 all_cls_tokens.append(output_dict['clstoken'])
-            
+
             # Concatenate all CLS tokens: [B1+B2+...+BN, D]
             cls_tokens_cat = torch.cat(all_cls_tokens, dim=0)
-            
+
             # Apply DINO head
-            cls_outputs = self.classhead(cls_tokens_cat)
-            
-            return {
+            if return_bottleneck:
+                cls_outputs, bottleneck = self.classhead(cls_tokens_cat, return_bottleneck=True)
+            else:
+                cls_outputs = self.classhead(cls_tokens_cat)
+
+            result = {
                 'cls_outputs': cls_outputs,  # [total_crops, out_dim]
                 'features_list': outputs_list,  # List of dicts
             }
+            if return_bottleneck:
+                result['bottleneck'] = bottleneck
+            return result
         
         else:
             # ========== SINGLE IMAGE MODE (iBOT) ==========

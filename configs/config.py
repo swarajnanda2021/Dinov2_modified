@@ -101,6 +101,53 @@ def get_args_parser():
     parser.add_argument('--clustering_student_temp', default=0.1, type=float,
                         help='Student temperature for clustering')
 
+    # ========== Typicality Dampening parameters ==========
+    parser.add_argument('--use_typicality_dampening', default=False, type=utils.bool_flag,
+                        help='Enable adaptive redundancy dampening for rare morphology preservation')
+    parser.add_argument('--typicality_K_prime', default=256, type=int,
+                        help='Number of representative prototypes (128=undercomplete, 256=complete, 512=overcomplete)')
+    parser.add_argument('--typicality_bank_size', default=8192, type=int,
+                        help='Bank capacity M (number of stored signatures)')
+    parser.add_argument('--typicality_modulation', default='adaptive_temp', type=str,
+                        choices=['adaptive_temp', 'weighted_loss'],
+                        help='Gradient modulation variant')
+    parser.add_argument('--typicality_alpha', default=1.0, type=float,
+                        help='Dampening strength for adaptive temperature variant')
+    parser.add_argument('--typicality_beta', default=0.5, type=float,
+                        help='Dampening strength for weighted loss variant')
+    parser.add_argument('--typicality_warmup_iters', default=15000, type=int,
+                        help='Iterations before typicality scores modulate the loss')
+    parser.add_argument('--typicality_repr_lr', default=1e-3, type=float,
+                        help='Fixed learning rate for representative prototype optimizer')
+    parser.add_argument('--typicality_replace_fraction', default=0.1, type=float,
+                        help='Fraction of bank to refresh per step')
+
+    # ========== Adversarial mask-as-student-view augmentation parameters ==========
+    # Note: --num_masks, --mask_model_arch, --mask_checkpoint are already declared
+    # under the Mask model parameters section (shared with semantic iBOT).
+    parser.add_argument('--use_adversarial_mask_augmentation', default=False, type=utils.bool_flag,
+                        help='Apply the adversarial mask model output as IMAGE-LEVEL masks to create '
+                             'additional student views (distinct from semantic iBOT which uses the same '
+                             'model at the TOKEN level inside the iBOT loss).')
+    parser.add_argument('--crops_per_mask', default=1, type=int,
+                        help='Number of local crops to extract per adversarial-masked global view')
+
+    # ========== CellViT augmentation parameters ==========
+    parser.add_argument('--use_cellvit_augmentation', default=False, type=utils.bool_flag,
+                        help='Enable CellViT-B based nuclei/background augmentation')
+    parser.add_argument('--cellvit_checkpoint', type=str, default=None,
+                        help='Path to trained CellViT model checkpoint')
+    parser.add_argument('--cellvit_crops_per_channel', default=1, type=int,
+                        help='Number of crops per channel (nuclei/background)')
+
+    # ========== Random rectangular mask augmentation parameters ==========
+    parser.add_argument('--use_random_mask_augmentation', default=False, type=utils.bool_flag,
+                        help='Enable random rectangular mask-based augmentation')
+    parser.add_argument('--random_num_masks', default=2, type=int,
+                        help='Number of random rectangular masks to generate')
+    parser.add_argument('--random_crops_per_mask', default=1, type=int,
+                        help='Number of local crops per random mask')
+
     # ========== Training parameters ==========
     parser.add_argument('--batch_size_per_gpu', default=32, type=int,
                         help='Batch size per GPU')

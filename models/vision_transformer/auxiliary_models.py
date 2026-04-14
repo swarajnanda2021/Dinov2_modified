@@ -40,11 +40,15 @@ class DINOHead(nn.Module):
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x):
+    def forward(self, x, return_bottleneck=False):
         x = self.mlp(x)
         # Clustering layers inspired by SwAV
         x = nn.functional.normalize(x, dim=-1, p=2)
+        if return_bottleneck:
+            bottleneck = x
         x = self.last_layer(x)
+        if return_bottleneck:
+            return x, bottleneck
         return x
 
 

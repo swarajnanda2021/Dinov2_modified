@@ -162,6 +162,31 @@ def main():
     args.clustering_teacher_temp = 0.07
     args.clustering_student_temp = 0.1
 
+    # Typicality dampening
+    args.use_typicality_dampening = False
+    args.typicality_K_prime = 256
+    args.typicality_bank_size = 8192
+    args.typicality_modulation = 'adaptive_temp'
+    args.typicality_alpha = 1.0
+    args.typicality_beta = 0.5
+    args.typicality_warmup_iters = 15_000
+    args.typicality_repr_lr = 1e-3
+    args.typicality_replace_fraction = 0.1
+
+    # Adversarial-mask-as-student-view augmentation (re-uses mask_checkpoint above)
+    args.use_adversarial_mask_augmentation = False
+    args.crops_per_mask = 0
+
+    # CellViT (nuclei / background) augmentation
+    args.use_cellvit_augmentation = False
+    args.cellvit_checkpoint = "/data1/vanderbc/nandas1/CellViT_models/TCGA_Dinov2_ViT-B_run2/model.pth"
+    args.cellvit_crops_per_channel = 0
+
+    # Random rectangular mask augmentation
+    args.use_random_mask_augmentation = False
+    args.random_num_masks = 2
+    args.random_crops_per_mask = 0
+
     # Teacher parameters
     args.momentum_teacher = 0.996
     args.teacher_temp = 0.07
@@ -224,6 +249,23 @@ def main():
         print(f"    Semantic iBOT weight: {args.semantic_ibot_weight}")
         if args.use_semantic_prototypes:
             print(f"    Semantic prototype loss: ENABLED (weight={args.semantic_clustering_weight})")
+
+    if args.use_typicality_dampening:
+        print(f"  Typicality Dampening: ENABLED")
+        print(f"    K' = {args.typicality_K_prime}, Bank M = {args.typicality_bank_size}")
+        print(f"    Modulation: {args.typicality_modulation}")
+
+    if args.use_adversarial_mask_augmentation:
+        print(f"  Adversarial Mask Augmentation: ENABLED")
+        print(f"    num_masks = {args.num_masks}, crops_per_mask = {args.crops_per_mask}")
+
+    if args.use_cellvit_augmentation:
+        print(f"  CellViT Augmentation: ENABLED")
+        print(f"    cellvit_crops_per_channel = {args.cellvit_crops_per_channel}")
+
+    if args.use_random_mask_augmentation:
+        print(f"  Random Mask Augmentation: ENABLED")
+        print(f"    random_num_masks = {args.random_num_masks}, random_crops_per_mask = {args.random_crops_per_mask}")
 
     print(f"  Total student views (DINO CLS): {total_views}")
     print(f"  Batch size per GPU: {args.batch_size_per_gpu}")
