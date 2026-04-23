@@ -60,7 +60,9 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         n_local_crops: int = 2,
         mean: tuple = (0.6816, 0.5640, 0.7232),
         std: tuple = (0.1617, 0.1714, 0.1389),
-        corruptions_dir: str = "corruption_results"
+        corruptions_dir: str = "corruption_results",
+        use_pathology_recipe: bool = False,
+        ect_probability: float = 0.4,
     ):
         super().__init__()
         self.base_dir = base_dir
@@ -71,7 +73,7 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         self.world_size = world_size
         self.seed = seed
         self.corruptions_dir = corruptions_dir
-        
+
         # Set parameters for transforms
         self.global_size = global_size
         self.local_size = local_size
@@ -80,7 +82,9 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         self.global_crop_scale = global_crop_scale
         self.mean = mean
         self.std = std
-        
+        self.use_pathology_recipe = use_pathology_recipe
+        self.ect_probability = ect_probability
+
         # Initialize transforms
         self.transforms = TMEDinoTransforms(
             local_size=local_size,
@@ -90,6 +94,8 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
             n_local_crops=n_local_crops,
             mean=mean,
             std=std,
+            use_pathology_recipe=use_pathology_recipe,
+            ect_probability=ect_probability,
         )
         
         # Setup corruption logging
@@ -480,13 +486,15 @@ class DINOv2PathologyDataset(torch.utils.data.IterableDataset):
         global_size: int = 224,
         mean: tuple = (0.6816, 0.5640, 0.7232),
         std: tuple = (0.1617, 0.1714, 0.1389),
+        use_pathology_recipe: bool = False,
+        ect_probability: float = 0.4,
     ):
         self.n_standard_local_crops = n_standard_local_crops
         self.global_views = global_views
         self.local_crop_size = local_crop_size
-        
+
         actual_global_views = max(2, global_views)
-        
+
         self.base_dataset = MemoryEfficientShardedPathologyDataset(
             base_dir=base_dir,
             index_file=index_file,
@@ -500,6 +508,8 @@ class DINOv2PathologyDataset(torch.utils.data.IterableDataset):
             n_local_crops=n_standard_local_crops,
             mean=mean,
             std=std,
+            use_pathology_recipe=use_pathology_recipe,
+            ect_probability=ect_probability,
         )
     
     def __iter__(self):
@@ -558,9 +568,11 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
         global_size: int = 224,
         mean: tuple = (0.6816, 0.5640, 0.7232),
         std: tuple = (0.1617, 0.1714, 0.1389),
+        use_pathology_recipe: bool = False,
+        ect_probability: float = 0.4,
     ):
         super().__init__()
-        
+
         self.batch_size_per_gpu = batch_size_per_gpu
         self.worker_id = worker_id
         self.num_workers = num_workers
@@ -596,6 +608,8 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
                 n_local_crops=n_standard_local_crops,  # Map parameter name
                 mean=mean,
                 std=std,
+                use_pathology_recipe=use_pathology_recipe,
+                ect_probability=ect_probability,
             )
             
             self.datasets.append(dataset)
