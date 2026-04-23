@@ -196,4 +196,43 @@ def get_args_parser():
     parser.add_argument('--gpu', default=0, type=int,
                         help='GPU id to use')
 
+    # ========== Pathology FM Recipe ==========
+    parser.add_argument('--use_pathology_recipe', default=False, type=utils.bool_flag,
+                        help='Enable pathology-FM recipe bundle. Sources: KDE regularizer, '
+                             'ECT augmentation, teacher_temp=0.04, out_dim=131072 '
+                             '[Virchow/Virchow2, Paige/MSKCC/MSR, arXiv:2309.07778 and '
+                             'arXiv:2408.00738]; solarization off, V-flip, 90-deg rotations '
+                             '[Virchow2 + RudolfV + Hibou convergence]; patch_size=14 '
+                             '[community standard across Virchow family, Midnight, RudolfV, '
+                             'H-optimus]; bf16 end-to-end [scaling-regime choice, flagged '
+                             'retroactively by Virchow2G]. Auto-enables qk_norm, 8+ register '
+                             'tokens, StableAdamW beta2=0.95 when embeddingdim >= 1280 '
+                             '[Virchow2G scaling package, arXiv:2408.00738 Section 6].')
+
+    parser.add_argument('--ect_probability', default=0.4, type=float,
+                        help='Probability of applying ECT branch on 40x tiles (source size '
+                             '>= 448). Default 0.4 means 40%% ECT, 60%% standard crop-and-'
+                             'resize. ECT itself is from Virchow2 arXiv:2408.00738 Section '
+                             '5.1. The probabilistic per-tile-size framing is a user '
+                             'adaptation for mixed-magnification (40x + 20x) training data. '
+                             'Only active when --use_pathology_recipe=True.')
+
+    parser.add_argument('--kde_kappa', default=5.0, type=float,
+                        help='vMF kernel concentration for KDE regularizer. Value 5.0 is the '
+                             'Virchow2 default (arXiv:2408.00738 Section 5.2 and ablation). '
+                             'Only used when --use_pathology_recipe=True.')
+
+    parser.add_argument('--qk_norm', default=None, type=utils.bool_flag,
+                        help='Enable QK normalization in attention [Virchow2G scaling '
+                             'package, arXiv:2408.00738 Section 6]. If None (default), '
+                             'auto-enables when embeddingdim >= 1280 AND '
+                             '--use_pathology_recipe=True. Explicit True/False overrides '
+                             'the auto-gate.')
+
+    parser.add_argument('--num_register_tokens', default=4, type=int,
+                        help='Number of register tokens [Darcet et al. 2023, adopted by '
+                             'Virchow2 (4), H-optimus-1 (4), Midnight (4), Virchow2G (8), '
+                             'UNI2-h (8)]. Auto-bumped to 8 if --use_pathology_recipe=True '
+                             'and embeddingdim >= 1280.')
+
     return parser
