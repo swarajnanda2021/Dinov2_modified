@@ -68,7 +68,40 @@ For ablation and reproducibility of prior experiments. `training.helpers.generat
 
 ---
 
-## 5. Alignments with Official DINOv2
+## 5. Pathology FM Recipe — `--use_pathology_recipe`
+
+*Motivation.* Independent of the four feature toggles above, this branch bundles a set of training-recipe changes that the open pathology-FM literature has converged on between 2024 and 2026. They are individually small but jointly change training behavior enough that mixing them with the `consolidated` defaults would produce a config that is neither the old recipe nor the new one. A single `--use_pathology_recipe` flag pulls the whole bundle in; leaving it `False` preserves the `consolidated` behavior bit-for-bit. Primary references: Virchow (arXiv:2309.07778), Virchow2 / Virchow2G (arXiv:2408.00738), Midnight (MICCAI 2025), RudolfV (arXiv:2401.04079), Hibou (arXiv:2406.05074).
+
+*Cross-preset changes applied when the flag is on.*
+
+- `patch_size` 16 → 14 (community standard across the Virchow family, Midnight, RudolfV, H-optimus; only Phikon-v2 and PathOrchestra stay at 16).
+- `out_dim` 65,536 → 131,072 (Virchow v1 Methods; Paige standard).
+- bf16 autocast end-to-end with `fp16_scaler=None` (Virchow2G retrospectively flagged fp16 as the cause of late-training NaN; H100 supports bf16 natively).
+- Solarization off on global crop 2 (Virchow2 §5.2 ablation; also in Virchow2G, RudolfV, Hibou).
+- Vertical flip on and 90-degree discrete rotations on in the color-jitter chain (Virchow2, RudolfV, Hibou, Lunit all adopt this — pathology tiles have no canonical orientation).
+- Teacher temperature fixed at 0.04 (Virchow2G §5.1).
+- `KoLeoLoss` → `KDELoss` with a von-Mises–Fisher kernel (κ from `--kde_kappa`, default 5.0), all-gather pooled across GPUs. Replaces KoLeo because pathology batches contain near-duplicate tiles; KoLeo's nearest-neighbor distance collapses and its gradient explodes on those. Virchow2 §5.2.
+- `--koleo_loss_weight` nudged from 0.1 → 0.05 only when the user hasn't overridden it (Virchow2 KDE default λ).
+
+*Probabilistic ECT augmentation.* ECT = Extended-Context Translation from Virchow2 §5.1. The **probabilistic per-tile-size framing** in this repo is the user's adaptation for mixed-magnification (40× + 20×) training data. At transform-call time, `TMEDinoTransforms.__call__` inspects `img.size[0]`:
+
+- **40× tiles** (source ≥ 448 pixels, native 40× at MPP 0.25) route to the ECT branch with probability `--ect_probability` (default 0.4) and to a standard crop-and-resize branch otherwise. The ECT branch crops at native 40× ± 10% (global `scale=(0.203, 0.303)`, `ratio=(0.95, 1.05)`; local `scale=(0.037, 0.056)`, `ratio=(0.95, 1.05)`), so the model sees cells at correct physical scale with no aggressive resize.
+- **20× tiles** (source < 448) always route to the standard branch.
+- The standard branch uses canonical DINOv2 ranges per Virchow2 §5.1 (global `scale=(0.32, 1.0)`, `ratio=(0.75, 1.33)`; local `scale=(0.05, 0.32)`, `ratio=(0.75, 1.33)`) and spans apparent magnification 20×–35× globally and 15×–38× locally — so the downstream 20× evaluation magnification is always covered regardless of source tile. A small gap at 35–36× where neither branch covers densely is an accepted trade-off: widening standard would defeat ECT's morphology guarantee. The full magnification table is documented as a module-level comment block in `run_with_submitit.py`.
+
+Under the recipe, the pre-resize to (global_size, global_size) is skipped — `RandomResizedCrop` handles the final resize to output size, so ECT actually operates on the native resolution it was designed for.
+
+*ViT-G auto-gate.* When the recipe is on **and** `args.embeddingdim >= 1280`, three additional Virchow2G §6 scaling-regime fixes kick in automatically and are logged at startup under `[pathology recipe auto-gate]`:
+
+- `qk_norm=True` inside attention (the feature was already wired through `ModernViT`/`TransformerBlock`; the auto-gate just flips the default). Explicit `--qk_norm=True/False` on the CLI overrides the auto-gate.
+- `num_register_tokens` bumped to `max(current, 8)` (Virchow2G + UNI2-h).
+- Optimizer swapped from `torch.optim.AdamW` to `utils.StableAdamW(betas=(0.9, 0.95))`. StableAdamW uses decoupled weight decay and per-step RMS-clipped updates; Virchow2G reports it prevented late-training NaN at ViT-G scale. The implementation lives alongside LARS in `utils.py`.
+
+*Control surface.* Four new CLI args, all defaulting off / neutral so the branch is a no-op unless opted in: `--use_pathology_recipe`, `--ect_probability`, `--kde_kappa`, `--qk_norm`, plus `--num_register_tokens` (was previously hardcoded to 4 at the `ModernViT` call site). `run_with_submitit.py` ships with a commented-out toggle stanza and the full magnification table inline; uncomment three lines to enable. Runtime verification checklist (no-op parity, ECT routing frequency, KDE stability, auto-gate log, bf16 end-to-end, ViT-L smoke test) is tracked in [`pathology_fm_recipe_verification.md`](pathology_fm_recipe_verification.md).
+
+---
+
+## 6. Alignments with Official DINOv2
 
 A handful of smaller corrections relative to common in-the-wild DINOv2 forks, already present on this branch (not features per se — implementation hygiene):
 
@@ -79,19 +112,19 @@ A handful of smaller corrections relative to common in-the-wild DINOv2 forks, al
 - **Sequence-packed multi-crop forward pass** inside the backbone (`CombinedModelDINO.forward` → `backbone.forward_features_list`): all crops are processed as a single packed sequence instead of per-crop loops.
 - **Typicality's per-sample DINO-temperature path** exposes `sample_temperatures` and `sample_weights` as optional kwargs on `DINOLoss.forward`; when both are `None` the loss reduces exactly to the scalar-temperature form.
 
-## 6. Repo layout
+## 7. Repo layout
 
 - `configs/` — `argparse`-based config builder (`configs.config.get_args_parser`).
-- `data/` — pathology tile dataset + proportional multi-source wrapper (`DINOv2PathologyDataset`, `ProportionalMultiDatasetWrapper`, `TMEDinoTransforms`).
-- `losses/` — `DINOLoss`, `iBOTPatchLoss`, `KoLeoLoss`, `PatchPrototypeLoss`.
+- `data/` — pathology tile dataset + proportional multi-source wrapper (`DINOv2PathologyDataset`, `ProportionalMultiDatasetWrapper`, `TMEDinoTransforms`; `TMEDinoTransforms` also owns the `Random90Rotation` + probabilistic ECT routing used by §5).
+- `losses/` — `DINOLoss`, `iBOTPatchLoss`, `KoLeoLoss`, `KDELoss` (used by §5), `PatchPrototypeLoss`.
 - `models/` — `CombinedModelDINO` (the packed-sequence student/teacher wrapper), `LinearPrototypeBank`, and vision-transformer bits (`ModernViT`, `DINOHead`, `MaskModel`, `ADIOSMaskModel`, `CellViT`).
 - `typicality/` — the three modules implementing the typicality dampening feature (§3).
 - `training/` — `train_dinov2` orchestration (`trainer.py`) and `helpers.py` with all the mask/crop utilities; `training/__init__.py` re-exports the common helpers.
 - `visualizations/` — standalone plotting scripts for loss curves, clustering entropy, PCA, prototype dendrograms, and prototype heatmaps.
-- `run_with_submitit.py` — SLURM launcher that sets defaults and submits via `submitit`.
+- `run_with_submitit.py` — SLURM launcher that sets defaults and submits via `submitit`; also carries the pathology-FM recipe toggle stanza and magnification table (§5).
 - `main_train.py` — single-process entry point (used locally for debugging; cluster training goes through `run_with_submitit.py`).
-- `utils.py` — distributed setup, layer-wise LR helpers, schedulers, serialization utilities.
+- `utils.py` — distributed setup, layer-wise LR helpers, schedulers, serialization utilities, and the `LARS` / `StableAdamW` optimizers.
 
-## 7. Running
+## 8. Running
 
 Cluster training recipes (job layouts, monitoring, checkpoint recovery) live in internal runbooks rather than this repo. For local debugging, `main_train.py` takes the same arguments as the SLURM launcher and runs without submitit — useful for verifying config validity and doing a smoke test on a single node.
