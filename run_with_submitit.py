@@ -151,11 +151,25 @@ def main():
     args.dist_url = get_init_file().as_uri()
 
     # ========== Default training configuration ==========
-    # Architecture
+    # Architecture - pick the variant. Each row of _VIT_CONFIGS fixes
+    # (embeddingdim, vitdepth, vitheads) to the standard DINOv2 sizes:
+    #   S:  embed=384,  depth=12, heads=6    (tiny)
+    #   B:  embed=768,  depth=12, heads=12   (base)
+    #   L:  embed=1024, depth=24, heads=16   (large)
+    #   H:  embed=1280, depth=32, heads=16   (huge)  -- triggers pathology-recipe auto-gate
+    #   G:  embed=1536, depth=40, heads=24   (giant) -- triggers pathology-recipe auto-gate
+    # patch_size is orthogonal to the variant; the pathology recipe overrides it to 14 at runtime.
+    args.vit_variant = "B"
+    _VIT_CONFIGS = {
+        "S": dict(embeddingdim=384,  vitdepth=12, vitheads=6),
+        "B": dict(embeddingdim=768,  vitdepth=12, vitheads=12),
+        "L": dict(embeddingdim=1024, vitdepth=24, vitheads=16),
+        "H": dict(embeddingdim=1280, vitdepth=32, vitheads=16),
+        "G": dict(embeddingdim=1536, vitdepth=40, vitheads=24),
+    }
+    for k, v in _VIT_CONFIGS[args.vit_variant].items():
+        setattr(args, k, v)
     args.patch_size = 16
-    args.embeddingdim = 768
-    args.vitheads = args.embeddingdim // 64
-    args.vitdepth = 12
 
     # ========== Augmentation Configuration ==========
     args.global_views = 2
@@ -251,7 +265,9 @@ def main():
     # ================================================================
     # PATHOLOGY FM RECIPE - toggle
     # ================================================================
-    # Uncomment to enable the Virchow2-derived pathology recipe bundle.
+    # Flip use_pathology_recipe to True to enable the Virchow2-derived
+    # bundle. ect_probability and kde_kappa are only consulted when the
+    # recipe is on; leaving them at their defaults here is harmless.
     #
     # Recipe includes:
     #   - KDE regularizer replaces KoLeo        [Virchow2 Sec 5.2]
@@ -262,11 +278,7 @@ def main():
     #   - bf16 end-to-end                        [Virchow2G retrospective]
     #   - Solarization off, V-flip, 90-deg rot   [Virchow2/RudolfV/Hibou convergence]
     #
-    # args.use_pathology_recipe = True
-    # args.ect_probability = 0.4
-    # args.kde_kappa = 5.0
-    #
-    # When embeddingdim >= 1280, the auto-gate additionally enables:
+    # When embeddingdim >= 1280 (ViT-H/G), the auto-gate additionally enables:
     #   - qk_norm=True                           [Virchow2G Sec 6]
     #   - num_register_tokens >= 8               [Virchow2G + UNI2-h]
     #   - StableAdamW with beta2=0.95            [Virchow2G Sec 6]
@@ -274,6 +286,9 @@ def main():
     # Full probabilistic ECT magnification table is documented in a
     # module-level comment block at the top of this file.
     # ================================================================
+    args.use_pathology_recipe = False
+    args.ect_probability = 0.4
+    args.kde_kappa = 5.0
 
     # Save configuration
     with open(os.path.join(args.output_dir, f"{job_name}_config.txt"), "w") as f:
@@ -291,9 +306,13 @@ def main():
     # Calculate total views
     total_views = calculate_total_student_views(args)
 
+    # Reflect the pathology-recipe patch_size override in the summary so the
+    # printed architecture matches what train_dinov2 will actually build.
+    effective_patch_size = 14 if args.use_pathology_recipe else args.patch_size
+
     print("\n" + "="*80)
     print("Configuration Summary:")
-    print(f"  Architecture: ViT-L/{args.patch_size}")
+    print(f"  Architecture: ViT-{args.vit_variant}/{effective_patch_size}")
     print(f"  Global crops: {args.global_views}")
     print(f"  Standard local crops: {args.n_standard_local_crops}")
 
