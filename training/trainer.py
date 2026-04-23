@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 import utils
 from models import CombinedModelDINO, LinearPrototypeBank, ModernViT, DINOHead
-from losses import DINOLoss, iBOTPatchLoss, KoLeoLoss, PatchPrototypeLoss
+from losses import DINOLoss, iBOTPatchLoss, KoLeoLoss, KDELoss, PatchPrototypeLoss
 from data import ProportionalMultiDatasetWrapper
 from .helpers import (
     load_pretrained_mask_model,
@@ -90,6 +90,42 @@ def train_dinov2(args):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
     print("git:\n  {}\n".format(utils.get_sha()))
+
+    # ============ Pathology FM recipe: resolve overrides and auto-gate ============
+    # Applied BEFORE model/loss/optimizer construction so downstream uses the
+    # effective values. No-op unless args.use_pathology_recipe=True.
+    auto_gate_active = getattr(args, 'use_pathology_recipe', False) and args.embeddingdim >= 1280
+
+    if getattr(args, 'use_pathology_recipe', False):
+        # patch_size 14 is the community standard for pathology FMs
+        if args.patch_size != 14:
+            print(f"[pathology recipe] Overriding patch_size {args.patch_size} -> 14 "
+                  f"(community standard for pathology FMs)")
+            args.patch_size = 14
+        # out_dim 131072 per Virchow v1 Methods (Paige standard)
+        if args.out_dim != 131072:
+            print(f"[pathology recipe] Overriding out_dim {args.out_dim} -> 131072 "
+                  f"(Virchow v1 Methods, Paige standard)")
+            args.out_dim = 131072
+        # Nudge koleo_loss_weight to 0.05 only if user left the default 0.1
+        if abs(args.koleo_loss_weight - 0.1) < 1e-6:
+            args.koleo_loss_weight = 0.05
+            print(f"[pathology recipe] Set koleo_loss_weight=0.05 (Virchow2 KDE default lambda)")
+
+    if auto_gate_active:
+        # qk_norm: auto-enable if not explicitly set
+        if args.qk_norm is None:
+            args.qk_norm = True
+        # register tokens: monotonic max with 8
+        if args.num_register_tokens < 8:
+            args.num_register_tokens = 8
+            print(f"[pathology recipe auto-gate] Bumped num_register_tokens to 8 "
+                  f"(Virchow2G scaling package)")
+        print(f"[pathology recipe auto-gate] qk_norm={args.qk_norm}, "
+              f"register_tokens={args.num_register_tokens}, StableAdamW active")
+    elif getattr(args, 'qk_norm', None) is None:
+        args.qk_norm = False  # safe default when auto-gate doesn't fire
+
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
 
@@ -218,6 +254,8 @@ def train_dinov2(args):
         world_size=dist.get_world_size(),
         seed=args.seed,
         global_size=224,
+        use_pathology_recipe=getattr(args, 'use_pathology_recipe', False),
+        ect_probability=getattr(args, 'ect_probability', 0.4),
     )
 
     train_loader = torch.utils.data.DataLoader(
@@ -239,11 +277,11 @@ def train_dinov2(args):
         num_heads=args.vitheads,
         mlp_ratio=4.0,
         qkv_bias=True,
-        qk_norm=False,
+        qk_norm=bool(args.qk_norm),
         dual_norm=False,
         drop_path_rate=0.4,
         pre_norm=False,
-        num_register_tokens=4,
+        num_register_tokens=args.num_register_tokens,
     )
 
     teacher_encoder = deepcopy(student_encoder)
@@ -352,10 +390,18 @@ def train_dinov2(args):
     teacher.requires_grad_(False)
 
     # ============ Initialize losses ============
+    if getattr(args, 'use_pathology_recipe', False):
+        warmup_teacher_temp_effective = 0.04
+        teacher_temp_effective = 0.04
+        print(f"Teacher temperature fixed at 0.04. Source: Virchow2G Section 5.1.")
+    else:
+        warmup_teacher_temp_effective = args.warmup_teacher_temp
+        teacher_temp_effective = args.teacher_temp
+
     dino_class_loss = DINOLoss(
         ncrops=total_student_views,
-        warmup_teacher_temp=args.warmup_teacher_temp,
-        teacher_temp=args.teacher_temp,
+        warmup_teacher_temp=warmup_teacher_temp_effective,
+        teacher_temp=teacher_temp_effective,
         warmup_teacher_temp_iters=args.teacher_temp_warmup_iters,
         n_iterations=5,
         student_temp=0.1,
@@ -366,7 +412,13 @@ def train_dinov2(args):
         n_iterations=3,
     ).cuda()
 
-    dino_koleo_loss = KoLeoLoss().cuda()
+    if getattr(args, 'use_pathology_recipe', False):
+        dino_koleo_loss = KDELoss(kappa=args.kde_kappa).cuda()
+        print(f"Using KDE regularizer (kappa={args.kde_kappa}, all-gather across "
+              f"{dist.get_world_size()} GPUs). Source: Virchow2 Section 5.2.")
+    else:
+        dino_koleo_loss = KoLeoLoss().cuda()
+        print("Using KoLeo regularizer (DINOv2 default)")
 
     patch_prototype_loss = None
     if args.use_prototype_clustering:
@@ -382,7 +434,14 @@ def train_dinov2(args):
         print("Patch prototype clustering disabled")
 
     # ============ Create fp16_scaler ============
-    fp16_scaler = torch.cuda.amp.GradScaler() if args.use_fp16 else None
+    if getattr(args, 'use_pathology_recipe', False):
+        fp16_scaler = None
+        bf16_mode = True
+        print("Using bf16 end-to-end (no GradScaler). H100-appropriate; "
+              "avoids fp16 NaN issues flagged by Virchow2G.")
+    else:
+        fp16_scaler = torch.cuda.amp.GradScaler() if args.use_fp16 else None
+        bf16_mode = False
 
     # ============ Create optimizers ============
     backbone_params = utils.get_params_groups_with_layer_decay(
@@ -396,7 +455,11 @@ def train_dinov2(args):
 
     all_param_groups = backbone_params + classhead_params + patchhead_params
 
-    optimizer_student = torch.optim.AdamW(all_param_groups)
+    if auto_gate_active:
+        optimizer_student = utils.StableAdamW(all_param_groups, betas=(0.9, 0.95))
+        print(f"Using StableAdamW (betas=(0.9, 0.95)). Source: Virchow2G Section 6.")
+    else:
+        optimizer_student = torch.optim.AdamW(all_param_groups)
 
     if utils.is_main_process():
         print(f"\n=== Layer-wise LR Decay (rate={args.lr_decay_rate}) ===")
@@ -620,7 +683,7 @@ def train_dinov2(args):
 
         if args.use_semantic_ibot and mask_model_frozen is not None:
             with torch.no_grad():
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16 or bf16_mode):
                     mask_output = mask_model_frozen(teacher_global_crops[0])
                     soft_masks = mask_output['masks'].float()
 
@@ -656,7 +719,7 @@ def train_dinov2(args):
 
         if args.use_adversarial_mask_augmentation and mask_model_frozen is not None:
             with torch.no_grad():
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16 or bf16_mode):
                     mask_output = mask_model_frozen(mask_model_input)
                     masks = mask_output['masks'].float()  # Cast back to float32 for downstream ops
 
@@ -821,7 +884,7 @@ def train_dinov2(args):
             optimizer_prototypes.zero_grad()
 
         # ========== Forward passes and loss computation ==========
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16 or bf16_mode):
             # ========== DINO Loss with Sequence Packing ==========
 
             student_masks = [block_masks_1, block_masks_2] + [None] * len(student_local_crops)
@@ -1001,7 +1064,7 @@ def train_dinov2(args):
         if args.use_prototype_clustering:
             current_teacher_temp = dino_class_loss.teacher_temp_schedule(current_iteration)
 
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16 or bf16_mode):
                 # ---------- Block mask prototype: Global crop 1 ----------
                 clust_loss_g1, proto_loss_g1, koleo_proto_g1 = patch_prototype_loss(
                     teacher_patch_tokens_g1,
@@ -1138,7 +1201,7 @@ def train_dinov2(args):
             if args.use_semantic_ibot and mask_model_frozen is not None:
                 sample_image = teacher_global_crops[0][:1]
                 with torch.no_grad():
-                    with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16):
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16 or bf16_mode):
                         vis_masks = mask_model_frozen(sample_image)['masks']
                     save_iteration_masks_efficient(
                         sample_image,
