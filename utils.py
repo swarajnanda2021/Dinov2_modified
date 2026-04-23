@@ -948,6 +948,81 @@ class LARS(torch.optim.Optimizer):
                 p.add_(mu, alpha=-g['lr'])
 
 
+class StableAdamW(torch.optim.Optimizer):
+    """
+    StableAdamW with update clipping to prevent late-training NaN.
+
+    Reference: Virchow2G (Zimmermann et al. 2024, arXiv:2408.00738 Section 6)
+    reports using StableAdamW with beta2=0.95 to avoid NaN incidents observed
+    with standard AdamW at ViT-G scale. The paper does not release a reference
+    implementation; this follows the common StableAdamW formulation where the
+    update is clipped by the RMS of the recent gradient.
+
+    Args:
+        params: iterable of parameters to optimize
+        lr: learning rate
+        betas: (beta1, beta2) - Virchow2G uses (0.9, 0.95)
+        eps: epsilon for numerical stability
+        weight_decay: decoupled weight decay coefficient
+        clip_threshold: RMS bound for update clipping (default 1.0)
+    """
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.95), eps=1e-8,
+                 weight_decay=0.01, clip_threshold=1.0):
+        defaults = dict(lr=lr, betas=betas, eps=eps,
+                        weight_decay=weight_decay,
+                        clip_threshold=clip_threshold)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p)
+                    state['exp_avg_sq'] = torch.zeros_like(p)
+
+                exp_avg = state['exp_avg']
+                exp_avg_sq = state['exp_avg_sq']
+                beta1, beta2 = group['betas']
+                state['step'] += 1
+                step = state['step']
+
+                # Decoupled weight decay
+                p.mul_(1 - group['lr'] * group['weight_decay'])
+
+                # Update moments
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                # Bias correction
+                bias_correction1 = 1 - beta1 ** step
+                bias_correction2 = 1 - beta2 ** step
+
+                denom = (exp_avg_sq.sqrt() /
+                         (bias_correction2 ** 0.5)).add_(group['eps'])
+
+                # Stability clip on update magnitude
+                rms = grad.pow(2).mean().sqrt()
+                clip_value = rms.clamp(min=group['clip_threshold'])
+                clip_ratio = group['clip_threshold'] / clip_value
+
+                step_size = group['lr'] / bias_correction1 * clip_ratio
+                p.addcdiv_(exp_avg, denom, value=-step_size)
+
+        return loss
+
+
 class MultiCropWrapper(nn.Module):
     """
     Perform forward pass separately on each resolution input.
