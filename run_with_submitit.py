@@ -78,6 +78,35 @@ class Trainer(object):
         print(f"Process group: {job_env.num_tasks} tasks, rank: {job_env.global_rank}")
 
 
+# PROBABILISTIC ECT - MAGNIFICATION TABLE
+#
+# Formula: apparent_mag = source_mag * output_side / (sqrt(scale) * source_side)
+#
+# 40x tiles (source >= 448, native 40x at MPP 0.25):
+#   ECT branch (p=0.4) - preserves cellular morphology:
+#     Global (224 out): scale=(0.203, 0.303), ratio=(0.95, 1.05)
+#     Local  (96  out): scale=(0.037, 0.056), ratio=(0.95, 1.05)
+#     Apparent mag: globals 36.3-44.4x, locals 36.2-44.5x
+#   Standard branch (p=0.6):
+#     Global (224 out): scale=(0.32, 1.0),    ratio=(0.75, 1.33)
+#     Local  (96  out): scale=(0.05, 0.32),   ratio=(0.75, 1.33)
+#     Apparent mag: globals 20.0-35.4x, locals 15.2-38.3x
+#
+# 20x tiles (source == 224, native 20x at MPP 0.50):
+#   Standard branch always:
+#     Global (224 out): scale=(0.32, 1.0),    ratio=(0.75, 1.33)
+#     Local  (96  out): scale=(0.05, 0.32),   ratio=(0.75, 1.33)
+#     Apparent mag: globals 20.0-35.4x, locals 15.2-38.3x
+#
+# Design notes:
+#  - ECT branch (Virchow2 recipe) lives at native 40x +/- 10%. Model sees
+#    cells at correct physical scale; no aggressive resize.
+#  - Standard branch spans 20x-35x globally, 15x-38x locally on both tile
+#    types. This includes the downstream evaluation magnification (20x).
+#  - Small gap at 35-36x where neither branch covers densely. Acceptable
+#    trade-off: widening standard would defeat ECT's morphology guarantee.
+
+
 def main():
     """Main submitit launcher."""
     args = parse_args()
@@ -218,6 +247,33 @@ def main():
         "CPTAC:/data1/vanderbc/foundation_model_training_images/CPTAC:CPTAC_dataset_index.pkl",
         "IMPACT:/data1/vanderbc/foundation_model_training_images/IMPACT:IMPACT_dataset_index.pkl"
     ]
+
+    # ================================================================
+    # PATHOLOGY FM RECIPE - toggle
+    # ================================================================
+    # Uncomment to enable the Virchow2-derived pathology recipe bundle.
+    #
+    # Recipe includes:
+    #   - KDE regularizer replaces KoLeo        [Virchow2 Sec 5.2]
+    #   - Probabilistic ECT augmentation         [Virchow2 Sec 5.1 + user variation]
+    #   - Teacher temp fixed at 0.04             [Virchow2G Sec 5.1]
+    #   - out_dim=131,072                        [Virchow v1 Methods]
+    #   - patch_size=14                          [pathology FM community standard]
+    #   - bf16 end-to-end                        [Virchow2G retrospective]
+    #   - Solarization off, V-flip, 90-deg rot   [Virchow2/RudolfV/Hibou convergence]
+    #
+    # args.use_pathology_recipe = True
+    # args.ect_probability = 0.4
+    # args.kde_kappa = 5.0
+    #
+    # When embeddingdim >= 1280, the auto-gate additionally enables:
+    #   - qk_norm=True                           [Virchow2G Sec 6]
+    #   - num_register_tokens >= 8               [Virchow2G + UNI2-h]
+    #   - StableAdamW with beta2=0.95            [Virchow2G Sec 6]
+    #
+    # Full probabilistic ECT magnification table is documented in a
+    # module-level comment block at the top of this file.
+    # ================================================================
 
     # Save configuration
     with open(os.path.join(args.output_dir, f"{job_name}_config.txt"), "w") as f:
