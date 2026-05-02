@@ -112,8 +112,23 @@ per-tile $h_1, \ldots, h_{T_{\max}}$ vector at inference (single-tile, pool-
 of-one CLS) so the halt-depth distribution can be reconstructed. This is a
 one-line change at the inference driver and does not affect training.
 
-## Schematic
+## Schematic of the training method
 
-The training method that this sweep evaluates is shown in
-[`figures/looped_dinov2_training.svg`](figures/looped_dinov2_training.svg).
-Source: [`figures/generate_looped_dinov2_schematic.py`](figures/generate_looped_dinov2_schematic.py).
+![Looped DINOv2 — training schematic with explicit residual pathway](figures/looped_dinov2_method_residual.png)
+
+Vector originals: [`figures/looped_dinov2_method_residual.svg`](figures/looped_dinov2_method_residual.svg) (preferred for inclusion in the paper) and [`figures/looped_dinov2_method_residual.pdf`](figures/looped_dinov2_method_residual.pdf). Source: [`figures/generate_looped_dinov2_method_residual.py`](figures/generate_looped_dinov2_method_residual.py). Re-run with `python3 figures/generate_looped_dinov2_method_residual.py`.
+
+**What the figure shows.**
+
+The figure draws one full forward pass of the looped student backbone for `T_max = 4` recursion steps, organized as four horizontal lanes.
+
+- **Recursion lane (top, gray).** The state circles `z_0, z_1, z_2, z_3, z_4` and the shared block `f_θ` are drawn in series: `z_0 → f_θ → ⊕ → z_1 → f_θ → ⊕ → z_2 → ...`. The same `f_θ` rectangle is repeated four times, signaling weight tying — emphasized by the purple brace and label `shared parameters f_θ (applied T_max times)` running across the entire lane. The arrow direction inside the lane (left to right) is the *time axis* of the recursion, not depth in the parameter sense.
+- **Time-embedding inputs (top of the recursion lane).** Each `f_θ` invocation receives a per-step learnable bias `τ_t` from a small yellow circle directly above it. The four `τ_t` circles are distinct parameters, indexed by recursion step; they are what breaks the otherwise-identical behavior of the shared block across steps and let the recurrence carry out a different operation at each `t`.
+- **Input-injection bypass (purple, between recursion and halt rows).** A horizontal purple highway taps `z_0` and feeds it back into the residual sum node `⊕` *between* every `f_θ` and its `z_t`. The `⊕` symbols make the residual structure `z_t = f_θ(...) + z_0` graphically explicit — the same convention used in ResNet / Transformer diagrams for skip connections. This visual emphasizes that the recurrence is anchored to the input at every step rather than drifting away.
+- **Halt-head row (green, middle).** Each `z_t` is tapped (junction dots on the recursion lane) and feeds an image-pooled-CLS halt head `h_t = σ(W_halt · z̄_t)`, drawn as a small green circle. The four `h_t` circles together produce the PonderNet step-marginal distribution `{p_t}` — that's the bus that exits the row to the right.
+- **Per-step loss row (orange, lower).** Each `z_t` also feeds a per-step loss head `L_t` (a rounded orange box). The row tag clarifies these are evaluated student-vs.-teacher at each recursion step (`student z_t` vs. `teacher z_t^T`); the teacher is intentionally not redrawn here — the figure's focus is the student recurrence and how step outputs route into the loss mixture.
+- **Mixture / total-loss box (right, beige).** Both buses (`{p_t}` from the halt row, `{L_t}` from the loss row) flow into the total loss: `Σ_t p_t · L_t + β · KL(p ∥ Geom(λ_p))`. This is the single training objective; per-step student supervision is reweighted by the halting marginals and regularized by KL toward the truncated geometric prior.
+
+**Why the residual pathway is drawn explicitly.** Earlier draft schematics treated the input injection as a side annotation on the shared-stack box. The bypass-and-`⊕` rendering used here is the same convention papers reach for when explaining a skip connection in a backbone, and it makes a content-rich claim of the design legible at a glance: the recurrence's stability is bought by the input injection, not by anything internal to the shared block.
+
+**What is intentionally absent from the figure.** The teacher branch (run once at `T_max`, no halting head, EMA of student, gradients detached, Sinkhorn-Knopp targets shared across all student steps) is described in [`LOOPED_DINOV2.md`](LOOPED_DINOV2.md) §1 and [`training/looped_step.py`](training/looped_step.py). The packed multi-crop input (2 globals + 6 locals per image, BlockDiagonalMask) and the per-step decomposition of `L_t = L^DINO_t + w_iBOT · L^iBOT_t` plus the final-step KoLeo term are also documented there. The figure deliberately abstracts those into the single `L_t` box and the `z_0` input symbol so the recurrence + halt + mixture story stays the visual focus.
