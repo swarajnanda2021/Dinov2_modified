@@ -235,4 +235,62 @@ def get_args_parser():
                              'UNI2-h (8)]. Auto-bumped to 8 if --use_pathology_recipe=True '
                              'and embeddingdim >= 1280.')
 
+    # ========== Looped backbone (weight-tied recurrent depth + adaptive halting) ==========
+    # When --use_looped_backbone=True, the standard depth-`vitdepth` stack of
+    # unique transformer blocks is replaced by a shared stack of `shared_stack_L`
+    # blocks applied `recursion_T_max` times, with sandwich LayerNorm, per-step
+    # time embeddings, and input injection. Halting decisions are made per IMAGE
+    # via a small linear head + PonderNet KL-to-geometric prior. The student
+    # always runs all T_max steps in lockstep; halting only weights the per-
+    # step loss mixture during training, and is consumed for real early exit
+    # at inference.
+    #
+    # This feature is incompatible with --use_typicality_dampening,
+    # --use_prototype_clustering, --use_semantic_ibot, --use_semantic_prototypes,
+    # --use_adversarial_mask_augmentation, --use_cellvit_augmentation, and
+    # --use_random_mask_augmentation in this revision (the looped trainer path
+    # only supports the standard DINO + iBOT + KoLeo/KDE objective). Combinations
+    # are gated by an explicit error in the trainer.
+    #
+    # References:
+    #   - Geiping et al. 2025 "Huginn" (recurrent-depth LMs).      arXiv:2502.05171
+    #   - Zhu et al. 2025 "Ouro / LoopLM".                          arXiv:2510.25741
+    #   - Banino et al. 2021 "PonderNet" (halting + KL prior).      arXiv:2107.05407
+    #   - Yin et al. 2022 "A-ViT" (vision halting + dist. prior).   CVPR 2022
+    #   - Yang et al. 2024 (input injection).                       ICLR 2024
+    #   - Saunshi et al. 2025 (looped inductive bias).              arXiv:2502.17416
+    #   - Schwethelm et al. 2026 (iso-depth scaling).               arXiv:2604.21106
+    parser.add_argument('--use_looped_backbone', default=False, type=utils.bool_flag,
+                        help='Enable weight-tied looped backbone with image-level PonderNet '
+                             'adaptive halting. Default False reduces to vanilla DINOv2.')
+    parser.add_argument('--shared_stack_L', default=3, type=int,
+                        help='Number of unique transformer blocks in the shared stack. '
+                             'The stack is applied `recursion_T_max` times per forward, so '
+                             'effective depth is shared_stack_L * recursion_T_max. Ouro and '
+                             'Huginn report L=3, T_max=4 as a reasonable default at LM scale; '
+                             'pathology pilots should ablate this.')
+    parser.add_argument('--recursion_T_max', default=4, type=int,
+                        help='Number of recursion steps T_max. Both teacher and student run '
+                             'all T_max steps during training; the halting head only weights '
+                             'the per-step loss mixture.')
+    parser.add_argument('--ponder_kl_beta', default=0.01, type=float,
+                        help='Weight of the KL-to-geometric-prior regularizer in the '
+                             'PonderNet halting term (Banino et al. 2021 default).')
+    parser.add_argument('--ponder_lambda_p_start', default=0.9, type=float,
+                        help='Starting value of the geometric-prior parameter lambda_p. '
+                             'Larger lambda_p concentrates mass at earlier steps (encourages '
+                             'shallower halting). Default 0.9 -> E[t] approx 1.1.')
+    parser.add_argument('--ponder_lambda_p_end', default=0.3, type=float,
+                        help='Ending value of lambda_p after annealing. Smaller value '
+                             'concentrates mass at later steps (encourages deeper halting). '
+                             'Default 0.3 -> E[t] approx 3.0 for T_max=4.')
+    parser.add_argument('--ponder_lambda_p_anneal_frac', default=0.3, type=float,
+                        help='Fraction of total iterations over which to linearly anneal '
+                             'lambda_p from start -> end, then hold at end. 0.0 disables '
+                             'annealing.')
+    parser.add_argument('--ponder_inference_threshold', default=0.99, type=float,
+                        help='Cumulative halt probability threshold for inference-time early '
+                             'exit (1 - epsilon). Halts at step t when cumulative h reaches '
+                             'this value. Used by inference drivers; not consumed at training.')
+
     return parser

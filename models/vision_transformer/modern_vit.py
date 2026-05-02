@@ -1,6 +1,11 @@
 """
 Modern Vision Transformer with xformers memory-efficient attention.
 Supports sequence packing, register tokens, and masking for DINOv2.
+
+Optional looped (weight-tied recurrent-depth) backbone variant: when
+`looped_T_max > 0`, the standard stack of `depth` unique blocks is replaced
+by a shared stack of `looped_L` blocks applied `looped_T_max` times. See
+`shared_stack.SharedStack` and `LOOPED_DINOV2.md` for details.
 """
 
 import math
@@ -16,6 +21,8 @@ import xformers.ops as xops
 from xformers.ops import fmha
 
 from timm.models._manipulate import checkpoint_seq
+
+from .shared_stack import SharedStack
 
 # Cache for attention bias to avoid recomputation
 attn_bias_cache = {}
@@ -291,6 +298,8 @@ class VisionTransformer(nn.Module):
         block_fn=TransformerBlock,
         mlp_layer=SwiGLUFFNFused,
         num_register_tokens=4,
+        looped_T_max: int = 0,
+        looped_L: Optional[int] = None,
     ):
         super().__init__()
         assert global_pool in ("", "avg", "token")
@@ -343,21 +352,40 @@ class VisionTransformer(nn.Module):
         
         self.norm_pre = norm_layer(embed_dim) if pre_norm else nn.Identity()
 
-        # Stochastic depth
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        # Looped (weight-tied) backbone: the unique block count is `looped_L`
+        # (default = `depth`) and the shared stack is applied `looped_T_max`
+        # times per forward. When `looped_T_max == 0`, behavior is unchanged.
+        self.looped_T_max = int(looped_T_max) if looped_T_max else 0
+        if self.looped_T_max > 0:
+            self.looped_L = int(looped_L) if looped_L is not None else int(depth)
+            block_count = self.looped_L
+        else:
+            self.looped_L = None
+            block_count = int(depth)
 
-        # LayerScale initialization
+        # Stochastic depth (one rate per unique block; the shared stack reuses
+        # the same per-block drop_path across recursion steps, which is
+        # equivalent to per-recursion-step stochastic depth at the rate of the
+        # underlying block — see __doc__ at top of file).
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, block_count)]
+
+        # LayerScale initialization (effective depth still drives the choice
+        # of init values in looped mode, since T_max * L is what the backbone
+        # represents in operation count).
+        effective_depth = self.looped_T_max * block_count if self.looped_T_max > 0 else block_count
         layer_init_values = []
-        for i in range(depth):
-            if depth < 18:
+        for _ in range(block_count):
+            if effective_depth < 18:
                 layer_init_values.append(0.1)
-            elif depth < 24:
+            elif effective_depth < 24:
                 layer_init_values.append(1e-5)
             else:
                 layer_init_values.append(1e-6)
-        
-        # Transformer blocks
-        self.blocks = nn.Sequential(*[
+
+        # Transformer blocks. Use ModuleList in looped mode so SharedStack
+        # owns the iteration order; nn.Sequential is fine in the standard
+        # mode where the stack is just a forward pass through unique blocks.
+        block_list = [
             block_fn(
                 dim=embed_dim,
                 num_heads=num_heads,
@@ -373,9 +401,20 @@ class VisionTransformer(nn.Module):
                 act_layer=act_layer,
                 mlp_layer=mlp_layer,
             )
-            for i in range(depth)
-        ])
-        
+            for i in range(block_count)
+        ]
+        if self.looped_T_max > 0:
+            self.blocks = nn.ModuleList(block_list)
+            self.shared_stack = SharedStack(
+                blocks=self.blocks,
+                embed_dim=embed_dim,
+                T_max=self.looped_T_max,
+                norm_layer=norm_layer,
+            )
+        else:
+            self.blocks = nn.Sequential(*block_list)
+            self.shared_stack = None
+
         # Final normalization
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
         self.fc_norm = norm_layer(embed_dim) if use_fc_norm else nn.Identity()
@@ -477,6 +516,19 @@ class VisionTransformer(nn.Module):
 
     def get_intermediate_layers(self, x):
         """Extract features at specified points in the network."""
+        if self.looped_T_max > 0:
+            # Quartile extraction by unique-block index doesn't carry the
+            # same meaning under weight tying — `i in extraction_points` runs
+            # only over the L unique blocks of one recursion step, not over
+            # the T_max * L effective depth. For looped models, callers
+            # should pull intermediate states from the shared stack's
+            # per-recursion-step outputs instead.
+            raise NotImplementedError(
+                "get_intermediate_layers is not defined for looped backbones "
+                "(looped_T_max > 0). Use shared_stack(z0, return_per_step=True) "
+                "and pick the recursion-step indices you need."
+            )
+
         x = self.prepare_tokens(x)
         x = self.patch_drop(x)
         x = self.norm_pre(x)
@@ -484,9 +536,9 @@ class VisionTransformer(nn.Module):
         features = []
         total_blocks = len(self.blocks)
         extraction_points = [
-            (total_blocks // 4) - 1, 
-            (total_blocks // 2) - 1, 
-            (3 * total_blocks // 4) - 1, 
+            (total_blocks // 4) - 1,
+            (total_blocks // 2) - 1,
+            (3 * total_blocks // 4) - 1,
             total_blocks - 1
         ]
 
@@ -495,39 +547,58 @@ class VisionTransformer(nn.Module):
             if i in extraction_points:
                 features.append(x)
 
-        return features        
+        return features
     
     def forward_features(self, x):
         """Forward pass through features."""
         x = self.prepare_tokens(x)
         x = self.patch_drop(x)
         x = self.norm_pre(x)
-        
-        x = self.blocks(x)
-            
+
+        if self.looped_T_max > 0:
+            # Looped backbone: run T_max recursion steps through the shared
+            # stack, return only the final-step state. Used by inference and
+            # by the EMA teacher (which always runs to T_max).
+            x = self.shared_stack(
+                x,
+                attn_bias=None,
+                grad_checkpoint=self.grad_checkpointing,
+                return_per_step=False,
+            )
+        else:
+            x = self.blocks(x)
+
         x = self.norm(x)
         return x
 
     def forward_features_list(self, x, masks_list):
         """
         Process multiple crops using sequence packing.
-        
+
         Args:
             x: list of image tensors
             masks_list: list of mask tensors (can be None)
-            
-        Returns:
-            List of output dictionaries, one per crop type
-        """
-        x_packed = []
-        for img, masks in zip(x, masks_list):
-            if masks is not None:
-                x_prep = self.prepare_tokens_with_masks(img, masks)
-            else:
-                x_prep = self.prepare_tokens(img)
-            x_packed.append(x_prep)
 
-        if self.grad_checkpointing and not torch.jit.is_scripting():
+        Returns:
+            List of output dictionaries, one per crop type. In looped mode
+            this returns only the final-step (z_T_max) outputs, preserving the
+            non-looped contract; use `forward_features_list_per_step` to get
+            per-recursion-step outputs.
+        """
+        x_packed = self._prepare_packed(x, masks_list)
+
+        if self.looped_T_max > 0:
+            # Pack once to a single tensor so the shared stack runs T_max
+            # times on the full packed sequence with the same attn_bias.
+            attn_bias, x_cat = get_attn_bias_and_cat(x_packed)
+            x_cat = self.shared_stack(
+                x_cat,
+                attn_bias=attn_bias,
+                grad_checkpoint=self.grad_checkpointing,
+                return_per_step=False,
+            )
+            x_packed = attn_bias.split(x_cat)
+        elif self.grad_checkpointing and not torch.jit.is_scripting():
             # Checkpoint-friendly version
             for blk in self.blocks:
                 attn_bias, x_cat = get_attn_bias_and_cat(x_packed)
@@ -556,6 +627,67 @@ class VisionTransformer(nn.Module):
 
         return outputs
 
+    def _prepare_packed(self, x, masks_list):
+        """Run patch embedding + token preparation for each crop in the list."""
+        x_packed = []
+        for img, masks in zip(x, masks_list):
+            if masks is not None:
+                x_prep = self.prepare_tokens_with_masks(img, masks)
+            else:
+                x_prep = self.prepare_tokens(img)
+            x_packed.append(x_prep)
+        return x_packed
+
+    def forward_features_list_per_step(self, x, masks_list):
+        """
+        Looped-mode forward returning per-recursion-step outputs.
+
+        Only valid when `looped_T_max > 0`. All crops traverse all T_max
+        recursion steps in lockstep; the return is a list of length T_max
+        whose t-th entry is exactly the same shape (list of per-crop dicts)
+        that `forward_features_list` would return.
+
+        Args:
+            x: list of image tensors (one per crop type).
+            masks_list: list of mask tensors (can contain None).
+
+        Returns:
+            List of length T_max; each element is a list of per-crop output
+            dicts with keys 'clstoken', 'regtokens', 'patchtokens', 'masks'.
+        """
+        if self.looped_T_max <= 0:
+            raise RuntimeError(
+                "forward_features_list_per_step requires looped_T_max > 0. "
+                "The standard non-looped backbone produces only one stack of "
+                "outputs."
+            )
+
+        x_packed = self._prepare_packed(x, masks_list)
+        attn_bias, x_cat = get_attn_bias_and_cat(x_packed)
+
+        z_per_step = self.shared_stack(
+            x_cat,
+            attn_bias=attn_bias,
+            grad_checkpoint=self.grad_checkpointing,
+            return_per_step=True,
+        )
+
+        outputs_per_step = []
+        for z_t in z_per_step:
+            x_packed_t = attn_bias.split(z_t)
+            outputs_t = []
+            for x_crop, masks in zip(x_packed_t, masks_list):
+                x_norm = self.norm(x_crop)
+                outputs_t.append({
+                    "clstoken": x_norm[:, 0],
+                    "regtokens": x_norm[:, 1:self.numregisters+1],
+                    "patchtokens": x_norm[:, self.numregisters+1:],
+                    "masks": masks,
+                })
+            outputs_per_step.append(outputs_t)
+
+        return outputs_per_step
+
     def forward(self, x, token_masks=None):
         """
         Forward with automatic detection of single vs multi-crop input.
@@ -581,18 +713,29 @@ class VisionTransformer(nn.Module):
                 x = self.prepare_tokens_with_masks(x, token_masks)
             else:
                 x = self.prepare_tokens(x)
-            
+
             x = self.patch_drop(x)
             x = self.norm_pre(x)
-            
-            if self.grad_checkpointing and not torch.jit.is_scripting():
+
+            if self.looped_T_max > 0:
+                # Looped backbone (non-list path): T_max recursion steps,
+                # final-step output. No early exit here — used by teacher
+                # and by training-time semantic-iBOT side calls. Inference-
+                # time early exit is handled by a separate driver.
+                x = self.shared_stack(
+                    x,
+                    attn_bias=None,
+                    grad_checkpoint=self.grad_checkpointing,
+                    return_per_step=False,
+                )
+            elif self.grad_checkpointing and not torch.jit.is_scripting():
                 x = checkpoint_seq(self.blocks, x)
             else:
                 for blk in self.blocks:
                     x = blk(x, attn_bias=None)
-            
+
             x = self.norm(x)
-            
+
             return {
                 'clstoken': x[:, 0],
                 'regtokens': x[:, 1:self.numregisters+1],

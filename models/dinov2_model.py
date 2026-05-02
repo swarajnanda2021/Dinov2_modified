@@ -11,7 +11,7 @@ class CombinedModelDINO(nn.Module):
     """
     Combined model for DINOv2 with iBOT using sequence packing.
     Now delegates packing to the backbone.
-    
+
     Args:
         backbone: Vision Transformer backbone
         classhead: Projection head for CLS tokens (DINO)
@@ -19,21 +19,26 @@ class CombinedModelDINO(nn.Module):
         num_masks: Number of semantic masks (legacy, kept for compatibility)
         patch_size: Patch size of the backbone
     """
-    def __init__(self, backbone, classhead, patchhead, num_masks=6, patch_size=16):
+    def __init__(self, backbone, classhead, patchhead, num_masks=6, patch_size=16, halt_head=None):
         super().__init__()
-        
+
         # Remove fc and head if they exist
         if hasattr(backbone, 'fc'):
             backbone.fc = nn.Identity()
         if hasattr(backbone, 'head'):
             backbone.head = nn.Identity()
-            
+
         self.backbone = backbone
         self.classhead = classhead
         self.patchhead = patchhead
+        # Optional looped-backbone halting head. When None, this is just a
+        # plain DINOv2 model. When provided, it must be an `nn.Module` with
+        # signature halt_head(cls_pool: [N, D]) -> [N] in (0, 1). Sits inside
+        # CombinedModelDINO so the student's DDP wrapper covers its params.
+        self.halt_head = halt_head
         self.num_masks = num_masks
         self.patch_size = patch_size
-    
+
     def set_grad_checkpointing(self, enable=True):
         """Enable gradient checkpointing in the backbone."""
         if hasattr(self.backbone, 'set_grad_checkpointing'):
@@ -42,7 +47,14 @@ class CombinedModelDINO(nn.Module):
         else:
             print(f"⚠ Warning: Backbone does not support gradient checkpointing")
 
-    def forward(self, crops, token_masks=None, mode='dino', return_bottleneck=False):
+    def forward(
+        self,
+        crops,
+        token_masks=None,
+        mode='dino',
+        return_bottleneck=False,
+        return_per_step=False,
+    ):
         """
         Unified forward supporting both DINO and iBOT modes.
 
@@ -58,10 +70,18 @@ class CombinedModelDINO(nn.Module):
             return_bottleneck: If True (multi-crop / DINO path only), also return
                 the pre-prototype bottleneck representation from the classhead.
                 Used by the typicality dampening feature.
+            return_per_step: If True AND the backbone is looped (looped_T_max>0)
+                AND `crops` is a list, run all T_max recursion steps in lockstep
+                and return per-recursion-step outputs. Used by the looped
+                student to compute the PonderNet-mixture-weighted loss.
 
         Returns:
             Dictionary with keys depending on mode:
-            - DINO: {'cls_outputs': tensor, 'features_list': list of dicts[, 'bottleneck': tensor]}
+            - DINO (return_per_step=False):
+                {'cls_outputs': tensor, 'features_list': list of dicts[, 'bottleneck': tensor]}
+            - DINO (return_per_step=True):
+                {'cls_outputs_per_step': list[T_max] of [B*ncrops, out_dim],
+                 'features_list_per_step': list[T_max] of list of dicts}
             - iBOT: {'patch_outputs': tensor, 'features': dict, 'cls_output': tensor}
         """
 
@@ -69,55 +89,73 @@ class CombinedModelDINO(nn.Module):
         is_multi_crop = isinstance(crops, list)
 
         if is_multi_crop:
-            # ========== MULTI-CROP MODE (DINO) ==========
             # Ensure masks is also a list
             if token_masks is None:
                 token_masks = [None] * len(crops)
             elif not isinstance(token_masks, list):
-                # Single mask provided, assume it's for first crop
                 token_masks = [token_masks] + [None] * (len(crops) - 1)
 
-            # Forward through backbone with packing
-            # backbone.forward() will detect list and call forward_features_list()
-            outputs_list = self.backbone(crops, token_masks=token_masks)
-            # outputs_list: [{'clstoken': [B,D], 'patchtokens': [B,N,D], ...}, ...]
+            if return_per_step:
+                if not getattr(self.backbone, 'looped_T_max', 0):
+                    raise RuntimeError(
+                        "return_per_step=True requires a looped backbone "
+                        "(VisionTransformer constructed with looped_T_max > 0)."
+                    )
+                # Per-step looped path: run shared stack T_max times and
+                # apply heads at each step. Returns nested-by-step outputs.
+                outputs_per_step = self.backbone.forward_features_list_per_step(
+                    crops, token_masks
+                )
+                cls_outputs_per_step = []
+                bottleneck_per_step = []
+                for outputs_t in outputs_per_step:
+                    cls_cat_t = torch.cat([d['clstoken'] for d in outputs_t], dim=0)
+                    if return_bottleneck:
+                        cls_out_t, btl_t = self.classhead(cls_cat_t, return_bottleneck=True)
+                        bottleneck_per_step.append(btl_t)
+                    else:
+                        cls_out_t = self.classhead(cls_cat_t)
+                    cls_outputs_per_step.append(cls_out_t)
 
-            # Collect all CLS tokens and apply head
+                result = {
+                    'cls_outputs_per_step': cls_outputs_per_step,
+                    'features_list_per_step': outputs_per_step,
+                }
+                if return_bottleneck:
+                    result['bottleneck_per_step'] = bottleneck_per_step
+                return result
+
+            # ========== MULTI-CROP MODE (DINO), single-step return ==========
+            outputs_list = self.backbone(crops, token_masks=token_masks)
+
             all_cls_tokens = []
             for output_dict in outputs_list:
                 all_cls_tokens.append(output_dict['clstoken'])
 
-            # Concatenate all CLS tokens: [B1+B2+...+BN, D]
             cls_tokens_cat = torch.cat(all_cls_tokens, dim=0)
 
-            # Apply DINO head
             if return_bottleneck:
                 cls_outputs, bottleneck = self.classhead(cls_tokens_cat, return_bottleneck=True)
             else:
                 cls_outputs = self.classhead(cls_tokens_cat)
 
             result = {
-                'cls_outputs': cls_outputs,  # [total_crops, out_dim]
-                'features_list': outputs_list,  # List of dicts
+                'cls_outputs': cls_outputs,
+                'features_list': outputs_list,
             }
             if return_bottleneck:
                 result['bottleneck'] = bottleneck
             return result
-        
+
         else:
             # ========== SINGLE IMAGE MODE (iBOT) ==========
-            # crops is a single tensor [B, C, H, W]
-            
-            # Forward through backbone
             output_dict = self.backbone(crops, token_masks=token_masks)
-            # output_dict: {'clstoken': [B,D], 'patchtokens': [B,N,D], ...}
-            
-            # Apply heads
+
             cls_output = self.classhead(output_dict['clstoken'])
             patch_outputs = self.patchhead(output_dict['patchtokens'])
-            
+
             return {
-                'cls_output': cls_output,  # [B, out_dim]
-                'patch_outputs': patch_outputs,  # [B, N, out_dim]
-                'features': output_dict,  # Full feature dict
+                'cls_output': cls_output,
+                'patch_outputs': patch_outputs,
+                'features': output_dict,
             }

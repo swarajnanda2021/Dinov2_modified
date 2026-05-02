@@ -21,7 +21,7 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 
 import utils
-from models import CombinedModelDINO, LinearPrototypeBank, ModernViT, DINOHead
+from models import CombinedModelDINO, LinearPrototypeBank, ModernViT, DINOHead, HaltHead
 from losses import DINOLoss, iBOTPatchLoss, KoLeoLoss, KDELoss, PatchPrototypeLoss
 from data import ProportionalMultiDatasetWrapper
 from .helpers import (
@@ -40,6 +40,7 @@ from .helpers import (
     setup_ddp_model,
 )
 from typicality import RepresentativePrototypes, TypicalityBank, TypicalityScorer
+from .looped_step import compute_looped_step
 
 
 def _gather_and_compute_weights(patch_tokens, mask, masks_weight=None):
@@ -125,6 +126,44 @@ def train_dinov2(args):
               f"register_tokens={args.num_register_tokens}, StableAdamW active")
     elif getattr(args, 'qk_norm', None) is None:
         args.qk_norm = False  # safe default when auto-gate doesn't fire
+
+    # ============ Looped backbone: validate incompatible combinations ============
+    # The looped + PonderNet path in this revision intentionally supports only
+    # standard DINO + iBOT + KoLeo/KDE. Combining with semantic iBOT, prototype
+    # clustering, typicality dampening, or any of the augmentation-as-view
+    # extensions would require interleaving per-step recursion with each of
+    # those features' own forward passes / loss heads — out of scope here.
+    use_looped_backbone = bool(getattr(args, 'use_looped_backbone', False))
+    if use_looped_backbone:
+        incompatible = []
+        if getattr(args, 'use_semantic_ibot', False):
+            incompatible.append('--use_semantic_ibot')
+        if getattr(args, 'use_semantic_prototypes', False):
+            incompatible.append('--use_semantic_prototypes')
+        if getattr(args, 'use_prototype_clustering', False):
+            incompatible.append('--use_prototype_clustering')
+        if getattr(args, 'use_typicality_dampening', False):
+            incompatible.append('--use_typicality_dampening')
+        if getattr(args, 'use_adversarial_mask_augmentation', False):
+            incompatible.append('--use_adversarial_mask_augmentation')
+        if getattr(args, 'use_cellvit_augmentation', False):
+            incompatible.append('--use_cellvit_augmentation')
+        if getattr(args, 'use_random_mask_augmentation', False):
+            incompatible.append('--use_random_mask_augmentation')
+        if incompatible:
+            raise ValueError(
+                "--use_looped_backbone=True is not supported in combination with: "
+                f"{', '.join(incompatible)}. Disable those flags or run without "
+                "the looped backbone for this revision."
+            )
+        if args.recursion_T_max < 1:
+            raise ValueError(f"--recursion_T_max must be >= 1, got {args.recursion_T_max}")
+        if args.shared_stack_L < 1:
+            raise ValueError(f"--shared_stack_L must be >= 1, got {args.shared_stack_L}")
+        print(f"[looped backbone] Enabled. shared_stack_L={args.shared_stack_L}, "
+              f"recursion_T_max={args.recursion_T_max}, kl_beta={args.ponder_kl_beta}, "
+              f"lambda_p {args.ponder_lambda_p_start}->{args.ponder_lambda_p_end} "
+              f"over first {args.ponder_lambda_p_anneal_frac*100:.0f}% of training.")
 
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
@@ -269,6 +308,9 @@ def train_dinov2(args):
     )
 
     # ============ Initialize models ============
+    looped_T_max = args.recursion_T_max if use_looped_backbone else 0
+    looped_L = args.shared_stack_L if use_looped_backbone else None
+
     student_encoder = ModernViT(
         img_size=224,
         patch_size=args.patch_size,
@@ -282,6 +324,8 @@ def train_dinov2(args):
         drop_path_rate=0.4,
         pre_norm=False,
         num_register_tokens=args.num_register_tokens,
+        looped_T_max=looped_T_max,
+        looped_L=looped_L,
     )
 
     teacher_encoder = deepcopy(student_encoder)
@@ -312,12 +356,17 @@ def train_dinov2(args):
         use_bn=args.use_bn_in_head,
     )
 
+    # Halt head is part of the student so the student's DDP wrapper covers it.
+    # Teacher always runs at T_max with no halting and therefore has no head.
+    student_halt_head = HaltHead(args.embeddingdim) if use_looped_backbone else None
+
     student = CombinedModelDINO(
         backbone=student_encoder,
         classhead=student_classhead,
         patchhead=student_patchhead,
         num_masks=args.num_masks,
         patch_size=args.patch_size,
+        halt_head=student_halt_head,
     )
 
     teacher = CombinedModelDINO(
@@ -326,6 +375,7 @@ def train_dinov2(args):
         patchhead=teacher_patchhead,
         num_masks=args.num_masks,
         patch_size=args.patch_size,
+        halt_head=None,
     )
 
     # ============ Create Prototype Bank (Optional) ============
@@ -444,16 +494,31 @@ def train_dinov2(args):
         bf16_mode = False
 
     # ============ Create optimizers ============
+    # In looped mode the backbone has shared_stack_L unique blocks
+    # (named blocks.0 ... blocks.{L-1}); pass L as num_layers so layer-wise
+    # LR decay multipliers stay calibrated to the actual unique-block count.
+    backbone_layer_count = args.shared_stack_L if use_looped_backbone else args.vitdepth
     backbone_params = utils.get_params_groups_with_layer_decay(
         student.module.backbone,
         lr_decay_rate=args.lr_decay_rate,
-        num_layers=args.vitdepth,
+        num_layers=backbone_layer_count,
     )
 
     classhead_params = utils.get_params_groups_with_decay_for_heads(student.module.classhead)
     patchhead_params = utils.get_params_groups_with_decay_for_heads(student.module.patchhead)
 
     all_param_groups = backbone_params + classhead_params + patchhead_params
+
+    # Halt head: tiny (D + 1 params). One group, no weight decay.
+    if use_looped_backbone and student.module.halt_head is not None:
+        halt_params = [p for p in student.module.halt_head.parameters() if p.requires_grad]
+        if halt_params:
+            all_param_groups.append({
+                'params': halt_params,
+                'lr_multiplier': 1.0,
+                'wd_multiplier': 0.0,
+                'weight_decay': 0.0,
+            })
 
     if auto_gate_active:
         optimizer_student = utils.StableAdamW(all_param_groups, betas=(0.9, 0.95))
@@ -884,253 +949,298 @@ def train_dinov2(args):
             optimizer_prototypes.zero_grad()
 
         # ========== Forward passes and loss computation ==========
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16 or bf16_mode):
-            # ========== DINO Loss with Sequence Packing ==========
-
+        if use_looped_backbone:
+            # PonderNet mixture-weighted: student runs T_max recursion steps in
+            # lockstep on every crop, halting head emits per-image step marginals
+            # p_t (sum_t p_t = 1), and the total loss is sum_t p_t * (DINO_t + iBOT_t)
+            # with KL toward a truncated geometric prior. See LOOPED_DINOV2.md.
             student_masks = [block_masks_1, block_masks_2] + [None] * len(student_local_crops)
-
-            # Teacher forward (unmasked targets)
-            with torch.no_grad():
-                teacher_output = teacher(teacher_global_crops, token_masks=[None, None], mode='dino')
-                teacher_cls_outputs = teacher_output['cls_outputs']
-                teacher_patch_tokens_g1 = teacher_output['features_list'][0]['patchtokens']
-                teacher_patch_tokens_g2 = teacher_output['features_list'][1]['patchtokens']
-
-            # Student forward (all crops, masks on global crops)
-            student_output = student(student_all_crops, token_masks=student_masks, mode='dino',
-                                     return_bottleneck=args.use_typicality_dampening)
-            student_cls_outputs = student_output['cls_outputs']
-            student_patch_tokens_g1 = student_output['features_list'][0]['patchtokens']
-            student_patch_tokens_g2 = student_output['features_list'][1]['patchtokens']
-
-            # ========== Typicality Dampening ==========
-            typicality_temperatures = None
-            typicality_weights = None
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16 or bf16_mode):
+                looped_out = compute_looped_step(
+                    student=student,
+                    teacher=teacher,
+                    student_all_crops=student_all_crops,
+                    student_masks=student_masks,
+                    teacher_global_crops=teacher_global_crops,
+                    block_masks_1=block_masks_1,
+                    masks_weight_1=masks_weight_1,
+                    block_masks_2=block_masks_2,
+                    masks_weight_2=masks_weight_2,
+                    dino_class_loss=dino_class_loss,
+                    dino_koleo_loss=dino_koleo_loss,
+                    args=args,
+                    current_iteration=current_iteration,
+                    bf16_mode=bf16_mode,
+                )
+            student_loss = looped_out['student_loss']
+            dino_class_loss_val = looped_out['dino_class_loss_val']
+            ibot_loss_val = looped_out['ibot_loss_val']
+            koleo_loss_val = looped_out['koleo_loss_val']
+            kl_loss_val = looped_out['kl_loss_val']
+            mean_halt_step = looped_out['mean_halt_step']
+            h_mean_per_step = looped_out['h_mean_per_step']
+            lambda_p_value = looped_out['lambda_p']
+            # Placeholders for non-applicable features (validated off above).
+            prototype_loss = torch.tensor(0.0, device='cuda')
+            clustering_loss = torch.tensor(0.0, device='cuda')
+            semantic_ibot_loss_val = torch.tensor(0.0, device='cuda')
+            semantic_clustering_loss = torch.tensor(0.0, device='cuda')
+            teacher_proto_loss = torch.tensor(0.0, device='cuda')
+            semantic_teacher_proto_loss = torch.tensor(0.0, device='cuda')
+            koleo_proto_loss = torch.tensor(0.0, device='cuda')
+            semantic_koleo_proto_loss = torch.tensor(0.0, device='cuda')
             bank_output = {'ready': False}
             t = None
-
-            if args.use_typicality_dampening and repr_protos is not None:
-                with torch.no_grad():
-                    # Extract bottleneck from global crop 1: first B entries
-                    z_global1 = student_output['bottleneck'][:batch_size].detach()
-
-                    # Compute morphology signatures
-                    s_batch = repr_protos.compute_signatures(z_global1)
-
-                    # Bank update and scoring
-                    bank_output = typicality_bank.update_and_score(s_batch)
-
-                    if bank_output['ready'] and current_iteration >= args.typicality_warmup_iters:
-                        t = TypicalityScorer.compute_scores(
-                            bank_output['d'], bank_output['mu'], bank_output['sigma']
-                        )
-
-                        if args.typicality_modulation == 'adaptive_temp':
-                            typicality_temperatures = TypicalityScorer.adaptive_temperature(
-                                t, tau_base=dino_class_loss.student_temp, alpha=args.typicality_alpha
-                            )
-                        else:
-                            typicality_weights = TypicalityScorer.sample_weights(
-                                t, beta=args.typicality_beta
-                            )
-                    else:
-                        t = torch.zeros(batch_size, device=z_global1.device)
-
-            # DINO CLS loss
-            dino_class_loss_val = dino_class_loss(
-                student_cls_outputs,
-                teacher_cls_outputs,
-                current_iteration,
-                sample_temperatures=typicality_temperatures,
-                sample_weights=typicality_weights,
-            )
-
-            # ========== KoLeo Loss ==========
-            # Matches morphological_rarity: if adversarial-mask-as-student-view is enabled,
-            # its masked globals are included in the KoLeo regularizer (CellViT / random
-            # masked globals are left out).
-            num_global_total = args.global_views
-            if args.use_adversarial_mask_augmentation:
-                num_global_total += args.num_masks
-            global_features_list = student_output['features_list'][:num_global_total]
-            global_cls_tokens = [feat_dict['clstoken'] for feat_dict in global_features_list]
-
-            koleo_loss_val = torch.tensor(0.0).cuda()
-            if len(global_cls_tokens) > 0:
-                koleo_loss_val = sum(dino_koleo_loss(token) for token in global_cls_tokens) / len(global_cls_tokens)
-
-            # ================================================================
-            # iBOT Loss — gather-then-project to avoid [B, N, 65536] tensors.
-            # Projects only masked tokens (~7k) instead of all tokens (~50k).
-            # Semantic iBOT integrated here, reusing teacher backbone tokens.
-            # ================================================================
-            current_teacher_temp_ibot = dino_class_loss.teacher_temp_schedule(current_iteration)
-
-            semantic_ibot_loss_val = torch.tensor(0.0, device='cuda')
-            semantic_backbone_outputs = []  # Raw [B, N, D] tokens for prototype section
-
-            # ---------- Block iBOT: Global crop 1 ----------
-            s_gathered_1, weights_1, B = _gather_and_compute_weights(
-                student_patch_tokens_g1, block_masks_1, masks_weight_1
-            )
-
-            if s_gathered_1 is not None:
-                with torch.no_grad():
-                    t_gathered_1 = teacher_patch_tokens_g1.reshape(-1, teacher_patch_tokens_g1.shape[-1])[
-                        block_masks_1.reshape(-1).nonzero(as_tuple=True)[0]
-                    ]
-                    t_proj_1 = teacher.module.patchhead(t_gathered_1)
-
-                s_proj_1 = student.module.patchhead(s_gathered_1)
-
-                ibot_loss_g1 = ibot_patch_loss.forward_gathered(
-                    s_proj_1, t_proj_1, weights_1, B, current_teacher_temp_ibot
-                )
-                del s_proj_1, t_proj_1, s_gathered_1, t_gathered_1
-            else:
-                ibot_loss_g1 = torch.tensor(0.0, device='cuda')
-
-            # ---------- Semantic iBOT on global crop 1 ----------
-            if args.use_semantic_ibot and semantic_token_masks is not None:
-                ibot_accum = 0.0
-
-                for sem_mask, sem_weight in zip(semantic_token_masks, semantic_masks_weights):
-                    # Backbone forward with semantic mask tokens
-                    sem_backbone_out = student.module.backbone(
-                        teacher_global_crops[0], token_masks=sem_mask
-                    )
-                    sem_patch_raw = sem_backbone_out['patchtokens']  # [B, N, D]
-
-                    # Store for prototype section (backbone-dim, ~0.4 GB each)
-                    semantic_backbone_outputs.append((sem_patch_raw, sem_mask, sem_weight))
-
-                    # Gather only masked tokens, then project
-                    sem_s_gathered, sem_weights, _ = _gather_and_compute_weights(
-                        sem_patch_raw, sem_mask, sem_weight
-                    )
-
-                    if sem_s_gathered is not None:
-                        with torch.no_grad():
-                            sem_t_gathered = teacher_patch_tokens_g1.reshape(-1, teacher_patch_tokens_g1.shape[-1])[
-                                sem_mask.reshape(-1).nonzero(as_tuple=True)[0]
-                            ]
-                            sem_t_proj = teacher.module.patchhead(sem_t_gathered)
-
-                        sem_s_proj = student.module.patchhead(sem_s_gathered)
-
-                        loss_ibot = ibot_patch_loss.forward_gathered(
-                            sem_s_proj, sem_t_proj, sem_weights, B, current_teacher_temp_ibot
-                        )
-                        ibot_accum += loss_ibot
-                        del sem_s_proj, sem_t_proj, sem_s_gathered, sem_t_gathered
-
-                    del sem_backbone_out
-
-                n_ch = len(semantic_token_masks)
-                semantic_ibot_loss_val = ibot_accum / n_ch
-
-            # ---------- Block iBOT: Global crop 2 ----------
-            s_gathered_2, weights_2, _ = _gather_and_compute_weights(
-                student_patch_tokens_g2, block_masks_2, masks_weight_2
-            )
-
-            if s_gathered_2 is not None:
-                with torch.no_grad():
-                    t_gathered_2 = teacher_patch_tokens_g2.reshape(-1, teacher_patch_tokens_g2.shape[-1])[
-                        block_masks_2.reshape(-1).nonzero(as_tuple=True)[0]
-                    ]
-                    t_proj_2 = teacher.module.patchhead(t_gathered_2)
-
-                s_proj_2 = student.module.patchhead(s_gathered_2)
-
-                ibot_loss_g2 = ibot_patch_loss.forward_gathered(
-                    s_proj_2, t_proj_2, weights_2, B, current_teacher_temp_ibot
-                )
-                del s_proj_2, t_proj_2, s_gathered_2, t_gathered_2
-            else:
-                ibot_loss_g2 = torch.tensor(0.0, device='cuda')
-
-            ibot_loss_val = (ibot_loss_g1 + ibot_loss_g2) / 2.0
-
-        # ================================================================
-        # Patch Prototype Clustering
-        # Operates on backbone-dim [B, N, 768] — no memory concern.
-        # Semantic prototype loss integrated here.
-        # ================================================================
-        semantic_clustering_loss = torch.tensor(0.0, device='cuda')
-        semantic_teacher_proto_loss = torch.tensor(0.0, device='cuda')
-        semantic_koleo_proto_loss = torch.tensor(0.0, device='cuda')
-
-        if args.use_prototype_clustering:
-            current_teacher_temp = dino_class_loss.teacher_temp_schedule(current_iteration)
-
+            typicality_temperatures = None
+            typicality_weights = None
+        else:
             with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16 or bf16_mode):
-                # ---------- Block mask prototype: Global crop 1 ----------
-                clust_loss_g1, proto_loss_g1, koleo_proto_g1 = patch_prototype_loss(
-                    teacher_patch_tokens_g1,
-                    student_patch_tokens_g1,
-                    block_masks_1,
-                    prototype_bank,
+                # ========== DINO Loss with Sequence Packing ==========
+
+                student_masks = [block_masks_1, block_masks_2] + [None] * len(student_local_crops)
+
+                # Teacher forward (unmasked targets)
+                with torch.no_grad():
+                    teacher_output = teacher(teacher_global_crops, token_masks=[None, None], mode='dino')
+                    teacher_cls_outputs = teacher_output['cls_outputs']
+                    teacher_patch_tokens_g1 = teacher_output['features_list'][0]['patchtokens']
+                    teacher_patch_tokens_g2 = teacher_output['features_list'][1]['patchtokens']
+
+                # Student forward (all crops, masks on global crops)
+                student_output = student(student_all_crops, token_masks=student_masks, mode='dino',
+                                         return_bottleneck=args.use_typicality_dampening)
+                student_cls_outputs = student_output['cls_outputs']
+                student_patch_tokens_g1 = student_output['features_list'][0]['patchtokens']
+                student_patch_tokens_g2 = student_output['features_list'][1]['patchtokens']
+
+                # ========== Typicality Dampening ==========
+                typicality_temperatures = None
+                typicality_weights = None
+                bank_output = {'ready': False}
+                t = None
+
+                if args.use_typicality_dampening and repr_protos is not None:
+                    with torch.no_grad():
+                        # Extract bottleneck from global crop 1: first B entries
+                        z_global1 = student_output['bottleneck'][:batch_size].detach()
+
+                        # Compute morphology signatures
+                        s_batch = repr_protos.compute_signatures(z_global1)
+
+                        # Bank update and scoring
+                        bank_output = typicality_bank.update_and_score(s_batch)
+
+                        if bank_output['ready'] and current_iteration >= args.typicality_warmup_iters:
+                            t = TypicalityScorer.compute_scores(
+                                bank_output['d'], bank_output['mu'], bank_output['sigma']
+                            )
+
+                            if args.typicality_modulation == 'adaptive_temp':
+                                typicality_temperatures = TypicalityScorer.adaptive_temperature(
+                                    t, tau_base=dino_class_loss.student_temp, alpha=args.typicality_alpha
+                                )
+                            else:
+                                typicality_weights = TypicalityScorer.sample_weights(
+                                    t, beta=args.typicality_beta
+                                )
+                        else:
+                            t = torch.zeros(batch_size, device=z_global1.device)
+
+                # DINO CLS loss
+                dino_class_loss_val = dino_class_loss(
+                    student_cls_outputs,
+                    teacher_cls_outputs,
                     current_iteration,
-                    current_teacher_temp,
-                    masks_weight=masks_weight_1
+                    sample_temperatures=typicality_temperatures,
+                    sample_weights=typicality_weights,
                 )
 
-                # ---------- Semantic prototype on global crop 1 ----------
-                if args.use_semantic_prototypes and len(semantic_backbone_outputs) > 0:
-                    # Randomly select one semantic channel for prototype loss (for economical reasons)
-                    sem_idx = random.randint(0, len(semantic_backbone_outputs) - 1)
-                    sem_patch_raw, sem_mask, sem_weight = semantic_backbone_outputs[sem_idx]
+                # ========== KoLeo Loss ==========
+                # Matches morphological_rarity: if adversarial-mask-as-student-view is enabled,
+                # its masked globals are included in the KoLeo regularizer (CellViT / random
+                # masked globals are left out).
+                num_global_total = args.global_views
+                if args.use_adversarial_mask_augmentation:
+                    num_global_total += args.num_masks
+                global_features_list = student_output['features_list'][:num_global_total]
+                global_cls_tokens = [feat_dict['clstoken'] for feat_dict in global_features_list]
 
-                    semantic_clustering_loss, semantic_teacher_proto_loss, semantic_koleo_proto_loss = patch_prototype_loss(
+                koleo_loss_val = torch.tensor(0.0).cuda()
+                if len(global_cls_tokens) > 0:
+                    koleo_loss_val = sum(dino_koleo_loss(token) for token in global_cls_tokens) / len(global_cls_tokens)
+
+                # ================================================================
+                # iBOT Loss — gather-then-project to avoid [B, N, 65536] tensors.
+                # Projects only masked tokens (~7k) instead of all tokens (~50k).
+                # Semantic iBOT integrated here, reusing teacher backbone tokens.
+                # ================================================================
+                current_teacher_temp_ibot = dino_class_loss.teacher_temp_schedule(current_iteration)
+
+                semantic_ibot_loss_val = torch.tensor(0.0, device='cuda')
+                semantic_backbone_outputs = []  # Raw [B, N, D] tokens for prototype section
+
+                # ---------- Block iBOT: Global crop 1 ----------
+                s_gathered_1, weights_1, B = _gather_and_compute_weights(
+                    student_patch_tokens_g1, block_masks_1, masks_weight_1
+                )
+
+                if s_gathered_1 is not None:
+                    with torch.no_grad():
+                        t_gathered_1 = teacher_patch_tokens_g1.reshape(-1, teacher_patch_tokens_g1.shape[-1])[
+                            block_masks_1.reshape(-1).nonzero(as_tuple=True)[0]
+                        ]
+                        t_proj_1 = teacher.module.patchhead(t_gathered_1)
+
+                    s_proj_1 = student.module.patchhead(s_gathered_1)
+
+                    ibot_loss_g1 = ibot_patch_loss.forward_gathered(
+                        s_proj_1, t_proj_1, weights_1, B, current_teacher_temp_ibot
+                    )
+                    del s_proj_1, t_proj_1, s_gathered_1, t_gathered_1
+                else:
+                    ibot_loss_g1 = torch.tensor(0.0, device='cuda')
+
+                # ---------- Semantic iBOT on global crop 1 ----------
+                if args.use_semantic_ibot and semantic_token_masks is not None:
+                    ibot_accum = 0.0
+
+                    for sem_mask, sem_weight in zip(semantic_token_masks, semantic_masks_weights):
+                        # Backbone forward with semantic mask tokens
+                        sem_backbone_out = student.module.backbone(
+                            teacher_global_crops[0], token_masks=sem_mask
+                        )
+                        sem_patch_raw = sem_backbone_out['patchtokens']  # [B, N, D]
+
+                        # Store for prototype section (backbone-dim, ~0.4 GB each)
+                        semantic_backbone_outputs.append((sem_patch_raw, sem_mask, sem_weight))
+
+                        # Gather only masked tokens, then project
+                        sem_s_gathered, sem_weights, _ = _gather_and_compute_weights(
+                            sem_patch_raw, sem_mask, sem_weight
+                        )
+
+                        if sem_s_gathered is not None:
+                            with torch.no_grad():
+                                sem_t_gathered = teacher_patch_tokens_g1.reshape(-1, teacher_patch_tokens_g1.shape[-1])[
+                                    sem_mask.reshape(-1).nonzero(as_tuple=True)[0]
+                                ]
+                                sem_t_proj = teacher.module.patchhead(sem_t_gathered)
+
+                            sem_s_proj = student.module.patchhead(sem_s_gathered)
+
+                            loss_ibot = ibot_patch_loss.forward_gathered(
+                                sem_s_proj, sem_t_proj, sem_weights, B, current_teacher_temp_ibot
+                            )
+                            ibot_accum += loss_ibot
+                            del sem_s_proj, sem_t_proj, sem_s_gathered, sem_t_gathered
+
+                        del sem_backbone_out
+
+                    n_ch = len(semantic_token_masks)
+                    semantic_ibot_loss_val = ibot_accum / n_ch
+
+                # ---------- Block iBOT: Global crop 2 ----------
+                s_gathered_2, weights_2, _ = _gather_and_compute_weights(
+                    student_patch_tokens_g2, block_masks_2, masks_weight_2
+                )
+
+                if s_gathered_2 is not None:
+                    with torch.no_grad():
+                        t_gathered_2 = teacher_patch_tokens_g2.reshape(-1, teacher_patch_tokens_g2.shape[-1])[
+                            block_masks_2.reshape(-1).nonzero(as_tuple=True)[0]
+                        ]
+                        t_proj_2 = teacher.module.patchhead(t_gathered_2)
+
+                    s_proj_2 = student.module.patchhead(s_gathered_2)
+
+                    ibot_loss_g2 = ibot_patch_loss.forward_gathered(
+                        s_proj_2, t_proj_2, weights_2, B, current_teacher_temp_ibot
+                    )
+                    del s_proj_2, t_proj_2, s_gathered_2, t_gathered_2
+                else:
+                    ibot_loss_g2 = torch.tensor(0.0, device='cuda')
+
+                ibot_loss_val = (ibot_loss_g1 + ibot_loss_g2) / 2.0
+
+            # ================================================================
+            # Patch Prototype Clustering
+            # Operates on backbone-dim [B, N, 768] — no memory concern.
+            # Semantic prototype loss integrated here.
+            # ================================================================
+            semantic_clustering_loss = torch.tensor(0.0, device='cuda')
+            semantic_teacher_proto_loss = torch.tensor(0.0, device='cuda')
+            semantic_koleo_proto_loss = torch.tensor(0.0, device='cuda')
+
+            if args.use_prototype_clustering:
+                current_teacher_temp = dino_class_loss.teacher_temp_schedule(current_iteration)
+
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16 or bf16_mode):
+                    # ---------- Block mask prototype: Global crop 1 ----------
+                    clust_loss_g1, proto_loss_g1, koleo_proto_g1 = patch_prototype_loss(
                         teacher_patch_tokens_g1,
-                        sem_patch_raw,
-                        sem_mask,
+                        student_patch_tokens_g1,
+                        block_masks_1,
                         prototype_bank,
                         current_iteration,
                         current_teacher_temp,
-                        masks_weight=sem_weight
+                        masks_weight=masks_weight_1
                     )
 
-                # Free semantic backbone outputs
+                    # ---------- Semantic prototype on global crop 1 ----------
+                    if args.use_semantic_prototypes and len(semantic_backbone_outputs) > 0:
+                        # Randomly select one semantic channel for prototype loss (for economical reasons)
+                        sem_idx = random.randint(0, len(semantic_backbone_outputs) - 1)
+                        sem_patch_raw, sem_mask, sem_weight = semantic_backbone_outputs[sem_idx]
+
+                        semantic_clustering_loss, semantic_teacher_proto_loss, semantic_koleo_proto_loss = patch_prototype_loss(
+                            teacher_patch_tokens_g1,
+                            sem_patch_raw,
+                            sem_mask,
+                            prototype_bank,
+                            current_iteration,
+                            current_teacher_temp,
+                            masks_weight=sem_weight
+                        )
+
+                    # Free semantic backbone outputs
+                    del semantic_backbone_outputs
+                    semantic_backbone_outputs = []
+
+                    # ---------- Block mask prototype: Global crop 2 ----------
+                    clust_loss_g2, proto_loss_g2, koleo_proto_g2 = patch_prototype_loss(
+                        teacher_patch_tokens_g2,
+                        student_patch_tokens_g2,
+                        block_masks_2,
+                        prototype_bank,
+                        current_iteration,
+                        current_teacher_temp,
+                        masks_weight=masks_weight_2
+                    )
+
+                    clustering_loss = (clust_loss_g1 + clust_loss_g2) / 2.0
+                    teacher_proto_loss = (proto_loss_g1 + proto_loss_g2) / 2.0
+                    koleo_proto_loss = (koleo_proto_g1 + koleo_proto_g2) / 2.0
+
+                prototype_loss = teacher_proto_loss + koleo_proto_loss
+                if args.use_semantic_prototypes:
+                    prototype_loss = prototype_loss + semantic_teacher_proto_loss + semantic_koleo_proto_loss
+            else:
                 del semantic_backbone_outputs
-                semantic_backbone_outputs = []
 
-                # ---------- Block mask prototype: Global crop 2 ----------
-                clust_loss_g2, proto_loss_g2, koleo_proto_g2 = patch_prototype_loss(
-                    teacher_patch_tokens_g2,
-                    student_patch_tokens_g2,
-                    block_masks_2,
-                    prototype_bank,
-                    current_iteration,
-                    current_teacher_temp,
-                    masks_weight=masks_weight_2
-                )
+                clustering_loss = torch.tensor(0.0).cuda()
+                teacher_proto_loss = torch.tensor(0.0).cuda()
+                koleo_proto_loss = torch.tensor(0.0).cuda()
+                prototype_loss = torch.tensor(0.0).cuda()
 
-                clustering_loss = (clust_loss_g1 + clust_loss_g2) / 2.0
-                teacher_proto_loss = (proto_loss_g1 + proto_loss_g2) / 2.0
-                koleo_proto_loss = (koleo_proto_g1 + koleo_proto_g2) / 2.0
-
-            prototype_loss = teacher_proto_loss + koleo_proto_loss
-            if args.use_semantic_prototypes:
-                prototype_loss = prototype_loss + semantic_teacher_proto_loss + semantic_koleo_proto_loss
-        else:
-            del semantic_backbone_outputs
-
-            clustering_loss = torch.tensor(0.0).cuda()
-            teacher_proto_loss = torch.tensor(0.0).cuda()
-            koleo_proto_loss = torch.tensor(0.0).cuda()
-            prototype_loss = torch.tensor(0.0).cuda()
-
-        # ========== Compute Total Losses ==========
-        student_loss = (
-            dino_class_loss_val +
-            args.koleo_loss_weight * koleo_loss_val +
-            args.ibot_loss_weight * ibot_loss_val +
-            args.clustering_weight * clustering_loss +
-            args.semantic_ibot_weight * semantic_ibot_loss_val +
-            args.semantic_clustering_weight * semantic_clustering_loss
-        )
+            # ========== Compute Total Losses ==========
+            student_loss = (
+                dino_class_loss_val +
+                args.koleo_loss_weight * koleo_loss_val +
+                args.ibot_loss_weight * ibot_loss_val +
+                args.clustering_weight * clustering_loss +
+                args.semantic_ibot_weight * semantic_ibot_loss_val +
+                args.semantic_clustering_weight * semantic_clustering_loss
+            )
 
         # ========== Backward and optimizer steps ==========
         if fp16_scaler is None:
@@ -1254,6 +1364,13 @@ def train_dinov2(args):
                 metric_logger.update(typicality_t_mean=t.mean().item())
                 metric_logger.update(typicality_t_std=t.std().item())
                 metric_logger.update(typicality_d_mean=bank_output['d'].mean().item())
+
+        if use_looped_backbone:
+            metric_logger.update(ponder_kl_loss=kl_loss_val.item())
+            metric_logger.update(ponder_mean_halt_step=mean_halt_step.item())
+            metric_logger.update(ponder_lambda_p=lambda_p_value)
+            for _t in range(h_mean_per_step.shape[0]):
+                metric_logger.update(**{f'h_step_{_t+1}': h_mean_per_step[_t].item()})
 
         metric_logger.update(lr=optimizer_student.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer_student.param_groups[0]["weight_decay"])

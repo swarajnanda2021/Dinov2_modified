@@ -2,6 +2,8 @@
 
 This repository trains Vision Transformer foundation models on whole-slide pathology tiles via self-supervised learning. It starts from the DINOv2 training recipe (Meta AI, 2023) — a joint DINO CLS-token objective + iBOT masked-patch objective + KoLeo regularizer on a student/EMA-teacher pair — and extends it in four directions that target pathology-specific failure modes of the vanilla recipe: semantic masking in iBOT, an auxiliary patch-prototype clustering loss, adaptive per-sample gradient dampening on morphologically redundant tiles ("typicality dampening" / "batch concurrence"), and three optional augmentation modes that produce additional student views from frozen segmentation models.
 
+This branch (`loop_pathology-fm-recipe`) additionally introduces a **looped (weight-tied recurrent-depth) backbone with image-level adaptive halting** on top of the pathology-FM recipe. Section 7 below describes it; full design and implementation notes are in [`LOOPED_DINOV2.md`](LOOPED_DINOV2.md).
+
 Every extension is opt-in through a command-line flag defaulting to `False`. With every flag off, the code reduces to a clean DINOv2 implementation with the minor alignments noted at the bottom of this document.
 
 ---
@@ -112,19 +114,65 @@ A handful of smaller corrections relative to common in-the-wild DINOv2 forks, al
 - **Sequence-packed multi-crop forward pass** inside the backbone (`CombinedModelDINO.forward` → `backbone.forward_features_list`): all crops are processed as a single packed sequence instead of per-crop loops.
 - **Typicality's per-sample DINO-temperature path** exposes `sample_temperatures` and `sample_weights` as optional kwargs on `DINOLoss.forward`; when both are `None` the loss reduces exactly to the scalar-temperature form.
 
-## 7. Repo layout
+---
 
-- `configs/` — `argparse`-based config builder (`configs.config.get_args_parser`).
+## 7. Looped DINOv2 with Image-Level Adaptive Halting — `--use_looped_backbone`
+
+*Motivation.* Two observations about the DINOv2 baseline are worth revisiting at pathology-FM scale: (a) much of the representational work in a `vitdepth=24` ViT-L is *iterative refinement* of the same operation, so a much smaller stack applied repeatedly should match downstream quality at a fraction of the parameters [Dehghani et al. 2019; Bae et al. 2024; Geiping et al. 2025; Zhu et al. 2025]; and (b) tiles vary enormously in content complexity (pure stroma vs. tumor–stroma interface), so allocating uniform compute per image leaves obvious efficiency on the table [Graves 2016; Banino et al. 2021; Raposo et al. 2024]. This feature combines both: a **shared (weight-tied) stack** of `--shared_stack_L` blocks applied `--recursion_T_max` times for the architectural substrate, plus a **PonderNet-style image-level halting head** for adaptive depth.
+
+*Architectural substrate (shared stack).* The standard DINOv2 stack of `vitdepth` unique transformer blocks is replaced (when the flag is on) by an `nn.ModuleList` of `--shared_stack_L` blocks driven by a [`SharedStack`](models/vision_transformer/shared_stack.py) module. The recurrence at step `t` is
+
+```
+z_t = post_norm( block_L o ... o block_1 ( pre_norm( z_{t-1} + tau_t ) ) ) + z_0
+```
+
+with sandwich LayerNorm bracketing each pass, a learnable per-step time embedding `tau_t` (zero-initialized) added before entry, and the patch-embedded input `z_0` re-injected at the end of every step. These three ingredients are the standard stability package from the looped / recurrent-depth transformer line [Geiping et al. 2025 (Huginn); Zhu et al. 2025 (Ouro / LoopLM); Yang et al. 2024 (input injection); Xu & Sato 2024 (time modulation)]. Default `L = 3, T_max = 4` gives 12 effective block applications at ~4× parameter reduction vs. a 12-block dense ViT. xformers `BlockDiagonalMask` packed multi-crop and FSDP2 sharding both work unchanged; gradient checkpointing is per recursion step, so activation memory scales with `T_max`, not `T_max * L`.
+
+*Image-level adaptive halting.* Halting is decided per **image**, not per crop or per token — per-token / per-crop halting was rejected because iBOT supervision requires masked patches to reach the final layer, which conflicts with per-token / per-crop early exit. At each recursion step `t`:
+
+1. The image's per-crop CLS tokens (e.g., 8 in the canonical recipe: 2 globals + 6 locals) are mean-pooled into a single per-image vector. Mean pooling is parameter-free and DINO's CLS is explicitly view-invariant, so the train–inference distribution gap (single-crop pool of one at deployment) stays small.
+2. A linear head + sigmoid emits the halting probability `h_t` per image (see [`HaltHead`](models/halting_head.py)).
+3. PonderNet step-marginals are computed: `p_t = h_t * prod_{s<t}(1 - h_s)`, with the final step absorbing remaining mass so `sum_t p_t = 1` per image [Banino et al. 2021].
+4. A KL term `beta * KL( p || Geom(lambda_p) )` (β default 0.01) regularizes the halting distribution toward a truncated geometric prior, with `lambda_p` linearly annealed from `0.9 -> 0.3` over the first 30% of training (Huginn-style variable-depth curriculum: `lambda_p` near 0.9 keeps the stack from being asked for deep compute too early; near 0.3 lets harder images earn more compute as the representations mature).
+
+*Critical training-time invariant.* All crops traverse all `T_max` recursion steps in lockstep during training. The halting distribution **only weights the per-step loss mixture**; it does **not** truncate the forward. This preserves byte-for-byte compatibility with packed multi-crop, register tokens, iBOT block masking, and the EMA teacher. Adaptive halting is an inference-time deployment feature, not a training-time speedup.
+
+*Loss.* The teacher always runs at `T_max` only and produces fixed targets (Sinkhorn-Knopp on teacher CLS and on teacher-projected iBOT-masked patches is computed once per batch, outside the t-loop, and reused across all student steps). This asymmetric arrangement — teacher at maximum depth, student at adaptive depth — mirrors the Intra-Loop Self-Distillation pattern of ELT [Goyal et al. 2026]. The total per-image loss is
+
+```
+L[i] = sum_t p_t[i] * (L_DINO_t[i] + ibot_w * L_iBOT_t[i])
+       + koleo_w * L_KoLeo[i]   (final step only)
+       + beta * KL( p[i] || Geom(lambda_p) )
+```
+
+implemented as **per-sample** (`[B]`-shaped) DINO and iBOT helpers in [`losses/looped_loss.py`](losses/looped_loss.py) so the per-image marginals can weight each image's contribution before reduction. The per-step student forward is orchestrated by [`training/looped_step.py`](training/looped_step.py), invoked from `trainer.py` behind an `if use_looped_backbone:` branch.
+
+*Anytime supervision property.* iBOT supervision is evaluated at every step but always against the teacher's step-`T_max` patch output. An image whose halting mass concentrates at small `t` trains its shared stack to produce iBOT-valid patches early; one whose mass concentrates at large `t` trains it to refine further. Because the shared stack is one set of parameters, these signals cooperate rather than compete — the block learns to be useful at any intermediate depth. This is the inductive bias argued by Saunshi et al. [2025] for looped models.
+
+*Inference.* Implemented separately. The intended pattern: at `t = 1, 2, ...` compute `h_t` from the (pool-of-one) CLS, accumulate `H_t = sum_{s<=t} h_s`, halt when `H_t >= 1 - epsilon` (default `epsilon = 0.01`, exposed as `--ponder_inference_threshold`). At convergence with `lambda_p = 0.3` the expected halted depth is ~ 2.5 for `T_max = 4`, giving roughly 1.6× wall-clock inference speedup at 4× parameter reduction. For batched inference, halted samples can be removed from the active batch via continuous depth-wise batching [Bae et al. 2024]; for single-tile pathology inference the common case has no batching friction.
+
+*Compatibility.* Compatible with `--use_pathology_recipe` (KDE regularizer, ECT augmentation, teacher-temp 0.04, patch_size 14, bf16 end-to-end, ViT-G auto-gate). **Incompatible** in this revision with `--use_semantic_ibot`, `--use_semantic_prototypes`, `--use_prototype_clustering`, `--use_typicality_dampening`, `--use_adversarial_mask_augmentation`, `--use_cellvit_augmentation`, `--use_random_mask_augmentation` — the trainer raises a clear error if any of those is combined with the looped backbone (each requires interleaving per-recursion-step state with feature-specific forward passes, out of scope for this revision).
+
+*Control surface.* Eight new CLI args, all defaulting off / neutral: `--use_looped_backbone`, `--shared_stack_L` (3), `--recursion_T_max` (4), `--ponder_kl_beta` (0.01), `--ponder_lambda_p_start` (0.9), `--ponder_lambda_p_end` (0.3), `--ponder_lambda_p_anneal_frac` (0.3), `--ponder_inference_threshold` (0.99). Engineering details (file boundaries, hyperparameter rationale, optimizer treatment, open empirical questions for the ViT-S pilot) are in [`LOOPED_DINOV2.md`](LOOPED_DINOV2.md).
+
+*Citations (looped / adaptive-compute / vision halting).* Bae et al. 2024 [arXiv:2410.20672](https://arxiv.org/abs/2410.20672); Bae et al. 2025 (MoR) [arXiv:2507.10524](https://arxiv.org/abs/2507.10524); Banino, Balaguer, Blundell 2021 (PonderNet) [arXiv:2107.05407](https://arxiv.org/abs/2107.05407); Dehghani et al. 2019 (Universal Transformers) [arXiv:1807.03819](https://arxiv.org/abs/1807.03819); Geiping et al. 2025 (Huginn) [arXiv:2502.05171](https://arxiv.org/abs/2502.05171); Giannou et al. 2023 (Looped Transformers as Programmable Computers) [arXiv:2301.13196](https://arxiv.org/abs/2301.13196); Goyal et al. 2026 (ELT) [arXiv:2604.09168](https://arxiv.org/abs/2604.09168); Graves 2016 (ACT) [arXiv:1603.08983](https://arxiv.org/abs/1603.08983); Li 2025 (MoR-ViT) [arXiv:2507.21761](https://arxiv.org/abs/2507.21761); Raposo et al. 2024 (Mixture-of-Depths) [arXiv:2404.02258](https://arxiv.org/abs/2404.02258); Saunshi et al. 2025 [arXiv:2502.17416](https://arxiv.org/abs/2502.17416); Schwethelm, Rückert, Kaissis 2026 [arXiv:2604.21106](https://arxiv.org/abs/2604.21106); Xu & Sato 2024 [arXiv:2410.01405](https://arxiv.org/abs/2410.01405); Yang et al. 2024 [arXiv:2311.12424](https://arxiv.org/abs/2311.12424); Yin et al. 2022 (A-ViT) [CVPR 2022](https://openaccess.thecvf.com/content/CVPR2022/papers/Yin_A-ViT_Adaptive_Tokens_for_Efficient_Vision_Transformer_CVPR_2022_paper.pdf); Zhu et al. 2025 (Ouro / LoopLM) [arXiv:2510.25741](https://arxiv.org/abs/2510.25741). Reference implementation for MoR (used as a starting point for routing mechanics, though this design ultimately uses PonderNet halting): [github.com/raymin0223/mixture_of_recursions](https://github.com/raymin0223/mixture_of_recursions).
+
+---
+
+## 8. Repo layout
+
+- `configs/` — `argparse`-based config builder (`configs.config.get_args_parser`); includes the looped-backbone CLI flags (§7).
 - `data/` — pathology tile dataset + proportional multi-source wrapper (`DINOv2PathologyDataset`, `ProportionalMultiDatasetWrapper`, `TMEDinoTransforms`; `TMEDinoTransforms` also owns the `Random90Rotation` + probabilistic ECT routing used by §5).
-- `losses/` — `DINOLoss`, `iBOTPatchLoss`, `KoLeoLoss`, `KDELoss` (used by §5), `PatchPrototypeLoss`.
-- `models/` — `CombinedModelDINO` (the packed-sequence student/teacher wrapper), `LinearPrototypeBank`, and vision-transformer bits (`ModernViT`, `DINOHead`, `MaskModel`, `ADIOSMaskModel`, `CellViT`).
+- `losses/` — `DINOLoss`, `iBOTPatchLoss`, `KoLeoLoss`, `KDELoss` (used by §5), `PatchPrototypeLoss`, plus `looped_loss.py` (per-sample DINO/iBOT helpers + standalone Sinkhorn-Knopp used by §7).
+- `models/` — `CombinedModelDINO` (the packed-sequence student/teacher wrapper, optionally hosting a `halt_head` for §7), `LinearPrototypeBank`, vision-transformer bits (`ModernViT`, `DINOHead`, `MaskModel`, `ADIOSMaskModel`, `CellViT`), `SharedStack` (weight-tied recurrent-depth stack for §7), and `halting_head.py` (`HaltHead` + PonderNet utilities).
 - `typicality/` — the three modules implementing the typicality dampening feature (§3).
-- `training/` — `train_dinov2` orchestration (`trainer.py`) and `helpers.py` with all the mask/crop utilities; `training/__init__.py` re-exports the common helpers.
+- `training/` — `train_dinov2` orchestration (`trainer.py`) and `helpers.py` with all the mask/crop utilities; `looped_step.py` factors out the PonderNet mixture-weighted forward+loss for §7; `training/__init__.py` re-exports the common helpers.
 - `visualizations/` — standalone plotting scripts for loss curves, clustering entropy, PCA, prototype dendrograms, and prototype heatmaps.
 - `run_with_submitit.py` — SLURM launcher that sets defaults and submits via `submitit`; also carries the pathology-FM recipe toggle stanza and magnification table (§5).
 - `main_train.py` — single-process entry point (used locally for debugging; cluster training goes through `run_with_submitit.py`).
 - `utils.py` — distributed setup, layer-wise LR helpers, schedulers, serialization utilities, and the `LARS` / `StableAdamW` optimizers.
+- `LOOPED_DINOV2.md` — engineer-facing companion to §7: file-by-file map of the looped-backbone changes, default hyperparameters, compatibility matrix, open empirical questions for the ViT-S pilot.
 
-## 8. Running
+## 9. Running
 
 Cluster training recipes (job layouts, monitoring, checkpoint recovery) live in internal runbooks rather than this repo. For local debugging, `main_train.py` takes the same arguments as the SLURM launcher and runs without submitit — useful for verifying config validity and doing a smoke test on a single node.
