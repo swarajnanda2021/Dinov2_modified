@@ -8,7 +8,11 @@ identical to `pathology-fm-recipe`.
 
 The full design and references are in the executive summary that motivated this
 work; this document is the **engineer-facing companion** that maps that design
-to the files in this repo.
+to the files in this repo. A schematic of the training pipeline is at
+[`figures/looped_dinov2_training.svg`](figures/looped_dinov2_training.svg)
+(source: [`figures/generate_looped_dinov2_schematic.py`](figures/generate_looped_dinov2_schematic.py)).
+The launch plan for the `(L, T_max)` sweep that evaluates this method is in
+[`LOOPED_DINOV2_SWEEP_PLAN.md`](LOOPED_DINOV2_SWEEP_PLAN.md).
 
 ---
 
