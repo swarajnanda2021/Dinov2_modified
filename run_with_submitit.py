@@ -290,6 +290,42 @@ def main():
     args.ect_probability = 0.4
     args.kde_kappa = 5.0
 
+    # ================================================================
+    # LOOPED DINOv2 - toggle and controls
+    # ================================================================
+    # Flip use_looped_backbone to True to swap the canonical depth-
+    # `vitdepth` stack of unique transformer blocks for a shared
+    # (weight-tied) stack of `shared_stack_L` blocks applied
+    # `recursion_T_max` times, with image-level PonderNet adaptive
+    # halting. With the flag off, the trainer is byte-for-byte the
+    # baseline pathology-FM-recipe code path.
+    #
+    # Defaults below match those in configs/config.py and the design
+    # in LOOPED_DINOV2.md (L = 3, T_max = 4, KL beta = 0.01,
+    # lambda_p annealed 0.9 -> 0.3 over the first 30% of training).
+    # The (L, T_max) sweep matrix from LOOPED_DINOV2_SWEEP_PLAN.md
+    # is launched by changing shared_stack_L and recursion_T_max
+    # while holding L * T_max = 12.
+    #
+    # Incompatible (the trainer raises if combined): use_semantic_ibot,
+    # use_semantic_prototypes, use_prototype_clustering,
+    # use_typicality_dampening, use_adversarial_mask_augmentation,
+    # use_cellvit_augmentation, use_random_mask_augmentation. See
+    # LOOPED_DINOV2.md Section 5 for the rationale.
+    #
+    # ponder_inference_threshold is consumed only by the inference
+    # driver (real early-exit at deployment time); leaving it at the
+    # default during training is harmless.
+    # ================================================================
+    args.use_looped_backbone = False
+    args.shared_stack_L = 3
+    args.recursion_T_max = 4
+    args.ponder_kl_beta = 0.01
+    args.ponder_lambda_p_start = 0.9
+    args.ponder_lambda_p_end = 0.3
+    args.ponder_lambda_p_anneal_frac = 0.3
+    args.ponder_inference_threshold = 0.99
+
     # Save configuration
     with open(os.path.join(args.output_dir, f"{job_name}_config.txt"), "w") as f:
         for arg, value in sorted(vars(args).items()):
@@ -341,6 +377,16 @@ def main():
     if args.use_random_mask_augmentation:
         print(f"  Random Mask Augmentation: ENABLED")
         print(f"    random_num_masks = {args.random_num_masks}, random_crops_per_mask = {args.random_crops_per_mask}")
+
+    if args.use_looped_backbone:
+        L_eff = args.shared_stack_L * args.recursion_T_max
+        print(f"  Looped backbone: ENABLED")
+        print(f"    shared_stack_L = {args.shared_stack_L}, recursion_T_max = {args.recursion_T_max} "
+              f"(effective depth L * T_max = {L_eff})")
+        print(f"    PonderNet: kl_beta = {args.ponder_kl_beta}, "
+              f"lambda_p {args.ponder_lambda_p_start} -> {args.ponder_lambda_p_end} "
+              f"over first {int(args.ponder_lambda_p_anneal_frac * 100)}% of training")
+        print(f"    Inference early-exit threshold (eval-time only): {args.ponder_inference_threshold}")
 
     print(f"  Total student views (DINO CLS): {total_views}")
     print(f"  Batch size per GPU: {args.batch_size_per_gpu}")
