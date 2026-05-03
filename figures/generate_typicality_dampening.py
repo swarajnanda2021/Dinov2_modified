@@ -39,7 +39,7 @@ def make_figure(output_dir='figures',
 
     fig, ax = plt.subplots(figsize=(27.0, 13.0))
     ax.set_xlim(-2.4, 25.8)
-    ax.set_ylim(-2.6, 11.6)
+    ax.set_ylim(-3.1, 11.6)
     ax.set_aspect('equal')
     ax.axis('off')
 
@@ -276,14 +276,14 @@ def make_figure(output_dir='figures',
     y_S_main  =  5.70
     y_S_patch =  4.90
     y_aug     =  7.50
-    y_loss    =  2.85           # R-training row (sub-island top)
-    y_merge   =  2.25           # merge wire below loss boxes (between losses and R)
-    y_R       =  0.40           # R, s(x), bank all at same y (per user request)
+    y_loss    =  2.35           # R-training row (sub-island top)
+    y_merge   =  1.75           # merge wire below loss boxes (between losses and R)
+    y_R       = -0.10           # R, s(x), bank all at same y (per user request)
     y_sx      =  y_R
     y_bank    =  y_R
-    y_typ     = -1.20           # typicality lane (‖·‖₁, d, 1-Φ, t)
+    y_typ     = -1.70           # typicality lane (‖·‖₁, d, 1-Φ, t)
     y_Rtrain  =  y_loss
-    y_return  = -1.95
+    y_return  = -2.45
 
     # ---------------- horizontal landmarks ----------------
     x_image  =  0.40
@@ -292,7 +292,7 @@ def make_figure(output_dir='figures',
     x_back   =  7.50
     x_tokens = 10.00
     x_heads  = 11.80
-    x_z      = 13.50
+    x_z      = 13.79
     x_Wp     = 15.10
     x_Wp_iBOT = 16.40
     x_CE_D   = 20.80
@@ -326,7 +326,7 @@ def make_figure(output_dir='figures',
     # R glyph top at y=3.45). h = 5.175.
     # Main typ island. +5% top and +5% bottom relative to previous
     # h=5.25 → new h=5.8125 (y_bot=-2.0625, y_top=3.7125).
-    island(4.55, -2.0625, 13.20, 5.8125,
+    island(4.55, -2.5625, 13.20, 5.7356,
            fc='#E5F2EA', ec=C['typ_b'], alpha=0.30)
 
     # ---------------- input + aug ----------------
@@ -378,22 +378,17 @@ def make_figure(output_dir='figures',
             zorder=Z_TOP)
 
     # ----- locals branch: terminates at student PE only -----
-    # Goes via x_loc_jn, then drops to lower-left of student PE. The
-    # locals vline crosses the globals hline at y_S_glob_in=6.10 — bump
-    # there so the two wires read as not-connected.
-    y_loc_exit  = y_aug - 0.20
+    # Exits aug from 6 o'clock (bottom-center), drops to y_S_loc_in,
+    # jogs RIGHT into student PE lower-left.
     y_S_loc_in  = y_S_main - 0.40
-
-    hline(y_loc_exit, x_aug + 0.85, x_loc_jn)
-    vline_with_bumps(x_loc_jn, y_S_loc_in, y_loc_exit,
-                     bumps_at_y=[y_S_glob_in], side='right')
-    hline(y_S_loc_in, x_loc_jn, x_PE_left)
+    y_aug_bot6  = y_aug - 0.475
+    junction_dot(x_aug, y_aug_bot6)
+    vline(x_aug, y_S_loc_in, y_aug_bot6)
+    hline(y_S_loc_in, x_aug, x_PE_left)
     arrowhead(x_PE_left, y_S_loc_in, 'right')
 
-    # locals label ABOVE the student encoder island so it doesn't read
-    # as a label for the island itself. Island y_top = y_S_main + 0.70
-    # = 6.40; place label at y = 6.65.
-    ax.text(x_loc_jn + 0.08, 6.65, r'$n$ locals',
+    # locals label along the descent
+    ax.text(x_aug + 0.10, 6.30, r'$n$ locals',
             ha='left', va='center', fontsize=11, style='italic',
             color=C['aug_b'],
             bbox=dict(facecolor='white', edgecolor='none', pad=1),
@@ -401,7 +396,7 @@ def make_figure(output_dir='figures',
 
     # ---------------- arm drawer ----------------
     def draw_arm(y_main, y_cls, y_patch, fc, ec, expose_z=False,
-                 wp_role='S'):
+                 wp_role='S', patch_to_head=True):
         box(x_PE, y_main, 1.9, 0.90, 'patch\nembed',
             fc, ec, fontsize=13, rounding=0.12)
         hline(y_main, x_PE + 0.95, x_back - 1.00)
@@ -468,8 +463,9 @@ def make_figure(output_dir='figures',
             x_dino_out = x_heads + 1.00
             x_zp_out = None
 
-        hline(y_patch, col_R, x_heads - 0.95)
-        arrowhead(x_heads - 0.95, y_patch, 'right')
+        if patch_to_head:
+            hline(y_patch, col_R, x_heads - 0.95)
+            arrowhead(x_heads - 0.95, y_patch, 'right')
         box(x_heads, y_patch, 1.9, 0.90, 'iBOT\nhead',
             fc, ec, fontsize=13, rounding=0.12)
 
@@ -526,10 +522,174 @@ def make_figure(output_dir='figures',
 
     x_S_dino_out, x_S_ibot_out, x_S_zp, x_S_zp_i = draw_arm(
         y_S_main, y_S_cls, y_S_patch,
-        C['student'], C['student_b'], expose_z=True, wp_role='S')
+        C['student'], C['student_b'], expose_z=True, wp_role='S',
+        patch_to_head=False)
     ax.text(-2.20, y_S_main, 'student\n(trainable)',
             ha='left', va='center', fontsize=13, style='italic',
             color=C['student_b'], fontweight='bold')
+
+    # ---------------- semantic iBOT pipeline -------------------------
+    # Frozen mask model receives teacher global crop 1, outputs num_masks=3
+    # soft semantic channels. One channel sampled per step → semantic token
+    # mask M_sem. Random block sampler (always on) produces M_block. Both
+    # are applied at the student PE→backbone wire as [MASK] token sources.
+    # The student backbone runs a SECOND forward for the semantic channel,
+    # producing an additional patch-token column that feeds CE_iBOT^sem.
+
+    y_mm = 4.05  # mask pipeline row (above typ-island top y=3.71)
+
+    # Island enclosing the mask-source branch (mask model → channels → masks)
+    island(0.20, 3.35, 5.65, 1.30,
+           fc='#FCEFF1', ec=C['ibot_b'], alpha=0.40)
+
+    ax.text(-2.20, y_mm, 'semantic\niBOT',
+            ha='left', va='center', fontsize=13, style='italic',
+            color=C['ibot_b'], fontweight='bold')
+
+    # Frozen mask model box
+    x_mm = 1.10
+    box(x_mm, y_mm, 1.55, 0.65, 'frozen\nmask model',
+        C['ibot'], C['ibot_b'], fontsize=11, lw=1.4, rounding=0.10)
+
+    # Aug LEFT (9 o'clock) → mask model TOP (12 o'clock).
+    x_aug_left = x_aug - 0.85
+    y_mm_top = y_mm + 0.325
+    junction_dot(x_aug_left, y_aug, color=C['ibot_b'])
+    hline(y_aug, x_mm, x_aug_left, color=C['ibot_b'], lw=1.4)
+    vline(x_mm, y_mm_top, y_aug, color=C['ibot_b'], lw=1.4)
+    arrowhead(x_mm, y_mm_top, 'down', color=C['ibot_b'])
+    ax.text(x_mm + 0.10, (y_aug + y_mm_top) / 2, 'global 1',
+            ha='left', va='center', fontsize=9, style='italic',
+            color=C['ibot_b'])
+
+    # 3 semantic channels glyph (middle highlighted = sampled this step)
+    x_3ch = 2.85
+    ch_size, ch_gap = 0.30, 0.06
+    ch_total = 3 * ch_size + 2 * ch_gap
+    x_3ch_left = x_3ch - ch_total / 2
+    for i in range(3):
+        cx = x_3ch_left + i * (ch_size + ch_gap)
+        fc = C['ibot_b'] if i == 1 else C['ibot']
+        ax.add_patch(Rectangle((cx, y_mm - ch_size / 2),
+                               ch_size, ch_size,
+                               fc=fc, ec=C['ibot_b'], lw=1.0, zorder=Z_BOX))
+        txt_color = 'white' if i == 1 else C['ibot_b']
+        ax.text(cx + ch_size / 2, y_mm, str(i + 1),
+                ha='center', va='center', fontsize=9,
+                color=txt_color, fontweight='bold', zorder=Z_BOX + 1)
+    ax.text(x_3ch, y_mm - ch_size / 2 - 0.10, r'$\sim\mathrm{Unif}(3)$',
+            ha='center', va='top', fontsize=9, style='italic',
+            color=C['ibot_b'])
+    hline(y_mm, x_mm + 0.775, x_3ch_left, color=C['ibot_b'], lw=1.2)
+    arrowhead(x_3ch_left, y_mm, 'right', color=C['ibot_b'])
+
+    # Semantic mask 4×4 grid (selected channel as 2D token mask)
+    grid_size, n_grid = 0.65, 4
+    cell = grid_size / n_grid
+    x_grid_sem = 4.30
+    sem_cells = {(0, 0), (0, 1), (1, 0), (1, 1), (2, 2), (3, 2)}
+    for i in range(n_grid):
+        for j in range(n_grid):
+            cx = x_grid_sem - grid_size / 2 + j * cell
+            cy = y_mm - grid_size / 2 + (n_grid - 1 - i) * cell
+            fc = C['ibot_b'] if (i, j) in sem_cells else C['ibot']
+            ax.add_patch(Rectangle((cx, cy), cell, cell,
+                                   fc=fc, ec=C['ibot_b'], lw=0.4,
+                                   zorder=Z_BOX))
+    ax.add_patch(Rectangle(
+        (x_grid_sem - grid_size / 2, y_mm - grid_size / 2),
+        grid_size, grid_size, fc='none', ec=C['ibot_b'], lw=1.2,
+        zorder=Z_BOX))
+    ax.text(x_grid_sem, y_mm - grid_size / 2 - 0.10,
+            r'$M_{\mathrm{sem}}$',
+            ha='center', va='top', fontsize=11, style='italic',
+            color=C['ibot_b'])
+    hline(y_mm, x_3ch + ch_total / 2, x_grid_sem - grid_size / 2,
+          color=C['ibot_b'], lw=1.2)
+    arrowhead(x_grid_sem - grid_size / 2, y_mm, 'right', color=C['ibot_b'])
+
+    # Block mask 4×4 grid (random rectangular block) — parallel source.
+    # Uses a distinct color (steel-blue) to differentiate block-mask
+    # source from the pink semantic-mask source.
+    block_color = '#3B6FB0'
+    block_color_light = '#CFDDED'
+    x_grid_block = 5.40
+    block_cells = {(1, 1), (1, 2), (2, 1), (2, 2)}
+    for i in range(n_grid):
+        for j in range(n_grid):
+            cx = x_grid_block - grid_size / 2 + j * cell
+            cy = y_mm - grid_size / 2 + (n_grid - 1 - i) * cell
+            fc = block_color if (i, j) in block_cells else block_color_light
+            ax.add_patch(Rectangle((cx, cy), cell, cell,
+                                   fc=fc, ec=block_color, lw=0.4,
+                                   zorder=Z_BOX))
+    ax.add_patch(Rectangle(
+        (x_grid_block - grid_size / 2, y_mm - grid_size / 2),
+        grid_size, grid_size, fc='none', ec=block_color, lw=1.2,
+        zorder=Z_BOX))
+    ax.text(x_grid_block, y_mm - grid_size / 2 - 0.10,
+            r'$M_{\mathrm{block}}$',
+            ha='center', va='top', fontsize=11, style='italic',
+            color=block_color)
+
+    # Both grids flatten upward → student PE→backbone wire at x_inject
+    y_route  = 4.85
+    x_inject = 6.30
+    vline(x_grid_sem,   y_mm + grid_size / 2, y_route,
+          color=C['ibot_b'], lw=1.2)
+    vline(x_grid_block, y_mm + grid_size / 2, y_route,
+          color=C['ibot_b'], lw=1.2)
+    junction_dot(x_grid_block, y_route, color=C['ibot_b'])
+    hline(y_route, x_grid_sem, x_inject, color=C['ibot_b'], lw=1.2)
+    vline(x_inject, y_route, y_S_main - 0.05,
+          color=C['ibot_b'], lw=1.2)
+    arrowhead(x_inject, y_S_main - 0.05, 'up', color=C['ibot_b'])
+    junction_dot(x_inject, y_S_main, color=C['ibot_b'])
+    ax.text(x_inject + 0.08, y_route - 0.04, '[MASK] tokens',
+            ha='left', va='top', fontsize=8, style='italic',
+            color=C['ibot_b'])
+
+    # Second patches column on student (semantic forward output).
+    # Highlighted cells = masked positions whose student outputs feed
+    # CE_iBOT^sem against teacher unmasked targets at same positions.
+    x_tokens_sem = x_tokens + 0.25
+    col2_L, col2_R, col2_B, col2_T = patches_strip_vertical(
+        x_tokens_sem, y_S_patch, n=6,
+        fc=C['student'], ec=C['student_b'])
+    sq_p, gap_p, n_p = 0.16, 0.04, 6
+    total_h_p = n_p * sq_p + (n_p - 1) * gap_p
+    y0_p = y_S_patch - total_h_p / 2
+    masked_idx = {1, 4}
+    for i in masked_idx:
+        yi = y0_p + i * (sq_p + gap_p)
+        ax.add_patch(Rectangle((x_tokens_sem - sq_p / 2, yi),
+                               sq_p, sq_p,
+                               fc=C['ibot_b'], ec=C['student_b'], lw=1.0,
+                               zorder=Z_BOX + 1))
+    ax.text(x_tokens_sem, col2_T + 0.08, 'sem-masked',
+            ha='center', va='bottom', fontsize=8, style='italic',
+            color=C['ibot_b'])
+
+    # Overlay block-masked cells on the FIRST patches column (existing
+    # student strip at x_tokens). Distinct block color, label below.
+    block_masked_idx = {2, 3}
+    for i in block_masked_idx:
+        yi = y0_p + i * (sq_p + gap_p)
+        ax.add_patch(Rectangle((x_tokens - sq_p / 2, yi),
+                               sq_p, sq_p,
+                               fc=block_color, ec=C['student_b'], lw=1.0,
+                               zorder=Z_BOX + 1))
+    col1_B = y0_p
+    ax.text(x_tokens, col1_B - 0.08, 'block-masked',
+            ha='center', va='top', fontsize=8, style='italic',
+            color=block_color)
+
+    # Single black arrow from sem-masked (2nd) column into iBOT head.
+    # Two mask types feed the same head; arrow source on either column
+    # is conventional — sem chosen so the arrow doesn't cross M_block
+    # block-mask cells visually.
+    hline(y_S_patch, col2_R, x_heads - 0.95)
+    arrowhead(x_heads - 0.95, y_S_patch, 'right')
 
     # ---------------- losses on student rows ----------------
     box(x_CE_D, y_S_cls, 1.9, 0.95, r'$\mathrm{CE}_{\mathrm{DINO}}$',
@@ -537,10 +697,26 @@ def make_figure(output_dir='figures',
     hline(y_S_cls, x_S_dino_out, x_CE_D - 0.95)
     arrowhead(x_CE_D - 0.95, y_S_cls, 'right')
 
-    box(x_CE_I, y_S_patch, 1.9, 0.95, r'$\mathrm{CE}_{\mathrm{iBOT}}$',
-        C['ibot'], C['ibot_b'], fontsize=18, lw=1.6, rounding=0.10)
+    box(x_CE_I, y_S_patch, 1.9, 0.95,
+        r'$\mathrm{CE}_{\mathrm{iBOT}}^{\mathrm{block}}$',
+        C['ibot'], C['ibot_b'], fontsize=16, lw=1.6, rounding=0.10)
     hline(y_S_patch, x_S_ibot_out, x_CE_I - 0.95)
     arrowhead(x_CE_I - 0.95, y_S_patch, 'right')
+
+    # CE_iBOT^sem: parallel sub-row UNDER CE_iBOT^block. Same iBOT head /
+    # W_p,i / z'^p,i upstream — branch off the z'^p,i → CE_iBOT^block
+    # wire and route DOWN, then RIGHT into CE_iBOT^sem from the left.
+    y_CE_sem = 3.85
+    box(x_CE_I, y_CE_sem, 1.9, 0.85,
+        r'$\mathrm{CE}_{\mathrm{iBOT}}^{\mathrm{sem}}$',
+        C['ibot'], C['ibot_b'], fontsize=14, lw=1.6, rounding=0.10)
+    x_branch_sem = x_S_ibot_out + 0.30
+    y_sem_S = y_CE_sem - 0.10
+    junction_dot(x_branch_sem, y_S_patch, color=C['ibot_b'])
+    vline(x_branch_sem, y_sem_S, y_S_patch, color=C['ibot_b'], lw=1.4)
+    hline(y_sem_S, x_branch_sem, x_CE_I - 0.95,
+          color=C['ibot_b'], lw=1.4)
+    arrowhead(x_CE_I - 0.95, y_sem_S, 'right', color=C['ibot_b'])
 
     # teacher target wires (dashed). Junction dots anchor the head exits
     # so the dashed wires read as continuations of the boxes, not as
@@ -560,18 +736,36 @@ def make_figure(output_dir='figures',
     # edge 17.32 and CE_DINO left edge 17.45), drop to y_TI_entry,
     # then jog RIGHT into CE_iBOT left edge.
     x_tgt_I    = 19.16
-    y_TI_entry = y_S_patch + 0.20
+    y_block_top = 4.90 + 0.475   # CE^block top edge = 5.375
+    y_sem_bot   = 3.85 - 0.425   # CE^sem bottom edge = 3.425
+    y_branch_T_top = y_block_top + 0.30   # 5.675
+    y_branch_T_bot = y_sem_bot - 0.30     # 3.125
     junction_dot(x_T_zp_i + 0.36, y_T_patch, color=C['teacher_b'])
     hline(y_T_patch, x_T_zp_i + 0.36, x_tgt_I,
           color=C['teacher_b'], dashed=True)
-    vline_with_bumps(x_tgt_I, y_TI_entry, y_T_patch,
-                     bumps_at_y=[y_S_cls], bump_radius=0.18,
+    vline_with_bumps(x_tgt_I, y_branch_T_bot, y_T_patch,
+                     bumps_at_y=[y_S_cls, y_S_patch], bump_radius=0.18,
                      color=C['teacher_b'], lw=1.4, side='right',
                      linestyle=(0, (5, 3)))
-    hline(y_TI_entry, x_tgt_I, x_CE_I - 0.95,
-          color=C['teacher_b'], dashed=True)
-    arrowhead(x_CE_I - 0.95, y_TI_entry, 'right', color=C['teacher_b'])
+    # Block target: branch at y_branch_T_top, hline RIGHT, drop DOWN onto top edge
+    junction_dot(x_tgt_I, y_branch_T_top, color=C['teacher_b'])
+    ax.add_line(Line2D([x_tgt_I, x_CE_I], [y_branch_T_top, y_branch_T_top],
+                       color=C['teacher_b'], lw=1.2,
+                       linestyle=(0, (5, 3)), zorder=Z_WIRE))
+    ax.add_line(Line2D([x_CE_I, x_CE_I], [y_branch_T_top, y_block_top],
+                       color=C['teacher_b'], lw=1.2,
+                       linestyle=(0, (5, 3)), zorder=Z_WIRE))
+    arrowhead(x_CE_I, y_block_top, 'down', color=C['teacher_b'])
     stop_grad_marker(x_tgt_I, 7.40, side='left')
+
+    # Sem target: at descent bottom (y_branch_T_bot), hline RIGHT, vline UP onto bottom edge
+    ax.add_line(Line2D([x_tgt_I, x_CE_I], [y_branch_T_bot, y_branch_T_bot],
+                       color=C['teacher_b'], lw=1.2,
+                       linestyle=(0, (5, 3)), zorder=Z_WIRE))
+    ax.add_line(Line2D([x_CE_I, x_CE_I], [y_branch_T_bot, y_sem_bot],
+                       color=C['teacher_b'], lw=1.2,
+                       linestyle=(0, (5, 3)), zorder=Z_WIRE))
+    arrowhead(x_CE_I, y_sem_bot, 'up', color=C['teacher_b'])
 
     # Single sg marker for the teacher EMA boundary
     stop_grad_marker(x_tgt_D, y_S_cls + 1.20, side='left')
@@ -584,12 +778,21 @@ def make_figure(output_dir='figures',
     # iBOT → total directly
     hline(y_S_patch, x_CE_I + 0.95, x_total - 1.30)
     arrowhead(x_total - 1.30, y_S_patch, 'right')
+    # CE_iBOT^sem → total (step UP since sem CE sits below L_total bottom)
+    y_into_total_sem = 4.50
+    hline(y_CE_sem, x_CE_I + 0.95, x_CE_I + 1.40, color=C['ibot_b'])
+    vline(x_CE_I + 1.40, y_CE_sem, y_into_total_sem, color=C['ibot_b'])
+    hline(y_into_total_sem, x_CE_I + 1.40, x_total - 1.30,
+          color=C['ibot_b'])
+    arrowhead(x_total - 1.30, y_into_total_sem, 'right',
+              color=C['ibot_b'])
 
-    box(x_total, y_S_main, 2.6, 2.30,
+    box(x_total, y_S_main, 2.6, 2.70,
         r'$\mathcal{L}_{\mathrm{total}}$' + '\n\n' +
-        r'$=\;w(x)\,\mathrm{CE}_{\mathrm{DINO}}$' + '\n\n' +
-        r'$+\;\mathrm{CE}_{\mathrm{iBOT}}$',
-        C['mix'], C['mix_b'], fontsize=14, lw=2.2, rounding=0.12)
+        r'$=\;w(x)\,\mathrm{CE}_{\mathrm{DINO}}$' + '\n' +
+        r'$+\;\mathrm{CE}_{\mathrm{iBOT}}^{\mathrm{block}}$' + '\n' +
+        r'$+\;\lambda_{\mathrm{sem}}\,\mathrm{CE}_{\mathrm{iBOT}}^{\mathrm{sem}}$',
+        C['mix'], C['mix_b'], fontsize=13, lw=2.2, rounding=0.12)
 
     # ---------------- EMA arrows ----------------
     def ema_arrow(x, y_from, y_to, bumps_at_y=None, bump_radius=0.18,
@@ -751,7 +954,7 @@ def make_figure(output_dir='figures',
     hline(y_return, x_t, x_otimes)
     # rise: bump where it crosses the iBOT→total loss wire at y_S_patch
     vline_with_bumps(x_otimes, y_return, y_S_cls - 0.22,
-                     bumps_at_y=[y_S_patch], side='right')
+                     bumps_at_y=[y_S_patch, 4.50], side='right')
     arrowhead(x_otimes, y_S_cls - 0.22, 'up')
     # w(x) label: ABOVE the return line (inside the typ island), shifted
     # RIGHT to sit clear of the ‖·‖₁ vs. bank box (centered in the open
@@ -774,7 +977,7 @@ def make_figure(output_dir='figures',
 
     # Sub-island encloses the R-training row.
     # Sub-island encloses the R-training row.
-    sub_y_bot = 1.55                   # lowered (more breathing room below L_repr label)
+    sub_y_bot = 1.05                   # lowered (more breathing room below L_repr label)
     sub_y_top = y_loss  + 0.55         # 3.40
     sub_x_left  = x_Lnn - 1.15         # 10.55
     sub_x_right = x_Lcov + 1.55        # 15.25 (extended right to fit L_cov labels)
@@ -782,7 +985,7 @@ def make_figure(output_dir='figures',
            sub_y_top - sub_y_bot,
            fc='#D6EADC', ec=C['typ_b'], alpha=0.55)
 
-    box(x_Lnn, y_Rtrain, 1.9, 0.85,
+    box(x_Lnn, y_Rtrain, 2.09, 0.85,
         r'$\mathcal{L}_{\mathrm{nn}}$' + r' (vs. $W^{\,S}$ rows)',
         C['typ'], C['typ_b'], fontsize=11, lw=1.4, rounding=0.10)
 
@@ -825,9 +1028,9 @@ def make_figure(output_dir='figures',
     # R top-left corner area), arrowhead pointing DOWN onto R top.
     y_R_top_entry = R_top                      # 1.80
     x_R_top_entry = x_R - 0.40                 # 14.70 (top-left of R)
-    vline(x_Lrepr, 2.00, y_merge, color=C['typ_b'])
-    hline(2.00, x_R_top_entry, x_Lrepr, color=C['typ_b'])
-    vline(x_R_top_entry, y_R_top_entry, 2.00, color=C['typ_b'])
+    vline(x_Lrepr, 1.50, y_merge, color=C['typ_b'])
+    hline(1.50, x_R_top_entry, x_Lrepr, color=C['typ_b'])
+    vline(x_R_top_entry, y_R_top_entry, 1.50, color=C['typ_b'])
     arrowhead(x_R_top_entry, y_R_top_entry, 'down', color=C['typ_b'])
 
     # R → L_cov: from R top-center UP to gram-glyph y, then LEFT into
@@ -842,7 +1045,7 @@ def make_figure(output_dir='figures',
     # to a column just left of L_nn box, then short L-jog UP to enter
     # L_nn at its left-edge vertical center. Bump where the horizontal
     # crosses the L_repr→R vertical at x = x_R - 0.40.
-    y_RLnn      = 1.75
+    y_RLnn      = 1.25
     x_Lnn_bot   = x_Lnn - 0.60                    # offset left of center to avoid merge wire (which starts at x_Lnn)
     y_Lnn_bot   = y_Rtrain - 0.425                # L_nn box bottom
     junction_dot(x_R, y_RLnn, color=C['typ_b'])
