@@ -107,14 +107,13 @@ class CombinedModelDINO(nn.Module):
         else:
             # ========== SINGLE IMAGE MODE (iBOT) ==========
             # crops is a single tensor [B, C, H, W]
-            
+
             # Forward through backbone
-            output_dict = self.backbone(crops, token_masks=token_masks)
-            # output_dict: {'clstoken': [B,D], 'patchtokens': [B,N,D], ...}
-            
-            # Apply heads
-            cls_output = self.classhead(output_dict['clstoken'])
-            patch_outputs = self.patchhead(output_dict['patchtokens'])
+            output_dict = self.backbone(crops, token_masks=token_masks, return_dict=True)
+
+            # Apply heads (postnorm tokens preserve the previous head input dist).
+            cls_output = self.classhead(output_dict['clstoken_postnorm'])
+            patch_outputs = self.patchhead(output_dict['patchtokens_postnorm'])
             
             return {
                 'cls_output': cls_output,  # [B, out_dim]

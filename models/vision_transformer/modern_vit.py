@@ -556,17 +556,22 @@ class VisionTransformer(nn.Module):
 
         return outputs
 
-    def forward(self, x, token_masks=None):
+    def forward(self, x, token_masks=None, return_dict: bool = False):
         """
         Forward with automatic detection of single vs multi-crop input.
-        
+
         Args:
             x: Either single tensor [B, C, H, W] or list of tensors
             token_masks: Either None, single mask, or list of masks
-            
+            return_dict: Single-image path only. False (default) returns the
+                pre-self.norm CLS token of shape [B, D]. True returns a dict
+                with prenorm and postnorm versions of CLS, patches, and
+                register tokens. Ignored on the list-input path.
+
         Returns:
-            - If list: List of dicts
-            - If single: Dict with clstoken, patchtokens, regtokens
+            - If list: List of dicts (unchanged)
+            - If single, return_dict=False: Tensor [B, D] (pre-norm CLS)
+            - If single, return_dict=True: Dict with prenorm/postnorm tokens
         """
         if isinstance(x, list):
             if token_masks is None:
@@ -590,14 +595,20 @@ class VisionTransformer(nn.Module):
             else:
                 for blk in self.blocks:
                     x = blk(x, attn_bias=None)
-            
-            x = self.norm(x)
-            
+
+            # x at this point is the post-blocks residual stream (pre-self.norm).
+            if not return_dict:
+                return x[:, 0]  # pre-norm CLS, [B, D]
+
+            x_norm = self.norm(x)
             return {
-                'clstoken': x[:, 0],
-                'regtokens': x[:, 1:self.numregisters+1],
-                'patchtokens': x[:, self.numregisters+1:],
-                'masks': token_masks
+                'clstoken_prenorm':     x[:, 0],
+                'clstoken_postnorm':    x_norm[:, 0],
+                'patchtokens_prenorm':  x[:, self.numregisters + 1:],
+                'patchtokens_postnorm': x_norm[:, self.numregisters + 1:],
+                'regtokens_prenorm':    x[:, 1:self.numregisters + 1],
+                'regtokens_postnorm':   x_norm[:, 1:self.numregisters + 1],
+                'masks':                token_masks,
             }
 
 
