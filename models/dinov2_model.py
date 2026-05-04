@@ -149,10 +149,11 @@ class CombinedModelDINO(nn.Module):
 
         else:
             # ========== SINGLE IMAGE MODE (iBOT) ==========
-            output_dict = self.backbone(crops, token_masks=token_masks)
+            output_dict = self.backbone(crops, token_masks=token_masks, return_dict=True)
 
-            cls_output = self.classhead(output_dict['clstoken'])
-            patch_outputs = self.patchhead(output_dict['patchtokens'])
+            # Postnorm tokens preserve the previous head input distribution.
+            cls_output = self.classhead(output_dict['clstoken_postnorm'])
+            patch_outputs = self.patchhead(output_dict['patchtokens_postnorm'])
 
             return {
                 'cls_output': cls_output,

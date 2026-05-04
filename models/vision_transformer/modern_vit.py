@@ -688,26 +688,46 @@ class VisionTransformer(nn.Module):
 
         return outputs_per_step
 
-    def forward(self, x, token_masks=None):
+    def forward(
+        self,
+        x,
+        token_masks=None,
+        return_dict: bool = False,
+        halt_head: Optional[nn.Module] = None,
+        epsilon: float = 0.01,
+    ):
         """
         Forward with automatic detection of single vs multi-crop input.
-        
+
         Args:
             x: Either single tensor [B, C, H, W] or list of tensors
             token_masks: Either None, single mask, or list of masks
-            
+            return_dict: Single-image path only. False (default) returns the
+                pre-self.norm CLS token of shape [B, D]. True returns a dict
+                with prenorm and postnorm versions of CLS, patches, and
+                register tokens (and `halt_step` in looped mode). Ignored on
+                the list-input path.
+            halt_head: Looped, single-image path only. When provided (an
+                `nn.Module` mapping postnorm CLS [B, D] -> halt prob [B]),
+                drives PonderNet-style early exit per sample. When None,
+                runs the full T_max recursion (legacy behavior).
+            epsilon: PonderNet halt threshold. A sample halts when its
+                cumulative not-halted mass falls below this value.
+
         Returns:
-            - If list: List of dicts
-            - If single: Dict with clstoken, patchtokens, regtokens
+            - If list: List of dicts (unchanged)
+            - If single, return_dict=False: Tensor [B, D] (pre-norm CLS)
+            - If single, return_dict=True: Dict with prenorm/postnorm tokens
+              (plus 'halt_step' [B] in looped mode)
         """
         if isinstance(x, list):
             if token_masks is None:
                 token_masks = [None] * len(x)
             elif not isinstance(token_masks, list):
                 token_masks = [token_masks] + [None] * (len(x) - 1)
-            
+
             return self.forward_features_list(x, token_masks)
-        
+
         else:
             if token_masks is not None:
                 x = self.prepare_tokens_with_masks(x, token_masks)
@@ -717,30 +737,92 @@ class VisionTransformer(nn.Module):
             x = self.patch_drop(x)
             x = self.norm_pre(x)
 
+            # After prepare_tokens / patch_drop / norm_pre, `x` is z_0.
             if self.looped_T_max > 0:
-                # Looped backbone (non-list path): T_max recursion steps,
-                # final-step output. No early exit here — used by teacher
-                # and by training-time semantic-iBOT side calls. Inference-
-                # time early exit is handled by a separate driver.
-                x = self.shared_stack(
-                    x,
-                    attn_bias=None,
-                    grad_checkpoint=self.grad_checkpointing,
-                    return_per_step=False,
+                z0 = x
+                B = z0.shape[0]
+                T_max = self.looped_T_max
+                halt_step = torch.full(
+                    (B,), T_max, dtype=torch.long, device=z0.device
                 )
+
+                if halt_head is None:
+                    # No halt head: run all T_max steps (legacy behavior).
+                    z = self.shared_stack(
+                        z0,
+                        attn_bias=None,
+                        grad_checkpoint=self.grad_checkpointing,
+                        return_per_step=False,
+                    )
+                else:
+                    not_halted_mass = torch.ones(
+                        B, device=z0.device, dtype=z0.dtype
+                    )
+                    halted_mask = torch.zeros(
+                        B, dtype=torch.bool, device=z0.device
+                    )
+                    z_out = None
+                    z_prev = z0
+                    z_t = z0
+
+                    for t in range(T_max):
+                        tau_t = self.shared_stack.tau[t].to(z_prev.dtype)
+                        z_t = self.shared_stack.step(
+                            z_prev, z0, tau_t, attn_bias=None
+                        )
+
+                        # Side tap: self.norm only to feed halt_head with its
+                        # training-time input distribution. The residual
+                        # stream returned to MIL consumers stays pre-self.norm.
+                        cls_for_halt = self.norm(z_t)[:, 0]
+                        h_t = halt_head(cls_for_halt)
+
+                        not_halted_mass = not_halted_mass * (1.0 - h_t)
+                        new_halts = (not_halted_mass < epsilon) & ~halted_mask
+                        if new_halts.any():
+                            if z_out is None:
+                                z_out = z_t.clone()
+                            else:
+                                z_out[new_halts] = z_t[new_halts]
+                            halt_step[new_halts] = t + 1
+                            halted_mask = halted_mask | new_halts
+
+                        if halted_mask.all():
+                            break
+                        z_prev = z_t
+
+                    # Samples that never crossed threshold get the final z_t.
+                    if not halted_mask.all():
+                        if z_out is None:
+                            z_out = z_t.clone()
+                        else:
+                            z_out[~halted_mask] = z_t[~halted_mask]
+
+                    z = z_out
+                x = z  # common tail consumes `x` regardless of path
+
             elif self.grad_checkpointing and not torch.jit.is_scripting():
                 x = checkpoint_seq(self.blocks, x)
             else:
                 for blk in self.blocks:
                     x = blk(x, attn_bias=None)
 
-            x = self.norm(x)
+            # Common tail. `x` is the residual stream (pre-self.norm).
+            if not return_dict:
+                return x[:, 0]
 
-            return {
-                'clstoken': x[:, 0],
-                'regtokens': x[:, 1:self.numregisters+1],
-                'patchtokens': x[:, self.numregisters+1:],
-                'masks': token_masks
+            x_norm = self.norm(x)
+            out = {
+                'clstoken_prenorm':     x[:, 0],
+                'clstoken_postnorm':    x_norm[:, 0],
+                'patchtokens_prenorm':  x[:, self.numregisters + 1:],
+                'patchtokens_postnorm': x_norm[:, self.numregisters + 1:],
+                'regtokens_prenorm':    x[:, 1:self.numregisters + 1],
+                'regtokens_postnorm':   x_norm[:, 1:self.numregisters + 1],
+                'masks':                token_masks,
             }
+            if self.looped_T_max > 0:
+                out['halt_step'] = halt_step
+            return out
 
 
