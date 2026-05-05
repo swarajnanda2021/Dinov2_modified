@@ -42,13 +42,13 @@ Each modification below cites its originating source(s). This matters because no
 | Modification | Primary Source | Also Adopted By | Notes |
 |---|---|---|---|
 | patch_size 14 | Community standard | Virchow, Virchow2, Virchow2G, Midnight, RudolfV, H-optimus, H0-mini, Atlas | Only Phikon-v2 and PathOrchestra stay at 16 |
-| out_dim 131,072 | Virchow v1 §Methods (Vorontsov 2023) | Virchow2, Virchow2G | Paige standard |
 | bf16 end-to-end | Virchow2G retrospective note | — | Authors flagged fp16 as cause of NaN; H100 supports bf16 natively |
 | Solarization OFF | Virchow2 §5.2 ablation | Virchow2G, RudolfV, Hibou | Distorts H&E chromophores |
 | V-flip + 90° rotations | Virchow2, RudolfV, Hibou | Lunit DINO | Pathology has no canonical orientation |
 | Teacher temp fixed 0.04 | Virchow2G §5.1 | — | Virchow2 uses decreasing 0.07→0.04 |
 | KDE regularizer (κ=5) | Virchow2 §5.2 | Midnight (cites Virchow2) | vMF kernel, replaces KoLeo |
 | ECT augmentation | Virchow2 §5.1 | — | Probabilistic framing is user's variation |
+| out_dim 131,072 at ≥ViT-H | Virchow v1 §Methods (Vorontsov 2023) | Virchow2, Virchow2G | Paige standard; scaled-regime change, ViT-H/G only |
 | qk_norm at ViT-G | Virchow2G §6 | — | Training stability at scale |
 | StableAdamW β₂=0.95 | Virchow2G §6 | — | Prevents late-training NaN at ViT-G |
 | 8 register tokens at ≥ViT-H | Virchow2G, UNI2-h | — | Darcet et al. register tokens |
@@ -58,19 +58,21 @@ Each modification below cites its originating source(s). This matters because no
 ### Group A: Cross-preset changes (applied by `--use_pathology_recipe=True`)
 
 - **A1. Patch size 16 → 14** — Community standard (Virchow family, Midnight, RudolfV, H-optimus)
-- **A2. DINO prototype count (`out_dim`) 65,536 → 131,072** — Virchow v1 Methods; Paige standard
-- **A3. Mixed precision fp16+GradScaler → bf16 end-to-end, no scaler** — H100-appropriate; avoids fp16 NaN issues flagged by Virchow2G team
-- **A4. Solarization OFF** — Virchow2 §5.2 ablation; also in Virchow2G, RudolfV, Hibou
-- **A5. Vertical flip ON + 90° rotations ON** — Virchow2, RudolfV, Hibou, Lunit
-- **A6. Teacher temperature fixed at 0.04** — Virchow2G §5.1
-- **A7. KoLeo regularizer → KDE regularizer** — Virchow2 §5.2; vMF kernel κ=5; all-gather across GPUs
-- **A8. Probabilistic ECT augmentation** — ECT from Virchow2 §5.1; probabilistic framing is user's variation (see Group C)
+- **A2. Mixed precision fp16+GradScaler → bf16 end-to-end, no scaler** — H100-appropriate; avoids fp16 NaN issues flagged by Virchow2G team
+- **A3. Solarization OFF** — Virchow2 §5.2 ablation; also in Virchow2G, RudolfV, Hibou
+- **A4. Vertical flip ON + 90° rotations ON** — Virchow2, RudolfV, Hibou, Lunit
+- **A5. Teacher temperature fixed at 0.04** — Virchow2G §5.1
+- **A6. KoLeo regularizer → KDE regularizer** — Virchow2 §5.2; vMF kernel κ=5; all-gather across GPUs
+- **A7. Probabilistic ECT augmentation** — ECT from Virchow2 §5.1; probabilistic framing is user's variation (see Group C)
 
-### Group B: ViT-G auto-gate (triggers when `args.embeddingdim >= 1280`)
+(`out_dim 131,072` is **not** in Group A — Virchow v1 chose it at ViT-H scale and Virchow2 / Virchow2G carried it at ViT-H/G, so it's a scaled-regime change. See Group B.)
+
+### Group B: ViT-H/G auto-gate (triggers when `args.embeddingdim >= 1280`)
 
 - **B1. `qk_norm`: False → True** — Virchow2G §6
 - **B2. `num_register_tokens`: max(current, 8)** — Virchow2G, UNI2-h (monotonic override)
-- **B3. Optimizer: AdamW → StableAdamW with β₂=0.95** — Virchow2G §6
+- **B3. DINO prototype count (`out_dim`) 65,536 → 131,072** — Virchow v1 Methods; Paige standard. ViT-B and ViT-L runs with the recipe on keep their CLI/default `out_dim`.
+- **B4. Optimizer: AdamW → StableAdamW with β₂=0.95** — Virchow2G §6
 
 ### Group C: Probabilistic ECT Specification
 
@@ -134,14 +136,15 @@ Add four new CLI arguments. The `help` text **must** include source attribution 
 # ========== Pathology FM Recipe ==========
 parser.add_argument('--use_pathology_recipe', default=False, type=utils.bool_flag,
                     help='Enable pathology-FM recipe bundle. Sources: KDE regularizer, '
-                         'ECT augmentation, teacher_temp=0.04, out_dim=131072 '
+                         'ECT augmentation, teacher_temp=0.04 '
                          '[Virchow/Virchow2, Paige/MSKCC/MSR, arXiv:2309.07778 and '
                          'arXiv:2408.00738]; solarization off, V-flip, 90-deg rotations '
                          '[Virchow2 + RudolfV + Hibou convergence]; patch_size=14 '
                          '[community standard across Virchow family, Midnight, RudolfV, '
                          'H-optimus]; bf16 end-to-end [scaling-regime choice, flagged '
                          'retroactively by Virchow2G]. Auto-enables qk_norm, 8+ register '
-                         'tokens, StableAdamW beta2=0.95 when embeddingdim >= 1280 '
+                         'tokens, out_dim=131072 (Virchow v1 Methods, Paige standard), '
+                         'and StableAdamW beta2=0.95 when embeddingdim >= 1280 '
                          '[Virchow2G scaling package, arXiv:2408.00738 Section 6].')
 
 parser.add_argument('--ect_probability', default=0.4, type=float,
@@ -666,15 +669,20 @@ if args.use_pathology_recipe:
         args.patch_size = 14
 ```
 
-**8i. Override `out_dim` when recipe is on:**
+**8i. Override `out_dim` inside the ViT-H/G auto-gate (NOT the unconditional recipe block):**
+
+`out_dim 131,072` is a scaled-regime change — Virchow v1 chose it at ViT-H scale, and Virchow2 / Virchow2G carried it at ViT-H/G. Place the override inside the `auto_gate_active` branch so ViT-B and ViT-L runs with `--use_pathology_recipe=True` keep their CLI/default `out_dim` (typically 65,536):
 
 ```python
-if args.use_pathology_recipe:
+if auto_gate_active:
+    # ... qk_norm + register tokens overrides above ...
     if args.out_dim != 131072:
-        print(f"[pathology recipe] Overriding out_dim {args.out_dim} -> 131072 "
+        print(f"[pathology recipe auto-gate] Overriding out_dim {args.out_dim} -> 131072 "
               f"(Virchow v1 Methods, Paige standard)")
         args.out_dim = 131072
 ```
+
+Do **not** place this inside `if args.use_pathology_recipe:`. That would trigger the override for every recipe run regardless of model size, which is wrong: at ViT-B/L scale `out_dim=131072` is far too large for the data and head capacity.
 
 ### File 9: `run_with_submitit.py`
 
@@ -692,7 +700,6 @@ Add the toggle as a commented-out block the user can uncomment:
 #   - KDE regularizer replaces KoLeo        [Virchow2 Sec 5.2]
 #   - Probabilistic ECT augmentation         [Virchow2 Sec 5.1 + user variation]
 #   - Teacher temp fixed at 0.04             [Virchow2G Sec 5.1]
-#   - out_dim=131,072                        [Virchow v1 Methods]
 #   - patch_size=14                          [pathology FM community standard]
 #   - bf16 end-to-end                        [Virchow2G retrospective]
 #   - Solarization off, V-flip, 90-deg rot   [Virchow2/RudolfV/Hibou convergence]
@@ -704,6 +711,7 @@ Add the toggle as a commented-out block the user can uncomment:
 # When embeddingdim >= 1280, the auto-gate additionally enables:
 #   - qk_norm=True                           [Virchow2G Sec 6]
 #   - num_register_tokens >= 8               [Virchow2G + UNI2-h]
+#   - out_dim=131,072                        [Virchow v1 Methods, Paige standard]
 #   - StableAdamW with beta2=0.95            [Virchow2G Sec 6]
 #
 # [Full probabilistic ECT magnification table — see Group C comment above]

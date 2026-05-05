@@ -103,11 +103,6 @@ def train_dinov2(args):
             print(f"[pathology recipe] Overriding patch_size {args.patch_size} -> 14 "
                   f"(community standard for pathology FMs)")
             args.patch_size = 14
-        # out_dim 131072 per Virchow v1 Methods (Paige standard)
-        if args.out_dim != 131072:
-            print(f"[pathology recipe] Overriding out_dim {args.out_dim} -> 131072 "
-                  f"(Virchow v1 Methods, Paige standard)")
-            args.out_dim = 131072
         # Nudge koleo_loss_weight to 0.05 only if user left the default 0.1
         if abs(args.koleo_loss_weight - 0.1) < 1e-6:
             args.koleo_loss_weight = 0.05
@@ -122,8 +117,16 @@ def train_dinov2(args):
             args.num_register_tokens = 8
             print(f"[pathology recipe auto-gate] Bumped num_register_tokens to 8 "
                   f"(Virchow2G scaling package)")
+        # out_dim 131072 was Virchow v1's choice at ViT-H scale, carried by
+        # Virchow2 / Virchow2G at ViT-H/G. It is a scaled-regime change, not
+        # a universal pathology-recipe component, so it lives in the auto-gate.
+        if args.out_dim != 131072:
+            print(f"[pathology recipe auto-gate] Overriding out_dim {args.out_dim} -> 131072 "
+                  f"(Virchow v1 Methods, Paige standard)")
+            args.out_dim = 131072
         print(f"[pathology recipe auto-gate] qk_norm={args.qk_norm}, "
-              f"register_tokens={args.num_register_tokens}, StableAdamW active")
+              f"register_tokens={args.num_register_tokens}, "
+              f"out_dim={args.out_dim}, StableAdamW active")
     elif getattr(args, 'qk_norm', None) is None:
         args.qk_norm = False  # safe default when auto-gate doesn't fire
 
