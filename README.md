@@ -79,7 +79,6 @@ For ablation and reproducibility of prior experiments. `training.helpers.generat
 *Cross-preset changes applied when the flag is on.*
 
 - `patch_size` 16 → 14 (community standard across the Virchow family, Midnight, RudolfV, H-optimus; only Phikon-v2 and PathOrchestra stay at 16).
-- `out_dim` 65,536 → 131,072 (Virchow v1 Methods; Paige standard).
 - bf16 autocast end-to-end with `fp16_scaler=None` (Virchow2G retrospectively flagged fp16 as the cause of late-training NaN; H100 supports bf16 natively).
 - Solarization off on global crop 2 (Virchow2 §5.2 ablation; also in Virchow2G, RudolfV, Hibou).
 - Vertical flip on and 90-degree discrete rotations on in the color-jitter chain (Virchow2, RudolfV, Hibou, Lunit all adopt this — pathology tiles have no canonical orientation).
@@ -95,11 +94,12 @@ For ablation and reproducibility of prior experiments. `training.helpers.generat
 
 Under the recipe, the pre-resize to (global_size, global_size) is skipped — `RandomResizedCrop` handles the final resize to output size, so ECT actually operates on the native resolution it was designed for.
 
-*ViT-G auto-gate.* When the recipe is on **and** `args.embeddingdim >= 1280`, three additional Virchow2G §6 scaling-regime fixes kick in automatically and are logged at startup under `[pathology recipe auto-gate]`:
+*ViT-G auto-gate.* When the recipe is on **and** `args.embeddingdim >= 1280`, four additional scaling-regime fixes kick in automatically and are logged at startup under `[pathology recipe auto-gate]`:
 
-- `qk_norm=True` inside attention (the feature was already wired through `ModernViT`/`TransformerBlock`; the auto-gate just flips the default). Explicit `--qk_norm=True/False` on the CLI overrides the auto-gate.
+- `qk_norm=True` inside attention (the feature was already wired through `ModernViT`/`TransformerBlock`; the auto-gate just flips the default). Explicit `--qk_norm=True/False` on the CLI overrides the auto-gate. (Virchow2G §6.)
 - `num_register_tokens` bumped to `max(current, 8)` (Virchow2G + UNI2-h).
-- Optimizer swapped from `torch.optim.AdamW` to `utils.StableAdamW(betas=(0.9, 0.95))`. StableAdamW uses decoupled weight decay and per-step RMS-clipped updates; Virchow2G reports it prevented late-training NaN at ViT-G scale. The implementation lives alongside LARS in `utils.py`.
+- `out_dim` 65,536 → 131,072 (Virchow v1 Methods; Paige standard). This is a scaled-regime change — Virchow v1 chose 131,072 at ViT-H scale and Virchow2 / Virchow2G carried it at ViT-H/G — not a universal pathology-recipe component, so ViT-B and ViT-L runs with `--use_pathology_recipe=True` keep their CLI/default `out_dim` (typically 65,536).
+- Optimizer swapped from `torch.optim.AdamW` to `utils.StableAdamW(betas=(0.9, 0.95))`. StableAdamW uses decoupled weight decay and per-step RMS-clipped updates; Virchow2G reports it prevented late-training NaN at ViT-G scale. The implementation lives alongside LARS in `utils.py`. (Virchow2G §6.)
 
 *Control surface.* Four new CLI args, all defaulting off / neutral so the branch is a no-op unless opted in: `--use_pathology_recipe`, `--ect_probability`, `--kde_kappa`, `--qk_norm`, plus `--num_register_tokens` (was previously hardcoded to 4 at the `ModernViT` call site). `run_with_submitit.py` ships with a commented-out toggle stanza and the full magnification table inline; uncomment three lines to enable. Runtime verification checklist (no-op parity, ECT routing frequency, KDE stability, auto-gate log, bf16 end-to-end, ViT-L smoke test) is tracked in [`pathology_fm_recipe_verification.md`](pathology_fm_recipe_verification.md).
 

@@ -273,7 +273,6 @@ def main():
     #   - KDE regularizer replaces KoLeo        [Virchow2 Sec 5.2]
     #   - Probabilistic ECT augmentation         [Virchow2 Sec 5.1 + user variation]
     #   - Teacher temp fixed at 0.04             [Virchow2G Sec 5.1]
-    #   - out_dim=131,072                        [Virchow v1 Methods]
     #   - patch_size=14                          [pathology FM community standard]
     #   - bf16 end-to-end                        [Virchow2G retrospective]
     #   - Solarization off, V-flip, 90-deg rot   [Virchow2/RudolfV/Hibou convergence]
@@ -281,6 +280,7 @@ def main():
     # When embeddingdim >= 1280 (ViT-H/G), the auto-gate additionally enables:
     #   - qk_norm=True                           [Virchow2G Sec 6]
     #   - num_register_tokens >= 8               [Virchow2G + UNI2-h]
+    #   - out_dim=131,072                        [Virchow v1 Methods, Paige standard]
     #   - StableAdamW with beta2=0.95            [Virchow2G Sec 6]
     #
     # Full probabilistic ECT magnification table is documented in a
