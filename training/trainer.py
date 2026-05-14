@@ -1000,9 +1000,9 @@ def train_dinov2(args):
                 for sem_mask, sem_weight in zip(semantic_token_masks, semantic_masks_weights):
                     # Backbone forward with semantic mask tokens
                     sem_backbone_out = student.module.backbone(
-                        teacher_global_crops[0], token_masks=sem_mask
+                        teacher_global_crops[0], token_masks=sem_mask, return_dict=True
                     )
-                    sem_patch_raw = sem_backbone_out['patchtokens']  # [B, N, D]
+                    sem_patch_raw = sem_backbone_out['patchtokens_postnorm']  # [B, N, D]
 
                     # Store for prototype section (backbone-dim, ~0.4 GB each)
                     semantic_backbone_outputs.append((sem_patch_raw, sem_mask, sem_weight))
