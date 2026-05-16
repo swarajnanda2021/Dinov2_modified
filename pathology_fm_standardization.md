@@ -61,9 +61,8 @@ Each modification below cites its originating source(s). This matters because no
 - **A2. Mixed precision fp16+GradScaler → bf16 end-to-end, no scaler** — H100-appropriate; avoids fp16 NaN issues flagged by Virchow2G team
 - **A3. Solarization OFF** — Virchow2 §5.2 ablation; also in Virchow2G, RudolfV, Hibou
 - **A4. Vertical flip ON + 90° rotations ON** — Virchow2, RudolfV, Hibou, Lunit
-- **A5. Teacher temperature fixed at 0.04** — Virchow2G §5.1
-- **A6. KoLeo regularizer → KDE regularizer** — Virchow2 §5.2; vMF kernel κ=5; all-gather across GPUs
-- **A7. Probabilistic ECT augmentation** — ECT from Virchow2 §5.1; probabilistic framing is user's variation (see Group C)
+- **A5. KoLeo regularizer → KDE regularizer** — Virchow2 §5.2; vMF kernel κ=5; all-gather across GPUs
+- **A6. Probabilistic ECT augmentation** — ECT from Virchow2 §5.1; probabilistic framing is user's variation (see Group C)
 
 (`out_dim 131,072` is **not** in Group A — Virchow v1 chose it at ViT-H scale and Virchow2 / Virchow2G carried it at ViT-H/G, so it's a scaled-regime change. See Group B.)
 
@@ -73,6 +72,7 @@ Each modification below cites its originating source(s). This matters because no
 - **B2. `num_register_tokens`: max(current, 8)** — Virchow2G, UNI2-h (monotonic override)
 - **B3. DINO prototype count (`out_dim`) 65,536 → 131,072** — Virchow v1 Methods; Paige standard. ViT-B and ViT-L runs with the recipe on keep their CLI/default `out_dim`.
 - **B4. Optimizer: AdamW → StableAdamW with β₂=0.95** — Virchow2G §6
+- **B5. Teacher temperature fixed at 0.04** — Virchow2G §5.1. Pairs with B3 (`out_dim=131,072`); applying it without B3 (ViT-B/L) produces near-one-hot targets over the smaller head.
 
 ### Group C: Probabilistic ECT Specification
 

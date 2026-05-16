@@ -393,10 +393,14 @@ def train_dinov2(args):
     teacher.requires_grad_(False)
 
     # ============ Initialize losses ============
-    if getattr(args, 'use_pathology_recipe', False):
+    # teacher_temp=0.04 fixed is a Virchow2G ViT-G scaling-package choice that
+    # pairs with out_dim=131k. Both live in the auto-gate; do not apply at
+    # ViT-B/L where the standard warmup schedule converges.
+    if auto_gate_active:
         warmup_teacher_temp_effective = 0.04
         teacher_temp_effective = 0.04
-        print(f"Teacher temperature fixed at 0.04. Source: Virchow2G Section 5.1.")
+        print(f"[pathology recipe auto-gate] Teacher temperature fixed at 0.04. "
+              f"Source: Virchow2G Section 5.1.")
     else:
         warmup_teacher_temp_effective = args.warmup_teacher_temp
         teacher_temp_effective = args.teacher_temp

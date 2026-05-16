@@ -199,15 +199,16 @@ def get_args_parser():
     # ========== Pathology FM Recipe ==========
     parser.add_argument('--use_pathology_recipe', default=False, type=utils.bool_flag,
                         help='Enable pathology-FM recipe bundle. Sources: KDE regularizer, '
-                             'ECT augmentation, teacher_temp=0.04 '
+                             'ECT augmentation '
                              '[Virchow/Virchow2, Paige/MSKCC/MSR, arXiv:2309.07778 and '
                              'arXiv:2408.00738]; solarization off, V-flip, 90-deg rotations '
                              '[Virchow2 + RudolfV + Hibou convergence]; patch_size=14 '
                              '[community standard across Virchow family, Midnight, RudolfV, '
                              'H-optimus]; bf16 end-to-end [scaling-regime choice, flagged '
-                             'retroactively by Virchow2G]. Auto-enables qk_norm, 8+ register '
-                             'tokens, out_dim=131072 (Virchow v1 Methods, Paige standard), '
-                             'and StableAdamW beta2=0.95 when embeddingdim >= 1280 '
+                             'retroactively by Virchow2G]. Auto-enables teacher_temp=0.04 '
+                             'fixed [Virchow2G Section 5.1], qk_norm, 8+ register tokens, '
+                             'out_dim=131072 (Virchow v1 Methods, Paige standard), and '
+                             'StableAdamW beta2=0.95 when embeddingdim >= 1280 '
                              '[Virchow2G scaling package, arXiv:2408.00738 Section 6].')
 
     parser.add_argument('--ect_probability', default=0.4, type=float,
