@@ -84,7 +84,6 @@ For ablation and reproducibility of prior experiments. `training.helpers.generat
 - bf16 autocast end-to-end with `fp16_scaler=None` (Virchow2G retrospectively flagged fp16 as the cause of late-training NaN; H100 supports bf16 natively).
 - Solarization off on global crop 2 (Virchow2 §5.2 ablation; also in Virchow2G, RudolfV, Hibou).
 - Vertical flip on and 90-degree discrete rotations on in the color-jitter chain (Virchow2, RudolfV, Hibou, Lunit all adopt this — pathology tiles have no canonical orientation).
-- Teacher temperature fixed at 0.04 (Virchow2G §5.1).
 - `KoLeoLoss` → `KDELoss` with a von-Mises–Fisher kernel (κ from `--kde_kappa`, default 5.0), all-gather pooled across GPUs. Replaces KoLeo because pathology batches contain near-duplicate tiles; KoLeo's nearest-neighbor distance collapses and its gradient explodes on those. Virchow2 §5.2.
 - `--koleo_loss_weight` nudged from 0.1 → 0.05 only when the user hasn't overridden it (Virchow2 KDE default λ).
 
@@ -96,8 +95,9 @@ For ablation and reproducibility of prior experiments. `training.helpers.generat
 
 Under the recipe, the pre-resize to (global_size, global_size) is skipped — `RandomResizedCrop` handles the final resize to output size, so ECT actually operates on the native resolution it was designed for.
 
-*ViT-G auto-gate.* When the recipe is on **and** `args.embeddingdim >= 1280`, four additional scaling-regime fixes kick in automatically and are logged at startup under `[pathology recipe auto-gate]`:
+*ViT-G auto-gate.* When the recipe is on **and** `args.embeddingdim >= 1280`, five additional scaling-regime fixes kick in automatically and are logged at startup under `[pathology recipe auto-gate]`:
 
+- Teacher temperature fixed at 0.04 (no warmup schedule). Virchow2G §5.1. At ViT-B/L this is left at the user-supplied schedule because a sharp teacher distribution over the smaller `out_dim=65,536` head produces near-one-hot targets and destabilizes early training.
 - `qk_norm=True` inside attention (the feature was already wired through `ModernViT`/`TransformerBlock`; the auto-gate just flips the default). Explicit `--qk_norm=True/False` on the CLI overrides the auto-gate. (Virchow2G §6.)
 - `num_register_tokens` bumped to `max(current, 8)` (Virchow2G + UNI2-h).
 - `out_dim` 65,536 → 131,072 (Virchow v1 Methods; Paige standard). This is a scaled-regime change — Virchow v1 chose 131,072 at ViT-H scale and Virchow2 / Virchow2G carried it at ViT-H/G — not a universal pathology-recipe component, so ViT-B and ViT-L runs with `--use_pathology_recipe=True` keep their CLI/default `out_dim` (typically 65,536).
