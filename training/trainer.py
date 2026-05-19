@@ -998,18 +998,37 @@ def train_dinov2(args):
                 ibot_loss_g1 = torch.tensor(0.0, device='cuda')
 
             # ---------- Semantic iBOT on global crop 1 ----------
+            # Memory optimization: only one channel is randomly selected
+            # downstream for the prototype-clustering path (see prototype
+            # block). Pre-pick that channel here so the loop can release
+            # the other (N-1) backbone graphs as soon as their iBOT loss
+            # is computed, instead of holding all N graphs alive until
+            # the prototype block. Saves ~3 GB peak at 3 channels, ViT-B/14.
             if args.use_semantic_ibot and semantic_token_masks is not None:
                 ibot_accum = 0.0
 
-                for sem_mask, sem_weight in zip(semantic_token_masks, semantic_masks_weights):
+                # Pre-pick which channel to retain for the prototype path.
+                # Only retain if semantic prototypes are actually enabled;
+                # otherwise no channel needs to be kept past iBOT loss.
+                if args.use_semantic_prototypes:
+                    retain_idx = random.randint(0, len(semantic_token_masks) - 1)
+                else:
+                    retain_idx = -1  # no retention
+
+                for ch_idx, (sem_mask, sem_weight) in enumerate(
+                    zip(semantic_token_masks, semantic_masks_weights)
+                ):
                     # Backbone forward with semantic mask tokens
                     sem_backbone_out = student.module.backbone(
                         teacher_global_crops[0], token_masks=sem_mask, return_dict=True
                     )
                     sem_patch_raw = sem_backbone_out['patchtokens_postnorm']  # [B, N, D]
 
-                    # Store for prototype section (backbone-dim, ~0.4 GB each)
-                    semantic_backbone_outputs.append((sem_patch_raw, sem_mask, sem_weight))
+                    # Store for prototype section ONLY if this is the
+                    # pre-selected retain channel; otherwise this graph
+                    # will be released at end of iteration.
+                    if ch_idx == retain_idx:
+                        semantic_backbone_outputs.append((sem_patch_raw, sem_mask, sem_weight))
 
                     # Gather only masked tokens, then project
                     sem_s_gathered, sem_weights, _ = _gather_and_compute_weights(
@@ -1031,7 +1050,12 @@ def train_dinov2(args):
                         ibot_accum += loss_ibot
                         del sem_s_proj, sem_t_proj, sem_s_gathered, sem_t_gathered
 
-                    del sem_backbone_out
+                    # Release the backbone graph for non-retained channels.
+                    # For the retained channel, sem_patch_raw is still
+                    # alive via semantic_backbone_outputs; deleting the
+                    # local name here just drops one reference, the list
+                    # entry keeps the graph alive until the prototype block.
+                    del sem_backbone_out, sem_patch_raw
 
                 n_ch = len(semantic_token_masks)
                 semantic_ibot_loss_val = ibot_accum / n_ch

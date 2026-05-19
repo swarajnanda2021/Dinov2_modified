@@ -140,13 +140,18 @@ class iBOTPatchLoss(nn.Module):
 
     @torch.no_grad()
     def sinkhorn_knopp_normalization(self, teacher_output, teacher_temp, n_iterations=None):
-        """Apply Sinkhorn-Knopp normalization to teacher outputs."""
+        """Apply Sinkhorn-Knopp normalization to teacher outputs.
+
+        Memory note: the fp32 copy from .float() is a fresh tensor we own,
+        so divide and exp are done in-place on that copy to avoid two
+        ~6 GB transient allocations at out_dim=65536, M~22k.
+        """
         if n_iterations is None:
             n_iterations = self.n_iterations
-            
+
         teacher_output = teacher_output.float()
-        
-        Q = torch.exp(teacher_output / teacher_temp).t()
+
+        Q = teacher_output.div_(teacher_temp).exp_().t()
         
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         
