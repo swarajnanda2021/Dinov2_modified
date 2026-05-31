@@ -291,6 +291,7 @@ class VisionTransformer(nn.Module):
         block_fn=TransformerBlock,
         mlp_layer=SwiGLUFFNFused,
         num_register_tokens=4,
+        layerscale_init=None,
     ):
         super().__init__()
         assert global_pool in ("", "avg", "token")
@@ -347,14 +348,17 @@ class VisionTransformer(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
 
         # LayerScale initialization
-        layer_init_values = []
-        for i in range(depth):
-            if depth < 18:
-                layer_init_values.append(0.1)
-            elif depth < 24:
-                layer_init_values.append(1e-5)
-            else:
-                layer_init_values.append(1e-6)
+        if layerscale_init is not None:
+            layer_init_values = [layerscale_init] * depth
+        else:
+            layer_init_values = []
+            for i in range(depth):
+                if depth < 18:
+                    layer_init_values.append(0.1)
+                elif depth < 24:
+                    layer_init_values.append(1e-5)
+                else:
+                    layer_init_values.append(1e-6)
         
         # Transformer blocks
         self.blocks = nn.Sequential(*[

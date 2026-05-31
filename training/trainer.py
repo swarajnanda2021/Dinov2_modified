@@ -285,6 +285,7 @@ def train_dinov2(args):
         drop_path_rate=0.4,
         pre_norm=False,
         num_register_tokens=args.num_register_tokens,
+        layerscale_init=args.layerscale_init,
     )
 
     teacher_encoder = deepcopy(student_encoder)
