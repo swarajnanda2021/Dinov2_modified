@@ -329,6 +329,7 @@ def train_dinov2(args):
         num_register_tokens=args.num_register_tokens,
         looped_T_max=looped_T_max,
         looped_L=looped_L,
+        layerscale_init=args.layerscale_init,
     )
 
     teacher_encoder = deepcopy(student_encoder)

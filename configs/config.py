@@ -30,6 +30,9 @@ def get_args_parser():
                         help='Normalize last layer of projection head')
     parser.add_argument('--use_bn_in_head', default=False, type=utils.bool_flag,
                         help='Use batch normalization in projection head')
+    parser.add_argument("--layerscale_init", default=None, type=float,
+                        help="If set, use this constant LayerScale init for ALL blocks, "
+                             "overriding the depth-based CaiT schedule. None = keep schedule.")
 
     # ========== Flexible augmentation parameters ==========
     parser.add_argument('--global_views', default=2, type=int,

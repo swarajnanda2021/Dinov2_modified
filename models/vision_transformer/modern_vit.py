@@ -300,6 +300,7 @@ class VisionTransformer(nn.Module):
         num_register_tokens=4,
         looped_T_max: int = 0,
         looped_L: Optional[int] = None,
+        layerscale_init=None,
     ):
         super().__init__()
         assert global_pool in ("", "avg", "token")
@@ -373,14 +374,17 @@ class VisionTransformer(nn.Module):
         # of init values in looped mode, since T_max * L is what the backbone
         # represents in operation count).
         effective_depth = self.looped_T_max * block_count if self.looped_T_max > 0 else block_count
-        layer_init_values = []
-        for _ in range(block_count):
-            if effective_depth < 18:
-                layer_init_values.append(0.1)
-            elif effective_depth < 24:
-                layer_init_values.append(1e-5)
-            else:
-                layer_init_values.append(1e-6)
+        if layerscale_init is not None:
+            layer_init_values = [layerscale_init] * block_count
+        else:
+            layer_init_values = []
+            for _ in range(block_count):
+                if effective_depth < 18:
+                    layer_init_values.append(0.1)
+                elif effective_depth < 24:
+                    layer_init_values.append(1e-5)
+                else:
+                    layer_init_values.append(1e-6)
 
         # Transformer blocks. Use ModuleList in looped mode so SharedStack
         # owns the iteration order; nn.Sequential is fine in the standard
