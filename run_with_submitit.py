@@ -171,6 +171,11 @@ def main():
         setattr(args, k, v)
     args.patch_size = 16
 
+    # ---- Architecture corrections (see LayerScale/qk-norm investigation) ----
+    args.layerscale_init = 1e-5     # uniform; NOT the CaiT depth-schedule (which broke ViT-L)
+    args.norm_last_layer = False    # DINOv2 behavior; True = frozen prototype magnitude (old bug)
+    args.qk_norm         = True     # caps attention-logit blow-up; False = block-10 sink at depth
+
     # ========== Augmentation Configuration ==========
     args.global_views = 2
     args.n_standard_local_crops = 6
@@ -191,7 +196,8 @@ def main():
 
     # DINO parameters
     args.out_dim = 65536
-    args.norm_last_layer = True
+    # args.norm_last_layer is set in the "Architecture corrections" block
+    # near the variant/patch_size definitions above.
     args.use_bn_in_head = False
 
     # DINOv2 parameters
@@ -349,6 +355,10 @@ def main():
     print("\n" + "="*80)
     print("Configuration Summary:")
     print(f"  Architecture: ViT-{args.vit_variant}/{effective_patch_size}")
+    print(f"    layerscale_init = {args.layerscale_init}  "
+          f"(schedule = {getattr(args, 'layerscale_schedule', 'uniform')})")
+    print(f"    norm_last_layer = {args.norm_last_layer}")
+    print(f"    qk_norm         = {args.qk_norm}")
     print(f"  Global crops: {args.global_views}")
     print(f"  Standard local crops: {args.n_standard_local_crops}")
 
