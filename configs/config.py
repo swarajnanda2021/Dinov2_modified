@@ -26,13 +26,23 @@ def get_args_parser():
                         help='Number of transformer blocks')
     parser.add_argument('--out_dim', default=65536, type=int,
                         help='Output dimension of projection heads')
-    parser.add_argument('--norm_last_layer', default=True, type=utils.bool_flag,
-                        help='Normalize last layer of projection head')
+    parser.add_argument('--norm_last_layer', default=False, type=utils.bool_flag,
+                        help='Normalize the DINO head last layer (frozen weight-norm trick). '
+                             'Default: False (corrected DINOv2 behavior). Pass True to '
+                             'reproduce the older runs that used the frozen last layer.')
     parser.add_argument('--use_bn_in_head', default=False, type=utils.bool_flag,
                         help='Use batch normalization in projection head')
-    parser.add_argument("--layerscale_init", default=None, type=float,
-                        help="If set, use this constant LayerScale init for ALL blocks, "
-                             "overriding the depth-based CaiT schedule. None = keep schedule.")
+    parser.add_argument("--layerscale_init", default=1e-5, type=float,
+                        help="Uniform LayerScale init for ALL blocks. Only consulted when "
+                             "--layerscale_schedule=uniform (the default). Default: 1e-5 "
+                             "(corrected DINOv2 behavior).")
+    parser.add_argument("--layerscale_schedule", default="uniform",
+                        choices=["uniform", "cait"],
+                        help="LayerScale init policy. 'uniform' (default) uses the constant "
+                             "--layerscale_init for every block (corrected DINOv2 behavior). "
+                             "'cait' reproduces the old depth-based schedule (0.1 for "
+                             "depth<18, 1e-5 for 18<=depth<24, 1e-6 for depth>=24); "
+                             "--layerscale_init is ignored in this mode.")
 
     # ========== Flexible augmentation parameters ==========
     parser.add_argument('--global_views', default=2, type=int,

@@ -128,7 +128,14 @@ def train_dinov2(args):
               f"register_tokens={args.num_register_tokens}, "
               f"out_dim={args.out_dim}, StableAdamW active")
     elif getattr(args, 'qk_norm', None) is None:
-        args.qk_norm = False  # safe default when auto-gate doesn't fire
+        # Corrected DINOv2 default: qk_norm on at every model size when the
+        # user did not set it explicitly. The auto-gate above still wins
+        # (it already sets True for ViT-H/G + pathology recipe). Explicit
+        # True/False from the CLI / launch script always wins because both
+        # values fail the `is None` check on the auto-gate's gating line.
+        # Pass --qk_norm False (or args.qk_norm = False in the launcher) to
+        # reproduce the older no-QK-norm runs.
+        args.qk_norm = True
 
     # ============ Looped backbone: validate incompatible combinations ============
     # The looped + PonderNet path in this revision intentionally supports only
@@ -314,6 +321,24 @@ def train_dinov2(args):
     looped_T_max = args.recursion_T_max if use_looped_backbone else 0
     looped_L = args.shared_stack_L if use_looped_backbone else None
 
+    # Layerscale schedule resolution. Defaults to 'uniform' with
+    # --layerscale_init=1e-5 (corrected DINOv2 behavior). 'cait' translates
+    # to layerscale_init=None at the constructor level, which the
+    # VisionTransformer already interprets as "use the depth-based CaiT
+    # schedule" (0.1 / 1e-5 / 1e-6 by effective_depth). Keeping the schedule
+    # flag trainer-side leaves the constructor signature unchanged, so the
+    # dashboard/PCA checkpoint loaders (which don't pass this kwarg) keep
+    # their existing CaiT-schedule behavior automatically. On the loop
+    # branch the constructor sizes the override list by block_count (not
+    # depth), so this resolution composes correctly with the looped path.
+    if getattr(args, 'layerscale_schedule', 'uniform') == 'cait':
+        effective_layerscale_init = None
+        if args.layerscale_init is not None:
+            print(f"[layerscale] schedule='cait' → using depth-based CaiT init; "
+                  f"--layerscale_init={args.layerscale_init} is ignored.")
+    else:
+        effective_layerscale_init = args.layerscale_init
+
     student_encoder = ModernViT(
         img_size=224,
         patch_size=args.patch_size,
@@ -329,7 +354,7 @@ def train_dinov2(args):
         num_register_tokens=args.num_register_tokens,
         looped_T_max=looped_T_max,
         looped_L=looped_L,
-        layerscale_init=args.layerscale_init,
+        layerscale_init=effective_layerscale_init,
     )
 
     teacher_encoder = deepcopy(student_encoder)
