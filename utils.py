@@ -356,6 +356,21 @@ def bool_flag(s):
         raise argparse.ArgumentTypeError("invalid value for a boolean flag")
 
 
+def bool_flag_or_none(s):
+    """
+    Parse boolean arguments that also accept an explicit "none" value.
+
+    Returns:
+        None for s in {"none", ""} (case-insensitive), else delegates to bool_flag.
+
+    Use this for flags whose default-None has a downstream meaning (e.g. an
+    auto-gate decides the value when the user did not explicitly set it).
+    """
+    if s is None or s.lower() in {"none", ""}:
+        return None
+    return bool_flag(s)
+
+
 def fix_random_seeds(seed=31):
     """
     Fix random seeds.

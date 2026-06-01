@@ -227,12 +227,13 @@ def get_args_parser():
                              'Virchow2 default (arXiv:2408.00738 Section 5.2 and ablation). '
                              'Only used when --use_pathology_recipe=True.')
 
-    parser.add_argument('--qk_norm', default=None, type=utils.bool_flag,
+    parser.add_argument('--qk_norm', default=None, type=utils.bool_flag_or_none,
                         help='Enable QK normalization in attention [Virchow2G scaling '
                              'package, arXiv:2408.00738 Section 6]. If None (default), '
                              'auto-enables when embeddingdim >= 1280 AND '
                              '--use_pathology_recipe=True. Explicit True/False overrides '
-                             'the auto-gate.')
+                             'the auto-gate. CLI accepts "none" to opt back into the '
+                             'auto-gate explicitly.')
 
     parser.add_argument('--num_register_tokens', default=4, type=int,
                         help='Number of register tokens [Darcet et al. 2023, adopted by '
