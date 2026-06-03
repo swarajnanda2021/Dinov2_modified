@@ -296,6 +296,10 @@ def main():
     args.ect_probability = 0.4
     args.kde_kappa = 5.0
 
+    # Patch-embed LR throttle (DINOv2 ssl_default_config: 0.2; MoCo v3 stability).
+    # Applied to the patch_embed param group only, on top of layer-wise decay.
+    args.patch_embed_lr_mult = 0.2
+
     # ================================================================
     # LOOPED DINOv2 - toggle and controls
     # ================================================================

@@ -189,8 +189,8 @@ class TransformerBlock(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         
         if qk_norm:
-            self.q_norm = norm_layer(self.head_dim)
-            self.k_norm = norm_layer(self.head_dim)
+            self.q_norm = nn.LayerNorm(self.head_dim, bias=False)
+            self.k_norm = nn.LayerNorm(self.head_dim, bias=False)
         else:
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
@@ -443,7 +443,8 @@ class VisionTransformer(nn.Module):
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.LayerNorm):
             nn.init.ones_(m.weight)
-            nn.init.zeros_(m.bias)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
     
     @torch.jit.ignore
     def no_weight_decay(self):
