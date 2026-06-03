@@ -1089,7 +1089,7 @@ def get_params_groups(model):
             regularized.append(param)
     return [{'params': regularized}, {'params': not_regularized, 'weight_decay': 0.}]
 
-def get_params_groups_with_layer_decay(model, lr_decay_rate=0.9, num_layers=None):
+def get_params_groups_with_layer_decay(model, lr_decay_rate=0.9, num_layers=None, patch_embed_lr_mult=0.2):
     """
     Create parameter groups with layer-wise LR decay for Vision Transformers.
     
@@ -1130,15 +1130,19 @@ def get_params_groups_with_layer_decay(model, lr_decay_rate=0.9, num_layers=None
         
         # Compute LR multiplier
         lr_mult = lr_decay_rate ** (num_layers + 1 - layer_id)
-        
+        if "patch_embed" in name:
+            lr_mult = lr_mult * patch_embed_lr_mult
+
         # WD multiplier (0 for bias/norm, 1 for weights)
         if name.endswith(".bias") or len(param.shape) == 1:
             wd_mult = 0.0
         else:
             wd_mult = 1.0
-        
-        # Create group key
-        group_key = f"layer_{layer_id}_wd_{wd_mult}"
+
+        # Create group key (lr_mult is part of the key so patch_embed — which now
+        # has a different lr_mult — does not get merged into the layer_0 group
+        # shared with cls_token / pos_embed / mask_token / register_tokens).
+        group_key = f"layer_{layer_id}_wd_{wd_mult}_lr_{lr_mult:.6f}"
         
         if group_key not in param_group_names:
             param_group_names[group_key] = {

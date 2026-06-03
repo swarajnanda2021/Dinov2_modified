@@ -479,6 +479,7 @@ def train_dinov2(args):
         student.module.backbone,
         lr_decay_rate=args.lr_decay_rate,
         num_layers=args.vitdepth,
+        patch_embed_lr_mult=args.patch_embed_lr_mult,
     )
 
     classhead_params = utils.get_params_groups_with_decay_for_heads(student.module.classhead)

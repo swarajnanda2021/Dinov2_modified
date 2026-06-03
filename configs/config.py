@@ -184,6 +184,11 @@ def get_args_parser():
                         help='Final weight decay')
     parser.add_argument('--lr_decay_rate', default=0.9, type=float,
                         help='Layer-wise LR decay rate (1.0 = no decay, 0.9 = typical)')
+    parser.add_argument('--patch_embed_lr_mult', default=0.2, type=float,
+                        help='LR multiplier applied to the patch_embed param group ONLY '
+                             '(on top of layer-wise decay). DINOv2 ssl_default_config uses '
+                             '0.2; set 1.0 to disable. Rationale: MoCo v3 patch-projection '
+                             'stability.')
     parser.add_argument('--grad_checkpointing', default=False, type=utils.bool_flag,
                     help='Enable gradient checkpointing to reduce memory at cost of ~40% speed')
 
