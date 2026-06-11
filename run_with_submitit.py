@@ -139,6 +139,11 @@ def main():
         slurm_setup=[
             'ulimit -l unlimited',
             f'export OMP_NUM_THREADS=8',
+            # PyTorch CUDA allocator: grow existing segments instead of carving fresh
+            # fixed-size ones. Collapses fragmentation from multi-crop forwards, xformers
+            # packed variable-length sequences, and iBOT [M, D] gathers where M varies
+            # per batch — the three biggest fragmentation sources in this training loop.
+            f'export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True',
             f'export NCCL_DEBUG=INFO',
             f'export NCCL_SOCKET_IFNAME=ib,bond',
             f'export MASTER_PORT=23468',
