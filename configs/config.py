@@ -43,6 +43,17 @@ def get_args_parser():
                              "'cait' reproduces the old depth-based schedule (0.1 for "
                              "depth<18, 1e-5 for 18<=depth<24, 1e-6 for depth>=24); "
                              "--layerscale_init is ignored in this mode.")
+    parser.add_argument('--drop_path_rate', default=0.4, type=float,
+                        help='Stochastic depth rate. Default 0.4 preserves the '
+                             'historical hard-coded value at the training call '
+                             'site. Canonical DINOv2 uses 0.3 for ViT-L with '
+                             '--drop_path_uniform=True.')
+    parser.add_argument('--drop_path_uniform', default=False, type=utils.bool_flag,
+                        help='If True, every block uses drop_path_rate (canonical '
+                             'DINOv2 ViT-L). If False (default, current fork '
+                             'behavior), use a linear ramp linspace(0, '
+                             'drop_path_rate, depth) — block 0 gets 0%, last '
+                             'block gets the full rate.')
 
     # ========== Flexible augmentation parameters ==========
     parser.add_argument('--global_views', default=2, type=int,

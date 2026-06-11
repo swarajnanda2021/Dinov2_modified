@@ -21,6 +21,28 @@ from timm.models._manipulate import checkpoint_seq
 attn_bias_cache = {}
 
 
+def drop_path(x, drop_prob: float = 0., training: bool = False):
+    """Per-sample stochastic depth. No-op in eval or when drop_prob=0."""
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+    if keep_prob > 0.:
+        random_tensor.div_(keep_prob)
+    return x * random_tensor
+
+
+class DropPath(nn.Module):
+    """Per-sample stochastic depth (drops whole residual branch)."""
+    def __init__(self, drop_prob: float = 0.):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
+
 def get_attn_bias_and_cat(x_list, branges=None):
     """
     Pack multiple sequences and create block-diagonal attention mask.
@@ -188,7 +210,7 @@ class TransformerBlock(nn.Module):
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
         
-        self.drop_path = nn.Identity() if drop_path == 0. else nn.Dropout(drop_path)
+        self.drop_path = nn.Identity() if drop_path == 0. else DropPath(drop_path)
         self.norm2 = norm_layer(dim)
         
         mlp_layer = mlp_layer or SwiGLUFFNFused
@@ -285,6 +307,7 @@ class VisionTransformer(nn.Module):
         proj_drop_rate=0.0,
         attn_drop_rate=0.0,
         drop_path_rate=0.4,
+        drop_path_uniform=False,
         weight_init="",
         norm_layer=None,
         act_layer=None,
@@ -345,7 +368,10 @@ class VisionTransformer(nn.Module):
         self.norm_pre = norm_layer(embed_dim) if pre_norm else nn.Identity()
 
         # Stochastic depth
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        if drop_path_uniform:
+            dpr = [drop_path_rate] * depth   # canonical DINOv2: flat across depth
+        else:
+            dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # CaiT ramp
 
         # LayerScale initialization
         if layerscale_init is not None:

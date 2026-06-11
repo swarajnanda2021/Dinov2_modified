@@ -175,6 +175,8 @@ def main():
     args.layerscale_init = 1e-5     # uniform; NOT the CaiT depth-schedule (which broke ViT-L)
     args.norm_last_layer = False    # DINOv2 behavior; True = frozen prototype magnitude (old bug)
     args.qk_norm         = True     # caps attention-logit blow-up; False = block-10 sink at depth
+    args.drop_path_rate    = 0.4    # rate; canonical DINOv2 ViT-L uses 0.3 with uniform=True
+    args.drop_path_uniform = False  # False = CaiT linear ramp (current fork); True = flat-rate DINOv2
 
     # ========== Augmentation Configuration ==========
     args.global_views = 2
