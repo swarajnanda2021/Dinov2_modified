@@ -174,6 +174,37 @@ class SwiGLUFFNFused(SwiGLUFFN):
         )
 
 
+class Mlp(nn.Module):
+    """Standard MLP FFN (Linear -> act -> Linear). DINOv2 ssl_default uses this
+    in place of SwiGLU. Drop-in for `mlp_layer`: same call signature as
+    SwiGLUFFNFused (in_features / hidden_features / out_features / drop / bias);
+    act_layer defaults to GELU since the TransformerBlock call does not pass it."""
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: Optional[int] = None,
+        out_features: Optional[int] = None,
+        act_layer: Callable[..., nn.Module] = nn.GELU,
+        drop: float = 0.0,
+        bias: bool = True,
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias)
+        self.drop = nn.Dropout(drop) if drop > 0 else nn.Identity()
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
 class TransformerBlock(nn.Module):
     """Transformer block with xformers attention and SwiGLU MLP."""
     def __init__(

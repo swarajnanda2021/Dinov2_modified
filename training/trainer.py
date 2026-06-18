@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 import utils
 from models import CombinedModelDINO, LinearPrototypeBank, ModernViT, DINOHead
+from models.vision_transformer.modern_vit import Mlp, SwiGLUFFNFused
 from losses import DINOLoss, iBOTPatchLoss, KoLeoLoss, KDELoss, PatchPrototypeLoss
 from data import ProportionalMultiDatasetWrapper
 from .helpers import (
@@ -295,6 +296,9 @@ def train_dinov2(args):
     else:
         effective_layerscale_init = args.layerscale_init
 
+    # FFN type: DINOv2 ssl_default uses a standard MLP+GELU; SwiGLU is the fork default.
+    mlp_layer_cls = Mlp if getattr(args, 'ffn_type', 'swiglu') == 'mlp' else SwiGLUFFNFused
+
     student_encoder = ModernViT(
         img_size=224,
         patch_size=args.patch_size,
@@ -310,6 +314,7 @@ def train_dinov2(args):
         pre_norm=False,
         num_register_tokens=args.num_register_tokens,
         layerscale_init=effective_layerscale_init,
+        mlp_layer=mlp_layer_cls,
     )
 
     teacher_encoder = deepcopy(student_encoder)
@@ -525,7 +530,7 @@ def train_dinov2(args):
 
     # ============ Create schedulers ============
     student_lr_schedule = utils.cosine_scheduler(
-        base_value=args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256.,
+        base_value=args.lr * math.sqrt(args.batch_size_per_gpu * utils.get_world_size() / 1024.0),
         final_value=args.min_lr,
         total_iters=args.total_iterations,
         warmup_iters=args.warmup_iterations,
