@@ -180,12 +180,13 @@ def main():
     args.layerscale_init = 1e-5     # uniform; NOT the CaiT depth-schedule (which broke ViT-L)
     args.norm_last_layer = False    # DINOv2 behavior; True = frozen prototype magnitude (old bug)
     args.qk_norm         = True     # caps attention-logit blow-up; False = block-10 sink at depth
-    args.drop_path_rate    = 0.4    # rate; canonical DINOv2 ViT-L uses 0.3 with uniform=True
-    args.drop_path_uniform = False  # False = CaiT linear ramp (current fork); True = flat-rate DINOv2
+    args.drop_path_rate    = 0.1    # DINOv2 ssl_default / UNI supplementary (was 0.4)
+    args.drop_path_uniform = True   # DINOv2 ssl_default: flat rate across depth (was False/CaiT ramp)
+    args.ffn_type          = "mlp"  # DINOv2 ssl_default uses standard MLP+GELU (was SwiGLU)
 
     # ========== Augmentation Configuration ==========
     args.global_views = 2
-    args.n_standard_local_crops = 6
+    args.n_standard_local_crops = 8
     args.local_crop_size = 96
 
     # Semantic iBOT
@@ -244,7 +245,7 @@ def main():
     args.random_crops_per_mask = 0
 
     # Teacher parameters
-    args.momentum_teacher = 0.996
+    args.momentum_teacher = 0.992
     args.teacher_temp = 0.07
     args.warmup_teacher_temp = 0.04
     args.teacher_temp_warmup_iters = 37_500
@@ -252,17 +253,17 @@ def main():
     # Optimization
     args.batch_size_per_gpu = 256
     args.warmup_iterations = 12_500
-    args.total_iterations = 150_001
+    args.total_iterations = 125_001
     args.freeze_last_layer_iters = 1_250
-    args.lr = 5e-5
+    args.lr = 2e-3      # base_lr under sqrt_wrt_1024 rule -> ~3.46e-3 applied at bs 3072 (384x8)
     args.min_lr = 1e-6
     args.weight_decay = 0.04
     args.weight_decay_end = 0.4
-    args.lr_decay_rate = 0.9
+    args.lr_decay_rate = 1.0    # DINOv2 ssl_default layerwise_decay=1.0 for ViT-L (was 0.9)
 
     # Training setup
     args.use_fp16 = True
-    args.clip_grad = 1.0
+    args.clip_grad = 3.0
     args.save_checkpoint_freq = 2_000
     args.num_workers = 10
     args.visualization_freq = 10000

@@ -32,6 +32,10 @@ def get_args_parser():
                              'reproduce the older runs that used the frozen last layer.')
     parser.add_argument('--use_bn_in_head', default=False, type=utils.bool_flag,
                         help='Use batch normalization in projection head')
+    parser.add_argument('--ffn_type', default='swiglu', choices=['swiglu', 'mlp'],
+                        help="Transformer FFN type. 'swiglu' (default, current fork) uses "
+                             "gated SwiGLU/SiLU. 'mlp' uses a standard Linear->GELU->Linear "
+                             "MLP (DINOv2 ssl_default behavior).")
     parser.add_argument("--layerscale_init", default=1e-5, type=float,
                         help="Uniform LayerScale init for ALL blocks. Only consulted when "
                              "--layerscale_schedule=uniform (the default). Default: 1e-5 "
