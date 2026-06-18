@@ -995,7 +995,9 @@ def train_dinov2(args):
 
             koleo_loss_val = torch.tensor(0.0).cuda()
             if len(global_cls_tokens) > 0:
-                koleo_loss_val = sum(dino_koleo_loss(token) for token in global_cls_tokens) / len(global_cls_tokens)
+                # Canonical DINOv2 / Virchow2: SUM the regularizer over the global
+                # crops (do NOT average). Applies to both KoLeo and KDE.
+                koleo_loss_val = sum(dino_koleo_loss(token) for token in global_cls_tokens)
 
             # ================================================================
             # iBOT Loss — gather-then-project to avoid [B, N, 65536] tensors.

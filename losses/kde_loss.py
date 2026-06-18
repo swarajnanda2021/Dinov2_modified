@@ -5,23 +5,30 @@ cause KoLeo's nearest-neighbor distance to collapse and its gradient
 to explode.
 
 Reference: Zimmermann et al., "Virchow 2: Scaling Self-Supervised Mixed
-Magnification Models in Pathology", arXiv:2408.00738 Section 5.2.
+Magnification Models in Pathology", arXiv:2408.00738 Section 3.2 / 5.2;
+open implementation: MedARC-AI/OpenMidnight dinov2/loss/kde_loss.py.
+
+Canonical behavior (matches Virchow2 / OpenMidnight):
+  - density is estimated on the LOCAL per-GPU batch (no cross-GPU all-gather),
+  - the self-comparison term (the diagonal, exp(kappa)) is INCLUDED in the
+    per-sample sum; that bounded self term is what keeps the gradient bounded.
+Deliberate deviation, kept on purpose: the reference returns the entropy
+-mean(log density); we return +mean(log density) so that MINIMIZING the loss
+lowers density and spreads features (the correct repulsion sign).
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
 
 class KDELoss(nn.Module):
     """
-    Kernel density estimation regularizer with von Mises-Fisher kernel.
-    Features are gathered across all GPUs before density estimation to
-    give a more accurate uniformity signal when world_size > 1.
+    Kernel density estimation regularizer with von Mises-Fisher kernel,
+    estimated over the local per-GPU batch (canonical Virchow2 / OpenMidnight).
 
     Args:
-        kappa: vMF concentration parameter (Virchow2 uses 5.0)
+        kappa: vMF concentration parameter (Virchow2 / OpenMidnight use 5.0)
     """
     def __init__(self, kappa=5.0):
         super().__init__()
@@ -29,58 +36,28 @@ class KDELoss(nn.Module):
 
     def forward(self, student_output, eps=1e-8):
         """
-        Compute KDE loss with cross-GPU feature pooling.
+        Compute the KDE regularizer on the local batch.
 
         Args:
-            student_output: Feature vectors [B_local, D]
+            student_output: Feature vectors [B, D]
             eps: Small constant for numerical stability inside the log
 
         Returns:
-            Scalar loss value encouraging uniform feature distribution
+            Scalar; minimizing it lowers per-sample feature density and thus
+            encourages a more uniform feature distribution.
         """
         with torch.cuda.amp.autocast(enabled=False):
-            x_local = F.normalize(student_output.float(), p=2, dim=-1)
+            x = F.normalize(student_output.float(), p=2, dim=-1)
 
-            # Gather features from all GPUs for global density estimation
-            if dist.is_available() and dist.is_initialized():
-                world_size = dist.get_world_size()
-                x_list = [torch.zeros_like(x_local) for _ in range(world_size)]
-                dist.all_gather(x_list, x_local)
-                # Replace this GPU's slot with the local tensor so the graph
-                # stays connected for local samples. Remote slots are detached
-                # by design (all_gather does not backprop across GPUs).
-                rank = dist.get_rank()
-                x_list[rank] = x_local
-                x_all = torch.cat(x_list, dim=0)
-            else:
-                x_all = x_local
+            # Pairwise cosine similarities [B, B].
+            sim = x @ x.t()
 
-            N = x_all.shape[0]
+            # Unnormalized vMF kernel exp(kappa * cos_sim). The diagonal equals
+            # exp(kappa) (the self-comparison) and is INCLUDED in the row sum:
+            # it floors the density away from zero and bounds the gradient.
+            density = torch.exp(self.kappa * sim).sum(dim=1)
 
-            # Pairwise cosine similarities [N, N]
-            sim = x_all @ x_all.t()
-
-            # vMF kernel with log-sum-exp numerical stability
-            logits = self.kappa * sim
-            max_per_row = logits.max(dim=1, keepdim=True).values
-            kernel = torch.exp(logits - max_per_row)
-
-            # Mask diagonal (exclude self-similarity)
-            mask = ~torch.eye(N, dtype=torch.bool, device=x_all.device)
-            density = (kernel * mask.float()).sum(dim=1) / (N - 1)
-
-            # Log-density per sample with stability offset recovered
-            log_density = torch.log(density + eps) + max_per_row.squeeze(1)
-
-            # Gradient only through local slice, so each GPU contributes
-            # gradient over its own batch samples
-            if dist.is_available() and dist.is_initialized():
-                B_local = x_local.shape[0]
-                rank = dist.get_rank()
-                start = rank * B_local
-                end = start + B_local
-                loss = log_density[start:end].mean()
-            else:
-                loss = log_density.mean()
-
+            # Fork sign: +mean(log density) (NOT the reference's -entropy), so
+            # minimizing the loss pushes density down -> spreads features.
+            loss = torch.log(density + eps).mean()
             return loss
