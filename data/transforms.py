@@ -103,7 +103,7 @@ class TMEDinoTransforms(object):
                                             saturation=0.2, hue=0.1)],
                     p=0.8,
                 ),
-                transforms.RandomGrayscale(p=0.01),
+                transforms.RandomGrayscale(p=0.2),
             ])
 
             # ECT primitives: native 40x +/- 10%, used on 40x source tiles
@@ -112,7 +112,7 @@ class TMEDinoTransforms(object):
                     size=global_size, scale=(0.203, 0.303), ratio=(0.95, 1.05),
                     interpolation=Image.BICUBIC),
                 self.flip_and_color_jitter,
-                transforms.GaussianBlur(3, (0.1, 0.15)),
+                transforms.GaussianBlur(9, (0.1, 2.0)),
                 self.to_tensor,
                 transforms.Normalize(mean=mean, std=std),
             ])
@@ -122,7 +122,7 @@ class TMEDinoTransforms(object):
                     size=global_size, scale=(0.203, 0.303), ratio=(0.95, 1.05),
                     interpolation=Image.BICUBIC),
                 self.flip_and_color_jitter,
-                transforms.GaussianBlur(3, (0.1, 0.15)),
+                transforms.RandomApply([transforms.GaussianBlur(9, (0.1, 2.0))], p=0.1),
                 # No RandomSolarize - Virchow2 Section 5.2 ablation
                 self.to_tensor,
                 transforms.Normalize(mean=mean, std=std),
@@ -133,7 +133,7 @@ class TMEDinoTransforms(object):
                     size=local_size, scale=(0.037, 0.056), ratio=(0.95, 1.05),
                     interpolation=Image.BICUBIC),
                 self.flip_and_color_jitter,
-                transforms.GaussianBlur(3, (0.1, 0.15)),
+                transforms.RandomApply([transforms.GaussianBlur(9, (0.1, 2.0))], p=0.5),
                 self.to_tensor,
                 transforms.Normalize(mean=mean, std=std),
             ])
@@ -144,7 +144,7 @@ class TMEDinoTransforms(object):
                     size=global_size, scale=(0.32, 1.0), ratio=(0.75, 1.33),
                     interpolation=Image.BICUBIC),
                 self.flip_and_color_jitter,
-                transforms.GaussianBlur(3, (0.1, 0.15)),
+                transforms.GaussianBlur(9, (0.1, 2.0)),
                 self.to_tensor,
                 transforms.Normalize(mean=mean, std=std),
             ])
@@ -154,7 +154,7 @@ class TMEDinoTransforms(object):
                     size=global_size, scale=(0.32, 1.0), ratio=(0.75, 1.33),
                     interpolation=Image.BICUBIC),
                 self.flip_and_color_jitter,
-                transforms.GaussianBlur(3, (0.1, 0.15)),
+                transforms.RandomApply([transforms.GaussianBlur(9, (0.1, 2.0))], p=0.1),
                 # No RandomSolarize - Virchow2 Section 5.2 ablation
                 self.to_tensor,
                 transforms.Normalize(mean=mean, std=std),
@@ -165,7 +165,7 @@ class TMEDinoTransforms(object):
                     size=local_size, scale=(0.05, 0.32), ratio=(0.75, 1.33),
                     interpolation=Image.BICUBIC),
                 self.flip_and_color_jitter,
-                transforms.GaussianBlur(3, (0.1, 0.15)),
+                transforms.RandomApply([transforms.GaussianBlur(9, (0.1, 2.0))], p=0.5),
                 self.to_tensor,
                 transforms.Normalize(mean=mean, std=std),
             ])
@@ -177,7 +177,7 @@ class TMEDinoTransforms(object):
                     [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
                     p=0.8
                 ),
-                transforms.RandomGrayscale(p=0.01),
+                transforms.RandomGrayscale(p=0.2),
             ])
 
             # Global view 1
@@ -185,7 +185,7 @@ class TMEDinoTransforms(object):
                 transforms.Resize((global_size, global_size), interpolation=Image.BICUBIC),
                 transforms.RandomResizedCrop(size=global_size, scale=global_crop_scale, interpolation=Image.BICUBIC),
                 self.flip_and_color_jitter,
-                transforms.GaussianBlur(3, (0.1, 0.15)),
+                transforms.GaussianBlur(9, (0.1, 2.0)),
                 self.to_tensor,
                 transforms.Normalize(mean=mean, std=std),
             ])
@@ -195,8 +195,8 @@ class TMEDinoTransforms(object):
                 transforms.Resize((global_size, global_size), interpolation=Image.BICUBIC),
                 transforms.RandomResizedCrop(size=global_size, scale=global_crop_scale, interpolation=Image.BICUBIC),
                 self.flip_and_color_jitter,
-                transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.15)),
-                transforms.RandomSolarize(threshold=64, p=0.5),
+                transforms.RandomApply([transforms.GaussianBlur(9, (0.1, 2.0))], p=0.1),
+                transforms.RandomSolarize(threshold=128, p=0.2),
                 self.to_tensor,
                 transforms.Normalize(mean=mean, std=std),
             ])
@@ -206,7 +206,7 @@ class TMEDinoTransforms(object):
                 transforms.Resize((global_size, global_size), interpolation=Image.BICUBIC),
                 transforms.RandomResizedCrop(size=local_size, scale=local_crop_scale, interpolation=Image.BICUBIC),
                 self.flip_and_color_jitter,
-                transforms.GaussianBlur(3, (0.1, 0.15)),
+                transforms.RandomApply([transforms.GaussianBlur(9, (0.1, 2.0))], p=0.5),
                 self.to_tensor,
                 transforms.Normalize(mean=mean, std=std),
             ])
