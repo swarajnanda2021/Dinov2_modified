@@ -63,6 +63,7 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         corruptions_dir: str = "corruption_results",
         use_pathology_recipe: bool = False,
         ect_probability: float = 0.4,
+        zip_interleave: int = 16,
     ):
         super().__init__()
         self.base_dir = base_dir
@@ -72,6 +73,7 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self.seed = seed
+        self.zip_interleave = zip_interleave
         self.corruptions_dir = corruptions_dir
 
         # Set parameters for transforms
@@ -116,13 +118,12 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         # Filter corrupted files
         self._filter_corrupted_zip_files()
         
-        # Defer shard calculation
-        self.shard_calculated = False
-        self.worker_files = []
-        self.worker_image_ranges = []
+        # Sharding is computed lazily in __iter__ from get_worker_info(); no
+        # precomputed shard state is stored. _epoch varies the per-worker shuffle.
+        self._epoch = 0
         
-        # Resume capability
-        self.samples_to_skip = 0
+        # Resume position (global; divided by live worker count in __iter__).
+        self._resume_global = 0
         
         # Rate limiting
         self.error_count = 0
@@ -130,23 +131,18 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         self.max_errors_per_minute = 10
     
     def set_worker_info(self, worker_id: int, num_workers: int):
-        """Set actual worker ID and num_workers from PyTorch DataLoader."""
+        """Vestigial: __iter__ now reads worker info from get_worker_info(). Kept as a
+        no-op-compatible setter so existing callers (e.g. worker_init_fn) don't break."""
         self.worker_id = worker_id
         self.num_workers = num_workers
-        self.shard_calculated = False
         print(f"Worker info set: worker_id={worker_id}, num_workers={num_workers}")
-    
+
     def set_resume_position(self, global_samples_processed: int):
-        """
-        Set how many samples to skip for resuming from checkpoint.
-        
-        Args:
-            global_samples_processed: Total samples processed across all GPUs and workers
-        """
-        total_workers = self.world_size * self.num_workers
-        self.samples_to_skip = global_samples_processed // total_workers
-        print(f"Resume: Worker will skip {self.samples_to_skip} samples from its shard")
-    
+        """Store the global resume position. __iter__ divides it by the live worker
+        count to get this worker's per-shard skip."""
+        self._resume_global = global_samples_processed
+        print(f"Resume: global samples processed = {self._resume_global}")
+
     def _load_known_corrupted_files(self) -> Set[str]:
         """Load pre-scanned corrupt file information from JSON files."""
         corrupted_zip_files = set()
@@ -235,71 +231,6 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         with open(metadata_path, 'wb') as f:
             pickle.dump(metadata, f)
     
-    def _calculate_worker_shard(self):
-        """Calculate which files and image indices belong to this worker."""
-        global_worker_id = self.rank * self.num_workers + self.worker_id
-        total_workers = self.world_size * self.num_workers
-        
-        self.worker_files = []
-        self.worker_image_ranges = []
-        
-        worker_indices = []
-        
-        for zip_idx, (zip_path, num_images) in enumerate(zip(self.zip_files, self.images_per_zip)):
-            if zip_path in self.corrupted_zip_files:
-                continue
-                
-            zip_seed = self.seed + hash(zip_path) % 10000
-            rng = random.Random(zip_seed)
-            
-            for img_idx in range(num_images):
-                worker = rng.randint(0, total_workers - 1)
-                if worker == global_worker_id:
-                    worker_indices.append((zip_idx, img_idx))
-        
-        if worker_indices:
-            worker_indices.sort()
-            
-            current_zip = worker_indices[0][0]
-            start_img = worker_indices[0][1]
-            
-            for i, (zip_idx, img_idx) in enumerate(worker_indices[1:] + [(None, None)]):
-                if zip_idx != current_zip or zip_idx is None:
-                    self.worker_files.append(self.zip_files[current_zip])
-                    self.worker_image_ranges.append((start_img, worker_indices[i][1] + 1))
-                    
-                    if zip_idx is not None:
-                        current_zip = zip_idx
-                        start_img = img_idx
-        
-        self.shard_calculated = True
-        print(f"Worker {global_worker_id}/{total_workers} will process {len(worker_indices)} images from {len(self.worker_files)} zip files")
-    
-    def _get_image_names(self, zip_path, start_idx, end_idx):
-        """Get specific image names for a range within a zip file."""
-        if zip_path in self.corrupted_zip_files:
-            return []
-            
-        try:
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-                # all_images = [f for f in zf.namelist() 
-                #             if f.endswith('.png') 
-                #             and ('_448_' in f) 
-                #             and ('_224_' not in f)]
-                all_images = [f for f in zf.namelist() 
-                            if f.endswith('.webp')
-                            and not f.startswith('__MACOSX')]
-                all_images.sort()
-                
-                image_names = all_images[start_idx:end_idx]
-            
-            return image_names
-        except Exception as e:
-            print(f"Error reading zip file {zip_path}: {e}")
-            self._log_corrupt_file(zip_path, "", e)
-            self.corrupted_zip_files.add(zip_path)
-            return []
-    
     def _log_corrupt_file(self, zip_path, image_name, exception):
         """Log a corrupt file to JSON log with proper locking."""
         current_time = time.time()
@@ -342,113 +273,101 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         except Exception as e:
             print(f"Error logging corrupt file: {e}")
     
-    def _load_image(self, zip_path, image_name):
-        """Load a single image from a zip file with error handling."""
-        if zip_path in self.corrupted_zip_files:
-            raise IOError(f"Skipping image from known corrupted zip file: {zip_path}")
-            
-        PngImagePlugin.MAX_TEXT_CHUNK = 100 * (1024 * 1024)
-        ImageFile.LOAD_TRUNCATED_IMAGES = True
-        
-        max_retries = 3
-        last_exception = None
-        
-        for attempt in range(max_retries):
-            try:
-                with zipfile.ZipFile(zip_path, 'r') as zf:
-                    data = zf.read(image_name)
-                    try:
-                        img = Image.open(io.BytesIO(data)).convert('RGB')
-                        return img
-                    except ValueError as e:
-                        if "Decompressed data too large" in str(e):
-                            buffer = io.BytesIO(data)
-                            img = Image.open(buffer)
-                            img.load()
-                            return img.convert('RGB')
-                        raise
-            except Exception as e:
-                last_exception = e
-                if attempt < max_retries - 1:
-                    time.sleep(0.5)
-                    continue
-        
-        current_time = time.time()
-        if current_time - self.last_error_time >= 60:
-            self.error_count = 0
-            self.last_error_time = current_time
-            
-        if self.error_count < self.max_errors_per_minute:
-            print(f"Failed to load image {image_name} from {zip_path} after {max_retries} attempts: {str(last_exception)}")
-            self.error_count += 1
-        
-        self._log_corrupt_file(zip_path, image_name, last_exception)
-        
-        if isinstance(last_exception, (zipfile.BadZipFile, zipfile.LargeZipFile)):
-            self.corrupted_zip_files.add(zip_path)
-        
-        raise IOError(f"Failed to load image after {max_retries} attempts: {str(last_exception)}")
-
     def __iter__(self):
-        """Iterator with memory-efficient shuffling and resume support."""
-        if not self.shard_calculated:
-            self._calculate_worker_shard()
-        
-        rng = random.Random(self.seed + self.worker_id)
-        
-        shuffled_files = list(enumerate(self.worker_files))
-        rng.shuffle(shuffled_files)
-        
-        samples_yielded = 0
-        
-        for file_idx, zip_path in shuffled_files:
-            if zip_path in self.corrupted_zip_files:
-                continue
-                
-            start_idx, end_idx = self.worker_image_ranges[file_idx]
-            
-            try:
-                image_names = self._get_image_names(zip_path, start_idx, end_idx)
-                
-                if not image_names:
+        """Iterate this worker's shard. Shards by ZIP FILE (strided -> disjoint),
+        keeps up to zip_interleave zips open at once and draws randomly among them
+        to mix the stream. Reads live worker info from get_worker_info(); the
+        self.worker_id / self.num_workers attributes are vestigial and ignored."""
+        wi = torch.utils.data.get_worker_info()
+        worker_id = wi.id if wi else 0
+        num_workers = wi.num_workers if wi else 1
+
+        gid = self.rank * num_workers + worker_id
+        total = self.world_size * num_workers
+
+        live = [z for z in self.zip_files if z not in self.corrupted_zip_files]
+        my_zips = live[gid::total]  # strided -> disjoint by construction; O(1), no RNG, no hash()
+        print(f"Worker {gid}/{total} -> {len(my_zips)} zips")
+
+        epoch = self._epoch
+        self._epoch += 1
+        rng = random.Random((self.seed * 1000003) ^ (gid * 9973) ^ (epoch * 31))
+        rng.shuffle(my_zips)
+
+        skip_per_worker = self._resume_global // max(total, 1)
+        emitted = 0
+
+        K = self.zip_interleave
+        pending = iter(my_zips)
+        streams = []  # list of [ZipFile, iterator-over-shuffled-names, zip_path]
+
+        def _open_next():
+            """Pull zips from `pending` until one opens with a usable name list."""
+            while True:
+                zpath = next(pending, None)
+                if zpath is None:
+                    return None
+                if zpath in self.corrupted_zip_files:
                     continue
-                    
-                rng.shuffle(image_names)
-                
-                for img_name in image_names:
-                    if samples_yielded < self.samples_to_skip:
-                        samples_yielded += 1
-                        continue
-                    
-                    try:
-                        img = self._load_image(zip_path, img_name)
-                        crops = self.transforms(img)
-                        samples_yielded += 1
-                        yield crops
-                    except Exception as e:
-                        if isinstance(e, IOError) and "BadZipFile" in str(e):
-                            self.corrupted_zip_files.add(zip_path)
-                            break
-                            
-                        if self.error_count < self.max_errors_per_minute:
-                            print(f"Skipping corrupted image {img_name} from {zip_path}: {e}")
-                            self.error_count += 1
-                        continue
-                        
-            except Exception as e:
-                if self.error_count < self.max_errors_per_minute:
-                    print(f"Error processing zip file {zip_path}: {e}")
-                    self.error_count += 1
-                self.corrupted_zip_files.add(zip_path)
-    
-    def __len__(self):
-        """Return number of samples this worker will process."""
-        total = 0
-        for i, (start_idx, end_idx) in enumerate(self.worker_image_ranges):
-            if i < len(self.worker_files) and self.worker_files[i] in self.corrupted_zip_files:
+                try:
+                    zf = zipfile.ZipFile(zpath, 'r')
+                    names = sorted(n for n in zf.namelist()
+                                   if n.endswith('.webp') and not n.startswith('__MACOSX'))
+                except Exception as e:
+                    self._log_corrupt_file(zpath, "", e)
+                    self.corrupted_zip_files.add(zpath)
+                    continue
+                if not names:
+                    zf.close()
+                    continue
+                rng.shuffle(names)
+                return [zf, iter(names), zpath]
+
+        while len(streams) < K:
+            s = _open_next()
+            if s is None:
+                break
+            streams.append(s)
+
+        while streams:
+            si = rng.randrange(len(streams))
+            zf, names_it, zpath = streams[si]
+            name = next(names_it, None)
+            if name is None:
+                zf.close()
+                streams.pop(si)
+                s = _open_next()
+                if s is not None:
+                    streams.append(s)
                 continue
-            total += (end_idx - start_idx)
-        return total
+            try:
+                img = Image.open(io.BytesIO(zf.read(name))).convert('RGB')
+            except Exception as e:
+                now = time.time()
+                if now - self.last_error_time >= 60:
+                    self.error_count = 0
+                    self.last_error_time = now
+                if self.error_count < self.max_errors_per_minute:
+                    print(f"Skipping corrupted image {name} from {zpath}: {e}")
+                    self.error_count += 1
+                self._log_corrupt_file(zpath, name, e)
+                if isinstance(e, (zipfile.BadZipFile, zipfile.LargeZipFile)):
+                    self.corrupted_zip_files.add(zpath)
+                    zf.close()
+                    streams.pop(si)
+                    s = _open_next()
+                    if s is not None:
+                        streams.append(s)
+                continue
+            emitted += 1
+            if emitted <= skip_per_worker:
+                continue
+            yield self.transforms(img)
+
+    def __len__(self):
+        """Approximate per-rank sample count. Not used by the DataLoader (this is an
+        IterableDataset); kept sane for callers that query it."""
+        return self.index_metadata['total_images'] // max(self.world_size, 1)
 
 
 class DINOv2PathologyDataset(torch.utils.data.IterableDataset):
@@ -685,6 +604,12 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
         Yield samples in proportion-maintaining pattern.
         Pattern repeats every batch_size samples.
         """
+        # Worker info from get_worker_info() so nothing depends on worker_init_fn
+        # having propagated self.worker_id / self.num_workers.
+        wi = torch.utils.data.get_worker_info()
+        worker_id = wi.id if wi else 0
+        num_workers = wi.num_workers if wi else 1
+
         # Create fresh iterators
         self.iterators = [iter(ds) for ds in self.datasets]
         
@@ -695,7 +620,7 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
             pattern.extend([dataset_idx] * count)
         
         # Shuffle pattern to avoid systematic bias within batch
-        rng = random.Random(self.seed + self.rank * self.num_workers + self.worker_id)
+        rng = random.Random(self.seed + self.rank * num_workers + worker_id)
         
         # Yield samples according to pattern
         while True:
