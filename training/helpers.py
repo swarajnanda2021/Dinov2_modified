@@ -506,12 +506,9 @@ def worker_init_fn(worker_id):
     worker_info = get_worker_info()
     dataset = worker_info.dataset
 
-    if hasattr(dataset, 'base_dataset'):
-        dataset.base_dataset.set_worker_info(worker_info.id, worker_info.num_workers)
-        seed = dataset.base_dataset.seed
-    else:
-        dataset.worker_id = worker_info.id
-        seed = dataset.seed
+    if hasattr(dataset, 'set_worker_info'):
+        dataset.set_worker_info(worker_info.id, worker_info.num_workers)
+    seed = getattr(dataset, 'seed', 0)
 
     worker_seed = seed + worker_id
     np.random.seed(worker_seed)

@@ -259,9 +259,9 @@ def train_dinov2(args):
         n_standard_local_crops=args.n_standard_local_crops,
         global_views=args.global_views,
         local_crop_size=args.local_crop_size,
-        worker_id=0,
+        worker_id=0,  # vestigial: __iter__ reads worker info from get_worker_info()
         num_workers=args.num_workers,
-        rank=args.gpu,
+        rank=dist.get_rank(),
         world_size=dist.get_world_size(),
         seed=args.seed,
         global_size=224,
