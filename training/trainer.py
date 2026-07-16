@@ -81,6 +81,48 @@ def _gather_and_compute_weights(patch_tokens, mask, masks_weight=None):
     return gathered, weights, B
 
 
+def _all_gather_signatures(s_local):
+    """All-gather [B_local, K'] signatures across data-parallel ranks into
+    [world_size*B_local, K'] (rank order preserved -> identical on every rank).
+    Falls back to the local tensor when distributed is unavailable or world_size == 1."""
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return s_local
+    world = dist.get_world_size()
+    gathered = [torch.empty_like(s_local) for _ in range(world)]
+    dist.all_gather(gathered, s_local.contiguous())
+    return torch.cat(gathered, dim=0)
+
+
+def _local_rows(x_global, b_local):
+    """Take this rank's contiguous B_local rows out of a gathered [world*B_local, ...]
+    tensor. Row order matches all_gather: rank r -> rows [r*b_local:(r+1)*b_local].
+    Identity when distributed is unavailable or world_size == 1."""
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return x_global
+    r = dist.get_rank()
+    return x_global[r * b_local:(r + 1) * b_local]
+
+
+def _assert_bank_synced(bank, tag=""):
+    """Cross-rank insurance: the global bank must be byte-identical on every rank.
+    Evict-nearest churn (topk/argmin + the CPU dedup dict) is deterministic only if all
+    ranks see the identical gathered batch AND dict-insertion order is fixed; this checks
+    it held. Compares a (sum, sum-of-squares) fingerprint via MIN/MAX all-reduce. No-op on
+    a single rank; runtime output comes from a >=2-rank run. If it ever prints False, make
+    the dedup order-deterministic (sort claimed keys / fix tie-breaks) before trusting the
+    global bank."""
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return
+    fp = torch.stack([bank.double().sum(), bank.double().pow(2).sum()])
+    lo = fp.clone(); hi = fp.clone()
+    dist.all_reduce(lo, op=dist.ReduceOp.MIN)
+    dist.all_reduce(hi, op=dist.ReduceOp.MAX)
+    if utils.is_main_process():
+        ok = bool(torch.allclose(lo, hi))
+        print(f"[typicality bank sync{tag}] cross-rank identical: {ok} "
+              f"(fp_min={lo.tolist()}, fp_max={hi.tolist()})")
+
+
 def train_dinov2(args):
     """
     Main training function for DINOv2 with iBOT and prototype clustering.
@@ -1064,15 +1106,24 @@ def train_dinov2(args):
                         # Extract bottleneck from global crop 1: first B entries
                         z_global1 = student_output['bottleneck'][:batch_size].detach()
 
-                        # Compute morphology signatures
+                        # Compute morphology signatures (local, detached)
                         s_batch = repr_protos.compute_signatures(z_global1)
 
-                        # Bank update and scoring
-                        bank_output = typicality_bank.update_and_score(s_batch)
+                        # Global bank: all-gather signatures so the evict-nearest churn runs
+                        # on the full gathered batch identically on every rank (rank order
+                        # preserved -> banks stay byte-identical, multi-node). The gate is
+                        # iteration-based/rank-invariant, so all ranks reach the collective.
+                        s_global = _all_gather_signatures(s_batch.detach())
+                        bank_output = typicality_bank.update_and_score(s_global)
+                        if bank_output['ready'] and current_iteration % 2000 == 0:
+                            _assert_bank_synced(typicality_bank.bank, tag=f"@it{current_iteration}")
 
                         if bank_output['ready'] and current_iteration >= args.typicality_warmup_iters:
+                            # d is over the gathered batch; take this rank's local rows to
+                            # weight the local loss.
+                            d_local = _local_rows(bank_output['d'], batch_size)
                             t = TypicalityScorer.compute_scores(
-                                bank_output['d'], bank_output['mu'], bank_output['sigma']
+                                d_local, bank_output['mu'], bank_output['sigma']
                             )
 
                             if args.typicality_modulation == 'adaptive_temp':
