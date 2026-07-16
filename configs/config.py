@@ -147,8 +147,6 @@ def get_args_parser():
                         help='Iterations before typicality scores modulate the loss')
     parser.add_argument('--typicality_repr_lr', default=1e-3, type=float,
                         help='Fixed learning rate for representative prototype optimizer')
-    parser.add_argument('--typicality_replace_fraction', default=0.1, type=float,
-                        help='Fraction of bank to refresh per step')
 
     # ========== Adversarial mask-as-student-view augmentation parameters ==========
     # Note: --num_masks, --mask_model_arch, --mask_checkpoint are already declared
