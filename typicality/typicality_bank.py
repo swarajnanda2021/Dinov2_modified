@@ -51,19 +51,15 @@ class TypicalityBank(nn.Module):
         self.bank_filled.fill_(min(self.M, int(self.bank_filled.item()) + B))
 
     @torch.no_grad()
-    def update_and_score(self, s_query, s_insert=None):
+    def update_and_score(self, s_batch):
         """
-        Score s_query against the current bank, then FIFO-insert s_insert.
+        Score s_batch against the current bank, then FIFO-insert it.
 
         Scoring happens BEFORE insertion, so the batch never matches itself.
-        s_insert defaults to s_query (single-rank / local bank); with a global
-        bank the caller scores the local s_query but inserts the all-gathered
-        s_insert, so every rank inserts the identical batch and banks stay in sync.
         During filling (bank not yet full): insert only, no scoring.
 
         Args:
-            s_query: [B, K'] detached local signatures to score
-            s_insert: [B_ins, K'] detached signatures to insert (defaults to s_query)
+            s_batch: [B, K'] detached morphology signatures
 
         Returns:
             dict with:
@@ -73,14 +69,11 @@ class TypicalityBank(nn.Module):
                 mu: scalar mean of bank_nn_dists
                 sigma: scalar std of bank_nn_dists
         """
-        if s_insert is None:
-            s_insert = s_query
-        s_query = s_query.float()
-        s_insert = s_insert.float()  # resolve autocast dtype
+        s_batch = s_batch.float()  # resolve autocast dtype
 
         # ---- Filling phase: bank not yet full -> insert only, not ready ----
         if int(self.bank_filled.item()) < self.M:
-            self._fifo_insert(s_insert)
+            self._fifo_insert(s_batch)
             return {
                 'ready': False,
                 'd': None,
@@ -89,10 +82,10 @@ class TypicalityBank(nn.Module):
                 'sigma': None,
             }
 
-        # ---- Bank full: score s_query against the current bank, then insert ----
+        # ---- Bank full: score s_batch against the current bank, then insert ----
 
         # Batch-to-bank L1 distances: [B, M] -> [B]
-        d = torch.cdist(s_query, self.bank, p=1).min(dim=1).values  # [B]
+        d = torch.cdist(s_batch, self.bank, p=1).min(dim=1).values  # [B]
 
         # Within-bank NN L1 distances: [M, M] -> [M]
         D_bank = torch.cdist(self.bank, self.bank, p=1)
@@ -103,7 +96,7 @@ class TypicalityBank(nn.Module):
         sigma = bank_nn_dists.std()
 
         # ---- FIFO churn: keep the most recent M signatures ----
-        self._fifo_insert(s_insert)
+        self._fifo_insert(s_batch)
 
         return {
             'ready': True,
