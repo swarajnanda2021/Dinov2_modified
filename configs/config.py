@@ -136,6 +136,9 @@ def get_args_parser():
                         help='Number of representative prototypes (128=undercomplete, 256=complete, 512=overcomplete)')
     parser.add_argument('--typicality_bank_size', default=8192, type=int,
                         help='Bank capacity M (number of stored signatures)')
+    parser.add_argument('--typicality_k', default=20, type=int,
+                        help='k-NN neighbour count for the density estimate (larger -> '
+                             'lower score variance, coarser resolution)')
     parser.add_argument('--typicality_modulation', default='adaptive_temp', type=str,
                         choices=['adaptive_temp', 'weighted_loss'],
                         help='Gradient modulation variant')
