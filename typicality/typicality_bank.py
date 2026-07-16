@@ -19,13 +19,11 @@ class TypicalityBank(nn.Module):
     Args:
         M: Bank capacity (number of stored signatures)
         K_prime: Signature dimensionality (number of representative prototypes)
-        k: k-NN neighbour count for the density estimate
     """
-    def __init__(self, M, K_prime, k=20):
+    def __init__(self, M, K_prime):
         super().__init__()
         self.M = M
         self.K_prime = K_prime
-        self.k = k
 
         # Ring buffer — persists across steps, saved in checkpoints.
         self.register_buffer('bank', torch.zeros(M, K_prime))
@@ -70,8 +68,8 @@ class TypicalityBank(nn.Module):
         Returns:
             dict with:
                 ready: bool — True once the ring has filled (bank_filled >= M)
-                d: [B] mean L1 distance from each batch sample to its k nearest bank entries
-                bank_nn_dists: [M] within-bank k-NN L1 distances (mean of each entry's k nearest)
+                d: [B] min L1 distance from each batch sample to its nearest bank entry
+                bank_nn_dists: [M] within-bank nearest-neighbor L1 distances
                 mu: scalar mean of bank_nn_dists
                 sigma: scalar std of bank_nn_dists
         """
@@ -93,15 +91,13 @@ class TypicalityBank(nn.Module):
 
         # ---- Bank full: score s_query against the current bank, then insert ----
 
-        k = min(self.k, self.M - 1)
+        # Batch-to-bank L1 distances: [B, M] -> [B]
+        d = torch.cdist(s_query, self.bank, p=1).min(dim=1).values  # [B]
 
-        # Batch-to-bank k-NN L1 distances: mean of the k nearest bank entries -> [B]
-        d = torch.cdist(s_query, self.bank, p=1).topk(k, largest=False).values.mean(dim=1)  # [B]
-
-        # Within-bank k-NN L1 distances (k nearest OTHER entries, diagonal excluded) -> [M]
+        # Within-bank NN L1 distances: [M, M] -> [M]
         D_bank = torch.cdist(self.bank, self.bank, p=1)
         D_bank.diagonal().fill_(float('inf'))
-        bank_nn_dists = D_bank.topk(k, largest=False).values.mean(dim=1)  # [M]
+        bank_nn_dists = D_bank.min(dim=1).values  # [M]
 
         mu = bank_nn_dists.mean()
         sigma = bank_nn_dists.std()
