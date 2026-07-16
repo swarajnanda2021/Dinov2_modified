@@ -226,9 +226,9 @@ def main():
     args.typicality_modulation = 'adaptive_temp'
     args.typicality_alpha = 1.0
     args.typicality_beta = 0.5
-    args.typicality_warmup_iters = 15_000
+    args.typicality_warmup_iters = 50000   # fill bank only after representation has settled
+    args.typicality_k = 20                 # k-NN neighbours for the density estimate
     args.typicality_repr_lr = 1e-3
-    args.typicality_replace_fraction = 0.1
 
     # Adversarial-mask-as-student-view augmentation (re-uses mask_checkpoint above)
     args.use_adversarial_mask_augmentation = False
@@ -351,6 +351,7 @@ def main():
         print(f"  Typicality Dampening: ENABLED")
         print(f"    K' = {args.typicality_K_prime}, Bank M = {args.typicality_bank_size}")
         print(f"    Modulation: {args.typicality_modulation}")
+        print(f"    k (k-NN) = {args.typicality_k}, warmup = {args.typicality_warmup_iters}")
 
     if args.use_adversarial_mask_augmentation:
         print(f"  Adversarial Mask Augmentation: ENABLED")
