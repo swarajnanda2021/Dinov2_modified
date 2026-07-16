@@ -947,7 +947,7 @@ def train_dinov2(args):
             bank_output = {'ready': False}
             t = None
 
-            if args.use_typicality_dampening and repr_protos is not None:
+            if args.use_typicality_dampening and repr_protos is not None and current_iteration >= args.typicality_warmup_iters:
                 with torch.no_grad():
                     # Extract bottleneck from global crop 1: first B entries
                     z_global1 = student_output['bottleneck'][:batch_size].detach()
