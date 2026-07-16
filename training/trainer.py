@@ -1430,6 +1430,8 @@ def train_dinov2(args):
                 metric_logger.update(typicality_t_mean=t.mean().item())
                 metric_logger.update(typicality_t_std=t.std().item())
                 metric_logger.update(typicality_d_mean=bank_output['d'].mean().item())
+                metric_logger.update(typicality_diffuse_frac=(typicality_bank.bank.max(dim=1).values < 0.5).float().mean().item())
+                metric_logger.update(typicality_t_lt0p1=(t < 0.1).float().mean().item())
 
         if use_looped_backbone:
             metric_logger.update(ponder_kl_loss=kl_loss_val.item())
