@@ -81,6 +81,34 @@ def _gather_and_compute_weights(patch_tokens, mask, masks_weight=None):
     return gathered, weights, B
 
 
+def _all_gather_signatures(s_local):
+    """All-gather [B_local, K'] signatures across data-parallel ranks into
+    [world_size*B_local, K'] (rank order preserved -> identical on every rank).
+    Falls back to the local tensor when distributed is unavailable or world_size == 1."""
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return s_local
+    world = dist.get_world_size()
+    gathered = [torch.empty_like(s_local) for _ in range(world)]
+    dist.all_gather(gathered, s_local.contiguous())
+    return torch.cat(gathered, dim=0)
+
+
+def _assert_bank_synced(bank, tag=""):
+    """Cross-rank insurance: the global bank must be byte-identical on every rank.
+    Compares a scalar fingerprint (sum, sum-of-squares) via MIN/MAX all-reduce.
+    No-op on a single rank; runtime output is produced only on a >=2-rank run."""
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return
+    fp = torch.stack([bank.double().sum(), bank.double().pow(2).sum()])
+    lo = fp.clone(); hi = fp.clone()
+    dist.all_reduce(lo, op=dist.ReduceOp.MIN)
+    dist.all_reduce(hi, op=dist.ReduceOp.MAX)
+    if utils.is_main_process():
+        ok = bool(torch.allclose(lo, hi))
+        print(f"[typicality bank sync{tag}] cross-rank identical: {ok} "
+              f"(fp_min={lo.tolist()}, fp_max={hi.tolist()})")
+
+
 def train_dinov2(args):
     """
     Main training function for DINOv2 with iBOT and prototype clustering.
@@ -1063,11 +1091,18 @@ def train_dinov2(args):
                         # Extract bottleneck from global crop 1: first B entries
                         z_global1 = student_output['bottleneck'][:batch_size].detach()
 
-                        # Compute morphology signatures
+                        # Compute morphology signatures (local, detached)
                         s_batch = repr_protos.compute_signatures(z_global1)
 
-                        # Bank update and scoring
-                        bank_output = typicality_bank.update_and_score(s_batch)
+                        # Global bank: all-gather signatures so every rank inserts the
+                        # identical batch (rank-independent, multi-node). Score the LOCAL
+                        # s_batch (per-rank d for the local loss); FIFO-insert the gathered
+                        # s_global. The gate is iteration-based/rank-invariant, so all ranks
+                        # reach the collective together.
+                        s_global = _all_gather_signatures(s_batch.detach())
+                        bank_output = typicality_bank.update_and_score(s_batch, s_global)
+                        if current_iteration == args.typicality_warmup_iters:
+                            _assert_bank_synced(typicality_bank.bank, tag=f"@it{current_iteration}")
 
                         if bank_output['ready'] and current_iteration >= args.typicality_warmup_iters:
                             t = TypicalityScorer.compute_scores(
