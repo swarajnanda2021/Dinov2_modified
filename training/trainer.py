@@ -468,6 +468,7 @@ def train_dinov2(args):
         typicality_bank = TypicalityBank(
             M=args.typicality_bank_size,
             K_prime=args.typicality_K_prime,
+            k=args.typicality_k,
         )
         typicality_bank = typicality_bank.cuda()
 
