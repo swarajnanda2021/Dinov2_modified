@@ -72,7 +72,9 @@ class TypicalityBank(nn.Module):
         # Batch-to-bank L1 distances: [B, M]
         D_batch_bank = torch.cdist(s_batch, self.bank, p=1)
         d = D_batch_bank.min(dim=1).values       # [B]
-        d_argmin = D_batch_bank.argmin(dim=1)     # [B] — nearest bank entry per sample
+        # (2) Nearest-eviction tie-break: torch.argmin returns the FIRST (lowest) index on
+        # ties (confirmed) -- kept explicit so the cross-rank choice can't silently change.
+        d_argmin = D_batch_bank.argmin(dim=1)     # [B] — nearest bank entry per sample (lowest idx on ties)
         
         # Within-bank NN L1 distances: [M, M] -> [M]
         D_bank = torch.cdist(self.bank, self.bank, p=1)
@@ -83,8 +85,14 @@ class TypicalityBank(nn.Module):
         sigma = bank_nn_dists.std()
         
         # ---- Churn: insert N most novel batch samples ----
+        # The GLOBAL (all-gathered) bank stays byte-identical across ranks only if the churn
+        # resolves every tie identically everywhere. The three "pick one of equals" points
+        # below are pinned to LOWEST index (torch's topk/argmin tie-break is otherwise
+        # unspecified). Non-tied cases (nearly all) are unchanged.
         N = min(self.N_replace, B)
-        _, novel_idx = d.topk(N, largest=True)     # [N] indices into batch
+        # (3) Most-novel selection: stable descending sort breaks equal-d ties by lowest
+        # index (topk does not guarantee this; argsort(stable=True) does).
+        novel_idx = torch.argsort(d, descending=True, stable=True)[:N]  # [N] indices into batch
         evict_idx = d_argmin[novel_idx]             # [N] bank entries to evict
         
         # Deduplicate: if multiple novel samples target the same bank entry,
@@ -92,6 +100,13 @@ class TypicalityBank(nn.Module):
         novel_idx_cpu = novel_idx.cpu()
         evict_idx_cpu = evict_idx.cpu()
         d_novel_cpu = d[novel_idx].cpu()
+
+        # (1) Iterate candidates in ascending batch-index order so the same tile wins a
+        # contested slot on every rank, regardless of GPU-local ordering.
+        order = torch.argsort(novel_idx_cpu)
+        novel_idx_cpu = novel_idx_cpu[order]
+        evict_idx_cpu = evict_idx_cpu[order]
+        d_novel_cpu = d_novel_cpu[order]
         
         claimed = {}  # bank_idx -> (batch_idx_in_novel, d_value)
         for i in range(N):
