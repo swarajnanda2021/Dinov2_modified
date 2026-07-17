@@ -225,8 +225,8 @@ determines.
 | One-off (artifact) rate | `ρ_out` | ≈ `10^{-5}`, no floor | sizes the transient reserve |
 
 Two structural findings from Table 1 guide the design. First, the support is a connected
-continuum of intrinsic dimension near ten with a moderate density range of about three orders
-of magnitude and no isolated modes; the absorbing-outlier hazard of §3.4 thus has no atomic
+continuum of intrinsic dimension near ten with a moderate density range (scale-dependent, and
+≈ 20× at the operating bandwidth `L`; §3.7) and no isolated modes; the absorbing-outlier hazard of §3.4 thus has no atomic
 modes to attach to, and the design need not defend against extreme skew. Second, the stream is
 near-independent at the tile level (a burst factor near 1.2 that decays within one batch) and
 the signature distribution drifts slowly after activation — by one correlation length only over
@@ -252,9 +252,13 @@ unlike a nearest-neighbor distance under a cover — retains its dependence on d
   the anchor set tiles the occupied support. On the measured continuum the density-estimation-
   optimal bandwidth places anchors in near-proportion to the data density (formally, anchor
   density `∝ p^{d*/(d*+2)}`, the classical quantization exponent; Graf and Luschgy, 2000). The
-  cell scale is set by the memory budget: with `M = 8192` anchors over a `d* ≈ 9.5`-dimensional
-  support the achievable anchor spacing is `s_M ≈ 0.155` (≈ 0.6 `L`), finer than the correlation
-  length, though the readout pools anchors to an effective bandwidth of ≈ `L` (§3.7).
+  cell scale — the single radius `s` used for *both* seeding and hits (Algorithm 2) — is set at the
+  *fill knee*, the value at which seed-on-miss populates exactly `M` anchors (empirically `s ≈ 0.22`
+  here; §3.7). This exceeds the covering-radius estimate `s_M ≈ (V/M)^{1/d*} ≈ 0.155` by about 1.4×,
+  because seed-on-miss packs anchors at spacing `s` rather than covering at radius `s`; the estimate
+  is a lower bound and `s` should be set empirically. The resulting anchor spacing (≈ 0.6 `L`) is
+  finer than the correlation length, but the readout pools anchors to an effective bandwidth of
+  ≈ `L` (§3.7).
 - *Readout.* The local density at a query is read from the counters as an *unnormalized*
   kernel sum of the anchor rates,
   `p̂(x) = Σ_i λ̂_i · K_h(x − b_i)`,
@@ -269,8 +273,9 @@ unlike a nearest-neighbor distance under a cover — retains its dependence on d
   sum. Centering the kernel on the query and using a symmetric profile cancels the leading
   (gradient) term of the bias exactly — anchors on either side of the query balance — leaving a
   curvature-order residual, whereas reading only the nearest anchor incurs a first-order,
-  spatially frozen bias of up to half a cell. The bandwidth cannot usefully fall below the
-  storage scale `s ≈ L`, and in `d* ≈ 9.5` a window of `j` anchors already lies within about
+  spatially frozen bias of up to half a cell. The effective readout bandwidth is the pooling window
+  — the radius enclosing the `j` anchors, ≈ `L` (§3.7) — and going finer resolves nothing, since the
+  density field has no structure below `L`; in `d* ≈ 9.5` those `j` anchors already lie within about
   `1.5×` the local spacing, so pooling costs almost nothing in resolution. The score is the
   monotone map `t(x) = F̂(log p̂(x))` — the probability integral transform, i.e. the
   decayed empirical rank of `log p̂(x)` among its values at recent tiles — so that `t` is the
@@ -395,7 +400,7 @@ but the readout pools `j ≈ 64` anchors, whose enclosing radius — the effecti
 **Offline validation of the bank.** We ran the counted-coverage bank (Algorithm 2, with the
 corrected lifetime exposure) over the 384,000 signatures in stream order and compared its score,
 per tile, against an offline `k`-nearest-neighbor density on the full sample — the best available
-proxy for ground-truth redundancy. With the hit radius set at the covering scale (`s ≈ 0.22`), the
+proxy for ground-truth redundancy. With the hit radius set at the fill knee (`s ≈ 0.22`), the
 online score recovers the offline density with **Spearman ρ = 0.75**, on a bounded memory holding
 8,192 of 384,000 tiles; this is close to the ceiling the resolution allows, since the score is an
 `L`-smoothed estimate correlated against a finer reference. The per-anchor rate `λ̂` tracks the
@@ -412,12 +417,20 @@ turnover).
 | 0.26 | +0.68 | +0.92 | 4967 (underfilled) | ~0 |
 | 0.30 | +0.61 | +0.90 | 2117 (underfilled) | ~0 |
 
-Two controls confirm the design decisions. The normalized (Nadaraya–Watson) readout — which the
+Three controls confirm the design decisions. The normalized (Nadaraya–Watson) readout — which the
 theory of §3.5 predicts collapses toward `p^{1−γ}` — yields ρ ≈ 0, so the unnormalized sum is
-necessary as claimed. And setting the hit radius below the covering radius (`s = 0.14 < s_M`) drives
+necessary as claimed. Replacing the lifetime exposure with the discarded traffic-count exposure
+(§3.5), everything else held at `s = 0.22`, collapses the per-anchor rate to a constant (coefficient
+of variation 0.00, versus 1.27 for the corrected form): the counters then carry no density, and
+recovery falls to ρ = 0.57 — the residual coverage-only signal of §3.4 — forfeiting the counting
+contribution that lifts the corrected readout to 0.75. This directly measures the failure the
+lifetime-exposure definition was introduced to avoid, rather than resting on the analogous
+normalization control. Finally, setting the hit radius below the fill knee (`s = 0.14`) drives
 constant admission and eviction that prevents the counters from stabilizing, collapsing recovery to
-ρ = 0.07; raising `s` to the covering scale restores it. The single parameter that must be set with
-care is therefore the hit radius, at approximately the covering scale `s_M`. This offline run is the
+ρ = 0.07; setting `s` at the fill knee restores it. The single parameter that must be set with care
+is therefore the hit radius, at the fill knee (≈ 0.22 here, where admissions per block collapse),
+which exceeds the covering-radius estimate `s_M ≈ 0.155` by ~1.4× and should be set empirically. This
+offline run is the
 prerequisite we place before any training integration (§3.8): it exercises the full mechanism on
 real signatures at low cost, and it is where a readout-inverting error surfaces as a flat,
 uncorrelated score — as the normalized control and the mis-set-radius run both illustrate.
@@ -429,7 +442,8 @@ knobs leave every constant unchanged. The **bank size `M`** sets only the anchor
 `s_M ∝ M^{−1/d*}` and, through the pooling count, the readout bandwidth; because `d* ≈ 9.5` this
 dependence is very weak (halving `M` coarsens the spacing by ~7.5%, and reaching the `L` ceiling or
 the pooling-locality floor takes order-of-magnitude changes), so `M` is a soft knob over a wide band,
-with the hit radius `s` the only coupled parameter — it must track `s_M`. The **prototype count `K'`**
+with the hit radius `s` the only coupled parameter — it must be re-tuned to the fill knee, which
+scales with `M` as `s_M` does. The **prototype count `K'`**
 also leaves the constants intact provided `K' ≥` the effective prototype rank (measured ≈ 44): the
 signature is then a rotation (`K' = 256`) or a projection that retains the occupied subspace, and the
 intrinsic dimension on which every `d*`-dependent formula rests is preserved. Reducing `K'` below the
