@@ -1,344 +1,343 @@
-# The Typicality Curator: Online Redundancy Curation for Self-Supervised Pathology Foundation Models
+# Typicality Dampening
 
-*Technique section (paper draft). Self-contained: it carries the motivation, the abstract
-curation problem, the empirical characterization of the training stream that fixes every
-design constant, the estimator-theoretic derivation of the converged algorithm, the
-pseudocode, the two loss-consumption variants (weighted-loss vs. adaptive-temperature),
-and the honest resolution ceiling. All quantitative claims are inference-only measurements
-on the baseline run `FMC_ViT-B_stab_baseline_rev3` and the `stab_bc_weightedloss_rev3`
-checkpoint; nothing was retrained to produce them.*
+*Method section (manuscript draft). This document describes the typicality-dampening module
+in full: the morphology-signature representation it operates on, the online estimator of
+tile redundancy at its core, the empirical study of the training stream that fixes the
+estimator's design, the resulting curation policy, and the two ways its output modulates the
+learning objective. Quantitative statements are inference-only measurements on our
+ViT-B/16 pathology model; the experimental protocol for each is given in Appendix A.*
 
 ---
 
-## 1. Motivation: the data is the problem
+## 3. Typicality Dampening
 
-Self-supervised recipes of the DINOv2 family assume a *curated* input distribution. This is
-not incidental: the DINOv2 corpus LVD-142M was **built** by an explicit offline pipeline —
-self-supervised copy-detection **de-duplication** followed by **retrieval-based
-rebalancing** against curated seed sets [Oquab et al., 2023]. ImageNet-scale SSL works in
-part because ImageNet is one-object-per-image, de-duplicated, and class-balanced. The recipe
-presumes that curation already happened.
+Whole-slide images are annotated at the slide level but consumed at the tile level, and the
+resulting training stream is heavily redundant. A single slide contributes thousands of
+near-duplicate views of stroma, adipose, and background, while diagnostically informative
+morphology is comparatively rare. Under the shared softmax temperature of the DINO objective,
+these common tiles contribute per-example gradients of the same magnitude as rare ones, so
+the informative signal is simultaneously diluted by, and redundantly reinforced against, a
+long tail of near-duplicates. This is the tile-level analogue of a problem that modern
+self-supervised recipes otherwise solve *offline*: the DINOv2 corpus, for instance, was built
+by an explicit de-duplication and retrieval-rebalancing pipeline before training began
+(Oquab et al., 2024). Tile streams admit no such pre-curation at scale.
 
-Computational histopathology violates every one of those assumptions at the tile level.
-Whole-slide images (WSIs) are soft-curated at the **slide** level (a slide carries a
-diagnosis), never at the **tile** level. Tiling a WSI produces thousands of tiles per slide,
-dominated by redundant, near-duplicate morphology (stroma, adipose, background), with no
-de-duplication and no balancing. Ported directly, a DINOv2 objective spends its capacity on
-the redundant majority. Practitioners then blame the architecture or bolt on losses, without
-asking whether the **input distribution** is the pathology.
+Typicality dampening supplies this curation *online and in-domain*. At each step it estimates,
+for every tile in the batch, how typical that tile is of the morphology the model has recently
+encountered, and attenuates the contribution of typical tiles to the image-level DINO
+objective. The module is a stop-gradient side-channel on the standard student/teacher pipeline
+(Figure 1): it reads an intermediate student representation, produces a scalar typicality
+score, and multiplies the DINO cross-entropy by a weight that decreases with typicality. The
+patch-level iBOT objective is left unmodulated, so dense per-patch supervision is preserved
+while the image-level objective is rebalanced toward rare morphology.
 
-The **typicality curator** supplies the missing curation *inline and in-domain*: one cannot
-hand-de-duplicate 287M tiles by retrieval against a curated seed, so we estimate tile
-redundancy online, in the model's own evolving morphology space, and convert it into a
-per-tile loss modulation. It is the online, in-training analogue of the LVD-142M curation
-step.
+### 3.1 Overview
 
-## 2. Notation and the score
+The module comprises three components, applied in sequence to each tile `x` in the batch.
 
-The backbone (ViT-B, patch 16, register tokens) produces a pre-norm `[CLS]` token. A DINO
-projection head maps it to an L2-normalized 256-d **bottleneck** `z`. A set of
-**representative prototypes** `R ∈ ℝ^{256×256}` (row-normalized `R̂`) defines the **signature**
+1. **Signature.** The student's L2-normalized 256-dimensional DINO-head bottleneck
+   `z(x)` is taken under stop-gradient and projected onto a small set of learned
+   *representative prototypes* `R` to yield a compact **morphology signature** `s(x)`
+   (§3.2).
+2. **Redundancy estimate.** `s(x)` is compared against a bounded **memory bank** of recently
+   observed signatures to produce a scalar **typicality score** `t(x) ∈ [0,1]`, high when the
+   tile lies in a densely populated region of signature space and low when it is rare (§3.3).
+3. **Modulation.** `t(x)` is mapped to a per-tile modulation of the DINO objective — either a
+   loss weight or a softmax temperature (§3.6).
+
+Of these, the signature and the modulation are lightweight and largely determined by the
+surrounding recipe; the memory bank is the technical crux, because whether `t(x)` faithfully
+measures redundancy depends entirely on what the bank stores and how it is maintained. The
+bulk of this section (§3.3–§3.5) is therefore devoted to the estimator: the requirement it
+must satisfy, an empirical characterization of the tile stream that determines its parameters,
+and the curation policy we derive.
+
+### 3.2 Morphology signatures
+
+The redundancy estimate is computed in a low-dimensional morphology space rather than on raw
+backbone features, for two reasons: the raw `[CLS]` representation is high-dimensional and
+continues to reorganize late into training (§3.4), whereas the DINO-head bottleneck is both
+compact and stable; and comparing tiles against a learned set of anchors gives an
+interpretable, bounded representation well suited to a nearest-neighbor memory.
+
+Let `z(x) ∈ S^{255}` be the student's unit-norm DINO-head bottleneck for the first global crop,
+taken under stop-gradient so the typicality path never contributes to the backbone gradient.
+A matrix of `K' = 256` **representative prototypes** `R ∈ ℝ^{K'×256}`, with unit-norm rows,
+defines the signature
 
 ```
-s = z · R̂ᵀ ∈ ℝ^256 ,        s_k = cos(z, R̂_k)          (raw cosine, no softmax)
+s(x) = R · z(x) ∈ ℝ^{K'} ,        s_k(x) = ⟨R_k, z(x)⟩ ,
 ```
 
-so a signature is 256 cosines-to-prototypes. A signature is **peaky** when one component
-dominates (`max_k s_k` large — the tile strongly resembles one morphology mode) and
-**diffuse** when all components sit at the random-projection floor (`max_k s_k ≈ 0.16` for a
-random unit vector through `R̂`). The curator maintains a bounded memory ("bank") of
-signatures and, for each incoming tile, emits a **typicality score** `t(x) ∈ [0,1]` that is
-monotone in the local density of the signature distribution — high for redundant morphology,
-low for rare/novel morphology. `t` is then consumed by a loss modulation (§8).
+the vector of similarities between the tile and each anchor. Signatures are *peaky* for
+well-formed morphology (one anchor dominates) and *diffuse* for representations that resemble
+no anchor (all similarities near the small-angle floor of a random projection); this
+distinction is used diagnostically in §3.4.
 
-## 3. The abstract curation problem
+The anchors are trained online, alongside the backbone but by a dedicated optimizer, to tile
+the occupied region of bottleneck space. Two terms are used:
 
-Strip the domain away and the curator is a **bounded-memory online density problem**. Let
-`(ℝ^d, ρ)` be a metric space, `μ` an unknown measure with density `p` (heavy concentration,
-a light outlier scatter), and `x₁, x₂, …` an i.i.d. stream processed in blocks of size `κ`
-(the gathered batch). We maintain `B_t`, `|B_t| ≤ M`, updated by an **eviction kernel**, and
-must emit `t(x)` from `B_t` alone. The objective is **importance weighting**: choose weights
-so the reweighted stream behaves like a sample from a flattened target `ν ∝ μ^γ` — i.e.
-estimate a monotone functional of `p(x)` online, in memory `M ≪ N`.
+```
+L_R = L_nn + λ_cov · L_cov ,
+```
 
-Two natural kernels give opposite behavior for the same distance statistic
-`d(x;B)=min_{b∈B} ρ(x,b)`:
+where `L_nn` pulls each anchor toward its nearest DINO output prototype (so anchors track the
+morphology directions the model itself has learned), and `L_cov` penalizes the off-diagonal
+entries of `R Rᵀ` (so anchors spread out rather than collapse together). The rows of `R` are
+re-projected to the unit sphere after each step, keeping `R` close to an orthonormal frame.
+Because the anchors and the loss both derive from the stop-gradient bottleneck, the signature
+space is a passive readout of the representation, not a target the backbone optimizes toward.
 
-- **Density-faithful (F1).** If `emp(B) → μ`, then `d(x;B) ≍ (M·p(x))^{-1/d}` — monotone in
-  `p`, but with `M ≪ N` a faithful sample barely represents light regions.
-- **Repulsive / coverage (F2).** Evict-nearest relaxes `B` to an even covering of
-  `supp(μ)`; `d(x;B) →` a constant packing radius, carrying no density information, and an
-  isolated atom is never anyone's nearest neighbor, hence **never evicted** (an absorbing
-  state — the estimator is non-ergodic).
+### 3.3 Tile redundancy as online density estimation
 
-The design problem is to choose a kernel + readout that reads density robustly across the
-mass range without either failure. **The correct resolution — derived in §6 — separates the
-two jobs: point positions do coverage; a per-atom counter does mass.**
+Given signatures, estimating a tile's redundancy is a density-estimation problem. Let `μ` be
+the distribution of signatures induced by the current model over the tile stream, with local
+density `p`. A tile is redundant precisely when it lies where `p` is large — where many other
+tiles produce nearly the same signature — so the typicality score should be a monotone
+increasing function of `p(s(x))`. We estimate `p` with a bounded memory: a bank `B` of at most
+`M` signatures, from which each incoming tile receives a score.
 
-## 4. Empirical characterization of the stream
+The shipped estimator is a nearest-neighbor density readout. For a query signature `s(x)`, let
+`d(x) = min_{b∈B} ‖s(x) − b‖₁` be the distance to the nearest bank entry, and let `μ_B, σ_B`
+be the mean and standard deviation of the within-bank nearest-neighbor distances. The score is
 
-Every constant below was measured; together they fix the entire design and — importantly —
-show the operating regime is **mild**, so the curator is justified by principle and
-robustness rather than by an extreme-skew necessity.
+```
+t(x) = 1 − Φ( (d(x) − μ_B) / σ_B ) ,
+```
 
-| quantity | symbol | measured value | how |
+with `Φ` the standard normal CDF, so a tile that lands close to the bank (small `d`) is scored
+typical (`t → 1`) and a tile far from every bank entry is scored rare (`t → 0`). The
+calibration by the bank's own spacing makes the score scale-free.
+
+The estimator is only as good as the bank's contents, and this is where the design becomes
+non-trivial. For `d(x)` to track *frequency*, the bank's stationary distribution must reflect
+the data distribution `μ`: nearest-neighbor distance grows as local density falls only if the
+bank samples dense and sparse regions in proportion to how often the stream visits them. Two
+natural maintenance policies both fail this requirement in opposite ways. A reservoir that
+admits every tile and evicts uniformly reproduces `μ` in distribution, but with `M ≪ N` it
+draws almost all of its entries from the dense majority and represents sparse morphology only
+noisily. A novelty-driven policy that admits the most dissimilar tiles and evicts the nearest
+incumbent — the policy of our initial implementation — instead relaxes the bank toward a
+space-filling cover of the occupied region: nearest-neighbor distance becomes roughly constant
+everywhere and carries little information about density, and isolated entries, never the
+nearest neighbor of any future tile, are never evicted. On our own model this second failure
+mode is severe: the bank saturates at a bimodal state in which the majority of entries are
+diffuse seed signatures left over from early training and the score is nearly constant across
+the stream (§3.4, §3.7). The remainder of this section derives a maintenance policy that
+estimates density faithfully within a fixed memory budget, and the parameters that policy
+requires are fixed by a direct measurement of the stream.
+
+### 3.4 Characterizing the tile stream
+
+The estimator's design — when to activate it, how to lay out the bank, how fast to forget —
+is determined by six properties of the tile stream, all measured directly on our model and
+summarized in Table 1. Two findings are structural (they change the algorithm) and the rest
+are quantitative (they fix its constants).
+
+**When to activate: representation stability.** The signature space is a projection of the
+DINO-head bottleneck, and the bottleneck stabilizes far earlier in training than the raw
+backbone. Measuring linear centered kernel alignment (CKA; Kornblith et al., 2019) between a
+fixed probe set encoded at successive checkpoints and at the final model, the raw `[CLS]`
+representation is only 55% converged at 50k iterations, whereas the bottleneck is 94%
+converged by the same point. A control that applies the *final* projection head to every
+checkpoint's `[CLS]` reaches 98% by 50k — higher than with the co-evolving head — which
+establishes that the early stability is a genuine property of a low-dimensional, early-forming
+subspace of the backbone rather than an artifact of the head adapting to a drifting
+representation. Because the bank is only meaningful once the signatures it stores are stable,
+the module is inactive for the first `T_warm ≈ 50k` iterations and the bank is filled only
+thereafter. (Local neighborhood structure continues to reorganize until roughly 90k, a
+residual we return to in §3.8.)
+
+**Geometry: low dimension, mild skew, no isolated modes.** The intrinsic dimension of the
+signature support, estimated both by the two-nearest-neighbor ratio method (Facco et al., 2017)
+and by the participation ratio of the feature covariance, is approximately 9.5 — far below the
+ambient 256. The dynamic range of local density across the support, estimated from k-nearest-
+neighbor distances, spans roughly three orders of magnitude (a factor of `10^3` between the
+1st and 99th percentiles), a figure independently corroborated by the variance of the log-
+density field. The support is a connected continuum rather than a set of isolated clusters:
+the effective number of resolvable modes grows smoothly with resolution and no dominant mode
+emerges. Together these mean the estimation problem is benign — density is readable, the skew
+is moderate, and the absorbing-outlier pathology of a novelty-driven bank has no atomic modes
+to latch onto (the isolation rate decays with sample size with no floor, extrapolating to a
+one-off rate near `10^{-5}`).
+
+**Temporal structure: near-i.i.d., slow drift.** At the batch level the stream is close to
+i.i.d.: the variance ratio between batches is near unity and the lag-one autocorrelation of
+batch statistics is small (a positive control that groups tiles by slide raises both sharply,
+confirming the measurement is sensitive). At the tile level the loader's interleave leaves only
+a weak, short-range correlation — a burst factor near 1.2 that decays within a single batch —
+so redundant tiles do not arrive in long runs. Finally, the signature distribution itself
+drifts slowly after activation: the representation moves by a correlation length only over tens
+of thousands of iterations, two to three orders of magnitude slower than the bank's forgetting
+timescale, so stored statistics never become stale relative to the encoder that produced them.
+
+**Table 1.** Measured properties of the signature stream (ViT-B/16, post-activation).
+| Property | Symbol | Value | Design role |
 |---|---|---|---|
-| intrinsic dimension of the signature support | `d*` | **≈ 9.5** (two-NN 9.2, linear PR 9.5; ~10–11 at 50k) | two-NN [Facco et al., 2017] + covariance participation ratio |
-| prototype row-space rank (readout cap) | rank `R̂` | **≈ 44** (185 at init) | participation ratio of `R̂` spectrum |
-| batch-level stationarity | VR, ρ(1) | **VR 1.7–2.0, ρ(1) ≈ −0.08** (IID); slide-grouped control VR 21.2, ρ(1) +0.48 | variance-ratio + lag-autocorrelation of batch-mean features |
-| tile-scale burst factor | `b` | **≈ 1.2**; same-slide adjacency 3.7%, run-length ≈ 1 | signature autocorrelation + slide-run structure in stream order |
-| autocorrelation length | `τ_ac` | **< 256 tiles** (< one block); cross-block ≈ 0 | signature autocorrelation vs lag |
-| density dynamic range | `R` | **≈ 10³** (p99/p1), 10³·⁸ (p99.9/p0.1), 10⁴·⁸⁵ extreme | k-NN local-density ratio; cross-checked by log-density sill 2.2 → e^{2·2.33·√2.2} ≈ 10³·⁰ |
-| mode structure | — | **continuum**: eff-#modes grows with resolution (30→240), no dominant mode | k-means sweep (equalizes mass, so used only for structure, not `R`) |
-| one-off / artifact rate | `ρ_out` | **∼ N^{−0.8}, no floor → ≈ 10⁻⁵** at full scale | isolation rate vs sample size at coverage scale |
-| log-density correlation length | `L` | **≈ 0.16** (‖∇log p‖⁻¹), 0.42 (decorrelation range); sill 2.2 | semivariogram of the k-NN log-density field |
-| memory-bound cell scale at M=8192 | `s_M` | **≈ 0.14 ≈ L** | covering radius `(V/M)^{1/d*}` |
-| drift horizon | `N_drift` | **≈ 6.7×10⁴ blocks** (0.1-CKA displacement); unit-scale ~10× longer | post-50k bottleneck CKA drift rate |
+| Bottleneck stabilization | — | 94% CKA at 50k (vs. 55% for `[CLS]`) | sets activation `T_warm ≈ 50k` |
+| Intrinsic dimension | `d*` | ≈ 9.5 | sets readout viability and cell scale |
+| Local-density dynamic range | `R` | ≈ `10^3` | places the operating regime; moderate |
+| Mode structure | — | connected continuum, no dominant mode | removes the coverage/outlier hazard |
+| Tile-level burst factor | `b` | ≈ 1.2, decays within one batch | permits simple exponential forgetting |
+| Log-density correlation length | `L` | ≈ 0.16 | sets the memory-bound cell scale |
+| One-off (artifact) rate | `ρ_out` | ≈ `10^{-5}`, no floor | sizes the transient reserve |
 
-Four consequences drive the design:
+### 3.5 Curation policy
 
-**(a) When to start — representation stability (→ 50k late-fill).** The signature space is a
-projection of the classhead bottleneck, not of the raw backbone, and the two settle on very
-different schedules. Measuring linear CKA vs. the final (124k) model on a fixed 76,800-tile
-probe:
+The characterization in §3.4 dictates a specific bank design. Because a single set of stored
+points cannot encode both *where* the occupied region is and *how densely* each part is
+populated — the failure at the root of §3.3 — we separate the two roles. The bank stores a set
+of anchor signatures that cover the support, and augments each anchor with two decayed scalar
+counters that record how much traffic it receives. Coverage is carried by the anchor
+positions; frequency is carried by the counters.
 
-- raw `[CLS]` (MIL feature) is only **55% CKA-converged at 50k** (0.547) — no knee there,
-  ~44% of its total representational path lies after 50k;
-- the **bottleneck is 94% converged at 50k** (0.944), velocity already ~10× below its peak.
+**Anchor state.** Each anchor `i` maintains a position `b_i` and two exponentially decayed
+counters: a *hit count* `S_i`, incremented when a tile falls within the cell of `b_i`, and an
+*exposure* `E_i`, incremented whenever `b_i` is the nearest anchor to an incoming tile. Their
+ratio `λ̂_i = S_i / E_i` estimates the local traffic rate at `b_i`. This pair is the sufficient
+statistic for the redundancy estimate under a Poisson-arrival model, and it dominates the two
+degenerate alternatives: a recency timestamp alone (which supports only a coarse "seen
+recently" test and discards magnitude) and an undecayed cumulative count (which retains anchors
+in regions the stream has long since left).
 
-A fixed-final-head decomposition (apply the frozen 124k head to every checkpoint's `[CLS]`)
-gives **0.976 at 50k** — *more* converged than with the co-evolving head — proving the
-stability is a genuine **early-forming stable subspace of the backbone**, not head
-co-adaptation. So the signature the curator reads is essentially formed by 50k, which is why
-the bank must be **filled only after ~50k** (the "late-fill" gate). Caveat retained: *local*
-neighborhood structure is only 62% settled at 50k and finishes reorganizing by ~90k, so the
-first ~40k iterations of curation run on globally-set / locally-still-settling signatures.
+**Placement.** New anchors are admitted where the stream visits regions not yet covered — a
+tile farther than the cell scale `s` from every anchor seeds a new anchor — so the anchor set
+tiles the occupied support. On the measured continuum the optimal density-estimation bandwidth
+places anchors in near-proportion to the data density (formally, anchor density `∝ p^{γ}` with
+`γ = d*/(d*+2) ≈ 0.83`, the classical quantization exponent; Graf and Luschgy, 2000), rather
+than as the uniform cover of a novelty-driven policy. The cell scale is set by the memory
+budget: with `M = 8192` anchors over a `d* ≈ 9.5`-dimensional support the achievable scale
+`s ≈ 0.15` coincides with the density correlation length `L`, which — as noted in §3.8 — is
+the resolution floor of any bounded summary in this regime.
 
-**(b) The regime is low-dimensional and mildly skewed.** `d* ≈ 9.5` (not hundreds) and
-`R ≈ 10³` (not 10⁶). This makes a distance readout viable (spacing ratio `R^{1/d*} ≈ 2–3×`,
-resolvable) and — because the mass ratio is modest and the support is a **continuum with no
-isolated rare modes** — removes the reason to spread the bank toward coverage. The absorbing
-outlier pathology of F2 retires to a corner case (`ρ_out ≈ 10⁻⁵`, with `N^{−0.8}` decay and
-no artifact floor — a continuum with no atomic one-offs).
+**Readout.** The typicality score is read from the counters rather than from distance:
+`t(x)` is a monotone map of a kernel-weighted, query-centered average of `λ̂_i` over the
+`j ≈ 32–64` nearest anchors. Centering the average at the query cancels the leading-order bias
+that a single-anchor readout would incur. Early in training, before the counters have
+accumulated, the distance readout of §3.3 serves as a cold-start estimator; once the counters
+fill — within a few dozen batches — the counted readout takes over, and the distance readout
+is retained only as a consistency probe whose disagreement with the counted estimate localizes
+drift or miscalibration.
 
-**(c) The stream is near-IID at the tile scale.** `b ≈ 1.2`, `τ_ac < κ`: the 16-way loader
-interleave already whitens it. Per-block decay is fully whitened; the hard-window vs. decay
-distinction is moot.
+**Eviction and forgetting.** When the anchor set is full, the anchor with the lowest traffic
+rate `λ̂_i` is evicted — a least-frequently-used policy with aging, so anchors that stop
+receiving traffic decay out while active anchors persist. A small transient reserve (of order
+1% of `M`, sized by the measured one-off rate `ρ_out`) holds newly admitted anchors so that a
+one-off tile cannot displace an established anchor before it has had the chance to accumulate
+traffic. The counters decay with a half-life of a few hundred batches — long relative to the
+batch autocorrelation, so recurring morphology accumulates standing evidence, yet short
+relative to the representation drift horizon, so the estimate tracks the current distribution.
 
-**(d) Counts never go stale.** The counter half-life (~250 blocks) is `t½/N_drift ≈ 3.7×10⁻³`
-of the drift horizon — counts refresh ~270× faster than the encoder drifts.
-
-## 5. Diagnosis of the coverage-only incumbent (why the design had to change)
-
-The shipped bank (`rev3`) is the F2 kernel — admit-most-novel, **evict-nearest**, scored by
-calibrated distance `t = 1 − Φ((d − µ)/σ)`, `k=1`. On the 124k checkpoint it fails
-completely, and the failure is exactly what F2 predicts:
-
-- **Seeded with junk.** `M = 8192`, per-rank batch 256 → the bank fills in ~32 steps, while
-  the encoder is untrained and `R` is fresh; the `warmup=15000` gate governed only *loss
-  modulation*, not *filling*. Seed signatures are diffuse: bank peak median **0.172**, i.e.
-  the random-projection floor (0.159).
-- **Never cleared.** Evict-nearest cannot expel isolated atoms, so the junk plateaus: the
-  peak-histogram is **bimodal** — 78.5% in a spike at the random floor (0.15–0.20) and 21.5%
-  genuinely peaky (median 0.715), with an empty valley between. Real freshly-encoded tiles
-  are peaky (median 0.825, 0% diffuse), so the diffuseness is a property of the *stale bank*,
-  not the data.
-- **Inert signal.** Every real tile scores far from the junk bank (`d ≈ 3.7µ`, `t ≈ 0.08`),
-  so the loss weight `w = 1 − β·t ≈ 0.96` is uniform — the modulation did nothing
-  differential, unnoticed across ~45 recipes for lack of bank-health logging.
-- **Structural flatness.** Even with a clean bank, a coverage net gives `d(x;B) ≈` const on
-  support, so `Ψ((d−µ)/σ)` is a near-flat support-membership score — it cannot discriminate
-  common from rare regardless of dimension. The coverage-only kernel is the **wrong end of
-  the dial**.
-
-Secondary: `R`'s effective rank collapses 185 → 44 over training, capping morphology
-*resolution* (but not the cause of the all-rare failure).
-
-## 6. Derivation of the converged curator
-
-**6.1 Separate coverage from mass.** A bare point set forces geometry to carry both *where*
-(coverage) and *how much* (mass), and no single placement does both across the mass range.
-Attach to each atom a **decayed hit-counter** and a **decayed exposure**: positions do
-coverage, counters do mass. This is a cache: the bank is a set of cached morphology anchors,
-a "hit" is a tile landing in an anchor's cell, and the replacement policy is the design
-object. Recency-eviction is **LRU**; count-eviction-with-aging is **LFU-with-aging**; the
-analysis tool is the characteristic-time (Che) approximation [Che et al., 2002].
-
-**6.2 The per-atom sufficient statistic `(S, E)`.** For a Poisson hit process under geometric
-discounting, keep two decayed scalars per atom — decayed hits `S` and decayed exposure `E` —
-and use the **rate** `λ̂ = S/E` for **both** eviction (evict `argmin λ̂`) and readout. This
-subsumes the alternatives: recency `τ` is the degenerate compression sufficient only for the
-binary "hit in window?" test (it discards magnitude, needed for the score); undecayed count
-`c` discards time (a "zombie" with large historical count survives after `μ` moves on). The
-extra scalar that protects newborns is **exposure `E`**, not recency: a fresh atom has small
-`E`, so a single hit already gives it a healthy rate — graded protection, not a blunt window.
-
-**6.3 The dial and its collapse on a continuum.** An eviction kernel that admits with
-probability `∝ D^α` induces a stationary law `emp(B) ∝ p^γ` with `γ = d*/(d*+α)` (mean-field
-balance; the same magnification exponent `ρ^{d/(d+r)}` as optimal quantization [Graf &
-Luschgy]; `α=1` is Meyerson online facility location [Meyerson, 2001], `α=2` is the k-means++
-D² rule [Arthur & Vassilvitskii, 2007]). The argument for `γ < 1` (coverage) runs entirely
-through **discrete light modes**: with isolated rare modes, a faithful sample starves them.
-On the measured **continuum** that cap is gone — a region of mass `m` gets `mM` points
-regardless of density — so the readout error is monotone decreasing in `γ` with **no interior
-optimum**, and the answer for the distance readout is `γ → 1` (plain reservoir + k-NN). For
-the count readout the bias-variance optimum of the variable-bandwidth histogram gives
-`s*(x) ∝ (p·N)^{-1/(d*+2)}`, i.e. `γ = d*/(d*+2) ≈ 0.83`. Both are **near-proportional**, a
-world away from the coverage end; we place atoms at `γ ≈ 0.83–1` and note the counts make the
-system nearly insensitive to the exact value.
-
-**6.4 The readout: centered pooled rate.** Reading the nearest single atom's rate places the
-query off-center in its cell — a first-order `∼ s/L` bias. Estimate instead a
-**kernel-weighted, query-centered average of the `j ≈ 32–64` nearest atoms' `S/E`**; the
-first-order gradient term cancels by symmetry, leaving curvature-order error without
-systematic sign. Storage resolution `s` floors the *bandwidth*, not the readout *order*.
-
-**6.5 Distance vs. counts, bandwidth-matched.** At `γ ≈ 1` both readouts count points in the
-same ball around `x`: the net contributes `M`, the decayed stream contributes `N_eff`. The
-count readout wins uniformly once `N_eff > M`, with sd advantage `√(N_eff/M)`. At
-`η = 0.997/block`, `N_eff ≈ 330` blocks; matched (pool ~64 atoms) the crossover is
-`N_eff ≈ M ≈ 8` blocks overall (~25 blocks in the bottom density decile). So the distance
-readout is a **cold-start estimator for the first few dozen blocks** and thereafter a
-permanent **consistency probe** (`log q̂_dist` should track `γ·log p̂_count`; the residual
-field localizes drift or calibration error), not the primary estimator.
-
-**6.6 Eviction timescale and scratch slack.** With `b ≈ 1.2`, `τ_ac < κ`, per-block decay is
-whitened. The slowest cells need retention `T_need ≈ 3M·ln(N/3Mδ) ≈ 250` blocks; the
-emergent memory-bound staleness threshold `T_C ≈ M·ln(1/ρ_adm)` is shorter, so under pressure
-pure recency would churn the slow decile. A small **transient scratch pool** fixes it: reserve
-`h·M` slots with `h ≥ ρ_out·T_need/M ≈ 0.3%` (well inside a 1% cap); transients then absorb
-all evictions (their FIFO age exceeds any kept atom's staleness) and the explicit window never
-binds — the operative timescale is the **emergent `T_C(M)`**. Set the decay half-life for the
-*readout's* sake at `t½ ≈ T_need ≈ 250` blocks (`η ≈ 0.997`), which dwarfs both `κ` and
-`τ_ac` and is `≪ N_drift` (§4d), so counts stay fresh.
-
-**6.7 The resolution ceiling (stated honestly).** Since `s_M ≈ L` at `M = 8192`, **every**
-`M`-bounded readout — distance, counts, any `γ` — has bandwidth `≥ s_M ≈ 0.88 L` and
-estimates only the `L`-smoothed density `p * φ_L`. The sub-`L` component of the field (a third
-to half the sill, ~0.8–1.0 log-units of sd) is invisible to any bounded summary; readouts
-differ in variance and centering, not in what they can resolve. The only levers are memory
-(`×3^{d*}` per refinement — infeasible) or **reducing `d*` upstream**. This is a property of
-the regime, not of the algorithm.
-
-## 7. The converged algorithm
+Algorithm 1 states the policy. It is applied once per batch, after the activation iteration,
+to the batch of signatures gathered across data-parallel workers (§3.7).
 
 ```
-ONLINE REDUNDANCY CURATOR  (converged form)
+Algorithm 1  Typicality bank update and scoring (one batch of signatures X)
 
-State (global, all-reduced & deterministic across data-parallel ranks):
-  atoms B = { (b_i, S_i, E_i, born_i) }, |B| ≤ M          # position, decayed hits, decayed exposure, birth block
-  M_scratch = ceil(h·M),  h ≈ 1%                          # FIFO transient pool (absorbs evictions)
-  s ≈ L ≈ 0.15  (memory-bound s_M);  j ≈ 32–64 pooling;  η ≈ 0.997/block (t½ ≈ 250 blocks)
-  T_warm = 50_000 iters;  warmup_blocks ≈ 30;  β (or temperature schedule) for §8
+  if iteration < T_warm:                       # signatures not yet stable (§3.4)
+      return t(x) = 0 for all x                 #   module inactive; bank untouched
 
-per training block  X = {x_1..x_κ}  (gathered signatures, one iteration):
-  if iter < T_warm:                                       # (a) representation not yet settled
-      return uniform weights                              #     — bank untouched (late-fill)
+  decay all counters:  S_i ← η · S_i ,  E_i ← η · E_i      # η set by half-life
 
-  # 1. decay (lazy, per-atom timestamp)
-  for i: S_i *= η ; E_i *= η
-
-  # 2. READOUT — score each incoming tile BEFORE updating
-  for x in X:
-      N ← j nearest atoms of x
-      if iter < T_warm + warmup_blocks:                   # cold-start
-          λ̂(x) ← calibrated k-NN distance readout(x, B)   #   (§6.5)
+  for each tile x in X:                         # score before updating
+      N ← the j anchors nearest to s(x)
+      if counters are still filling:
+          t(x) ← monotone( distance readout of §3.3 )       # cold-start
       else:
-          λ̂(x) ← Σ_{i∈N} κ_h(x,b_i)·(S_i/E_i) / Σ κ_h    #   centered pooled rate (§6.4)
-      t(x) ← calibrate(λ̂(x)) ∈ [0,1]                     #   monotone, high = common
-      # consistency probe: assert log λ̂_dist(x) ≈ γ·log λ̂_count(x); residual → drift/calib alarm
+          λ̂(x) ← centered kernel average of {S_i/E_i : i ∈ N}
+          t(x) ← monotone( λ̂(x) )
 
-  # 3. UPDATE counts (mass) — after scoring
-  for x in X:
-      b* ← nearest atom ; D ← ρ(x, b*)
-      E_{cell(x)} += 1                                     # exposure of the region
-      if D ≤ s:  S_{b*} += 1                               # hit
-      else:      admit (b=x, S=1, E=1) into scratch
-                 if |B| > M: evict argmin_i S_i/E_i  over atoms NOT in grace/scratch   # LFU-with-aging
+  for each tile x in X:                         # update after scoring
+      i* ← nearest anchor to s(x) ;  E_{i*} ← E_{i*} + 1
+      if ‖s(x) − b_{i*}‖ ≤ s:
+          S_{i*} ← S_{i*} + 1                   # a hit
+      else:
+          admit a new anchor at s(x) into the transient reserve
+          if the anchor set is full:
+              evict the anchor of lowest rate S_i/E_i outside the reserve
 
-  # 4. (optional) update ~10–100 macro-cells → calibration / drift monitor (not the estimator)
-
-  return  w(x) = modulate(t(x))                            # §8: weighted-loss OR adaptive-temperature
+  return { t(x) : x ∈ X }
 ```
 
-Global determinism (all-gather of signatures; tie-breaks pinned to lowest index; all-reduce
-of count increments) keeps the bank byte-identical across ranks and multi-node reproducible.
+### 3.6 Modulating the objective
 
-## 8. Consuming the score: weighted loss vs. adaptive temperature
+The typicality score modulates the image-level DINO cross-entropy in one of two ways, which
+differ in what they change about the learning signal. Both leave the iBOT objective untouched;
+the total loss is `L = m(x) · CE_DINO + CE_iBOT + λ_sem · CE_iBOT^{sem}`, where the modulation
+`m(x)` is one of the following.
 
-The curator produces `t(x)`; two families consume it, differing in **what** they change.
+**Weighted loss (magnitude).** The DINO term is scaled per tile by
+`w(x) = 1 − β · t(x)`, `β ∈ [0,1]`. A typical tile contributes a smaller-magnitude gradient,
+but the target it is trained toward is unchanged. This is a direct importance weighting: it
+reshapes the *effective sampling distribution* toward a flatter distribution over morphology
+while leaving each tile's learning signal intact. It is bounded and simple to reason about,
+and is the setting we adopt by default.
 
-**8.1 Weighted loss — modulates magnitude only.** `L = Σ_x (1 − β·t(x))·L_DINO+iBOT(x)`,
-`β ∈ [0,1]`. A typical tile contributes a smaller-magnitude gradient; the *target* it is
-trained toward (its teacher assignment) is unchanged. This is exactly the importance-weighting
-of §3 — it reshapes the *effective sampling distribution* toward `ν ∝ μ^γ` (flattened
-redundancy) while leaving each tile's learning signal intact. It is conservative, bounded,
-and easy to reason about (a pure rescaling of per-tile contributions). This is the
-`stab_bc_weightedloss` lineage.
+**Adaptive temperature (distribution).** The per-tile student softmax temperature is scaled,
+`τ(x) = τ_base · (1 + α · t(x))`, so a typical tile receives a flatter target distribution. This
+changes not only the gradient magnitude but the *shape* of the target, redistributing
+probability mass across output prototypes rather than merely down-scaling the tile's
+contribution. It is a stronger intervention — it can actively flatten over-represented modes in
+the assignment itself — but it couples the redundancy estimate into the representation geometry
+and is correspondingly harder to bound. We report it as an alternative and use the weighted-loss
+form for our main results.
 
-**8.2 Adaptive temperature — modulates magnitude *and* distribution.** The DINO/iBOT loss is a
-cross-entropy between temperature-sharpened softmax assignments; making the temperature a
-function of typicality, `τ(x) = τ₀·f(t(x))`, changes the **shape** of the target distribution
-for that tile — a softer (higher-entropy) target for a typical tile spreads probability mass
-across prototypes rather than committing it, redistributing *what* the tile teaches, not just
-*how much*. This is strictly more aggressive: it alters both the gradient magnitude and the
-distributional target. It can, in principle, actively flatten over-represented modes in the
-prototype assignment itself, but it couples the curator into the representation geometry (a
-closed loop, §9) and is harder to bound. This is the `stab_bc_adaptivetemp` lineage.
+### 3.7 Implementation and design progression
 
-The distinction matters for the paper's claim: **weighted loss is a de-biasing of the data
-distribution; adaptive temperature is a de-biasing of the learning target.** The curator
-(§7) is identical for both; only the consumer differs.
+**Synchronization.** The bank is a single global structure, maintained on the union of
+signatures gathered across all data-parallel workers, so that all workers share one estimator
+rather than each maintaining a private, `1/W`-resolution bank. All update decisions are made
+deterministically (ties broken by index) so the global bank remains bit-identical across
+workers and reproducible across nodes; a periodic cross-worker checksum guards this invariant.
 
-## 9. `rev4` as a stepping stone
+**Activation and monitoring.** Consistent with §3.4, the entire module — signature
+computation, bank update, and scoring — is gated off until `T_warm ≈ 50k` iterations, so the
+bank is never seeded from an unstable representation. Two health statistics are logged
+throughout training: the fraction of the bank that is diffuse, and the fraction of tiles scored
+extremely rare; a healthy run keeps both away from their degenerate limits.
 
-`rev4` is a partial instance of the converged design — the **coverage substrate without the
-counting layer** — and is best read as the last coverage-only variant before the dial was
-walked to near-proportional:
+**Design progression.** The policy of §3.5 is the endpoint of two revisions, which together
+form an ablation of the estimator. The initial implementation maintained a private per-worker
+bank, filled it from the first iteration, admitted the most novel tiles, and evicted the nearest
+incumbent. Filling before the representation stabilized seeded the bank with diffuse signatures,
+and the evict-nearest rule — unable to remove isolated entries — never cleared them: measured at
+the end of training, the bank was 78% diffuse seed material, and the resulting score was nearly
+constant across the stream, so the modulation was effectively inert. An intermediate revision
+corrected the two implementation faults — it made the bank global and deterministic and deferred
+filling to `T_warm` — but retained the novelty-admission and distance readout, and therefore the
+structural flatness of a coverage-based estimator. The policy of §3.5 replaces the churn rule
+with least-frequently-used eviction and the readout with the counted rate, closing the gap
+between the estimated and the true redundancy. §3.4 shows that on the measured stream the
+distance readout is in fact usable once the bank is faithfully maintained, so the two readouts
+agree after the counters fill; their disagreement before then is what the consistency probe
+monitors.
 
-- **Kept from rev4 (correct):** the **global all-gathered bank** (fixes rev3's per-rank
-  fragmentation — N ranks held N independent, worse estimators); **deterministic churn**
-  (lowest-index tie-breaks + cross-rank fingerprint check) so the global bank is
-  byte-identical; the **late-fill gate at 50k** (`typicality_warmup_iters = 50_000`, now
-  gating the *entire* bank block, not just modulation — this is the §4a fix and removes rev3's
-  root cause); and **bank-health logging** (`diffuse_frac`, `t<0.1`).
-- **Superseded (the wrong dial end):** rev4 retains **evict-nearest + a distance readout**,
-  i.e. `γ ≈ 0` coverage with a structurally flat score (§5). The converged design replaces the
-  eviction rule with **min-rate `S/E` (LFU-with-aging)**, the placement with
-  **near-proportional `γ ≈ 0.83–1`**, and the readout with the **centered pooled rate**
-  (distance demoted to cold-start + consistency probe), plus the **1% scratch pool** and the
-  **`η ≈ 0.997` decay**.
+### 3.8 Limitations
 
-So the ablation ladder for the paper is: rev3 (local, junk-seeded, inert) → rev4 (global,
-late-filled, deterministic, but coverage-flat) → converged counted curator (near-proportional
-placement, `(S,E)`-rate readout, LFU-aging eviction).
+Three limitations bound the method. First, the estimate is resolution-limited: with a memory
+budget of `M` anchors over a `d* ≈ 9.5`-dimensional support, the smallest resolvable cell scale
+coincides with the density correlation length `L`, so structure finer than `L` is invisible to
+*any* bounded summary of this size — refining it would require exponentially more memory
+(`∝ 3^{d*}` per halving) or a lower-dimensional signature. Second, the empirical constants of
+§3.4 were measured on a single, morphologically homogeneous slice of the stream; a
+substantially more skewed corpus could shift the operating regime, although the counted readout
+is by construction insensitive to the exact anchor-placement exponent. Third, the redundancy
+estimate modulates the objective that trains the encoder that produces the signatures, so the
+distribution the module measures is not exogenous. Deferring activation until the representation
+has stabilized (§3.4) is the safeguard we rely on; a formal analysis of the coupled dynamics is
+left to future work, and the adaptive-temperature modulation (§3.6), which feeds back through
+the target distribution, tightens this coupling relative to the weighted-loss form.
 
-## 10. Limitations
+---
 
-- **Sub-`L` blindness (§6.7).** At `M = 8192`, `d* ≈ 9.5`, no `M`-bounded summary resolves
-  below the density correlation length; the only real lever is reducing `d*` upstream.
-- **Single-slice measurement.** `R`, `ρ_out`, and the density tail were measured on one
-  76,800-tile LUAD-ish slice; the full 287M corpus may be more skewed (the counts make the
-  system insensitive to the exact `γ`, which mitigates this).
-- **Closed loop.** The score reweights the loss that updates the encoder that generates the
-  signatures — `μ` is endogenous, outside the i.i.d. framework. The 50k late-start (turning
-  curation on only after the signature space is ~settled, §4a) is the safeguard; formal
-  stability of the loop is not established, and adaptive-temperature (§8.2) tightens the
-  coupling relative to weighted-loss.
+### References
 
-## References
-
-- Oquab et al. *DINOv2: Learning Robust Visual Features without Supervision.* TMLR 2024. (LVD-142M curation: SSL dedup + retrieval rebalancing; KoLeo.)
-- Caron et al. *Emerging Properties in Self-Supervised Vision Transformers (DINO).* ICCV 2021.
-- Zhou et al. *iBOT: Image BERT Pre-Training with Online Tokenizer.* ICLR 2022.
-- Sablayrolles et al. *Spreading vectors for similarity search (KoLeo).* ICLR 2019.
-- Facco et al. *Estimating the intrinsic dimension of datasets by a minimal neighborhood information.* Sci. Rep. 2017. (two-NN.)
-- Levina & Bickel. *Maximum Likelihood Estimation of Intrinsic Dimension.* NeurIPS 2004.
-- Kornblith et al. *Similarity of Neural Network Representations Revisited (linear CKA).* ICML 2019.
-- Graf & Luschgy. *Foundations of Quantization for Probability Distributions.* Springer LNM 1730, 2000. (magnification law ρ^{d/(d+r)}.)
-- Meyerson. *Online Facility Location.* FOCS 2001.
-- Arthur & Vassilvitskii. *k-means++: The Advantages of Careful Seeding.* SODA 2007. (D² sampling.)
-- Che, Tung & Wang. *Hierarchical Web Caching Systems: Modeling, Design and Experimental Results.* IEEE JSAC 2002. (characteristic-time approximation.)
-- Einziger, Friedman & Manes. *TinyLFU: A Highly Efficient Cache Admission Policy.* ACM TOS 2017.
-- Bifet & Gavaldà. *Learning from Time-Changing Data with Adaptive Windowing (ADWIN).* SDM 2007.
-- Vitter. *Random Sampling with a Reservoir.* ACM TOMS 1985.
+Arthur and Vassilvitskii. *k-means++: The Advantages of Careful Seeding.* SODA 2007.
+Bifet and Gavaldà. *Learning from Time-Changing Data with Adaptive Windowing.* SDM 2007.
+Caron et al. *Emerging Properties in Self-Supervised Vision Transformers.* ICCV 2021.
+Che, Tung, and Wang. *Hierarchical Web Caching Systems.* IEEE JSAC 2002.
+Facco et al. *Estimating the Intrinsic Dimension of Datasets by a Minimal Neighborhood Information.* Scientific Reports 2017.
+Graf and Luschgy. *Foundations of Quantization for Probability Distributions.* Springer LNM 1730, 2000.
+Kornblith et al. *Similarity of Neural Network Representations Revisited.* ICML 2019.
+Oquab et al. *DINOv2: Learning Robust Visual Features without Supervision.* TMLR 2024.
+Zhou et al. *iBOT: Image BERT Pre-Training with Online Tokenizer.* ICLR 2022.
