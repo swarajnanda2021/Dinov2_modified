@@ -118,7 +118,7 @@ measured on a *baseline* model: a standard DINOv2 ViT-B/16 trained on pathology 
 four extensions of this work disabled, under a recipe following UNI (Chen et al., 2024) at
 ViT-B rather than its ViT-L scale. Measuring on this un-modulated baseline is deliberate: it
 characterizes the signature distribution the module takes as *input*, before the module itself
-perturbs it, which both isolates the design target and avoids the closed-loop confound of §3.7.
+perturbs it, which both isolates the design target and avoids the closed-loop confound of §3.8.
 All measurements are inference-only — a fixed probe of 76,800 tiles, drawn from the training
 stream in dataloader order (so arrival order is preserved for the temporal measurements) and
 encoded through a ladder of checkpoints spanning training (10k–124k iterations) — with no
@@ -218,10 +218,10 @@ determines.
 | Property | Symbol | Value | Design role |
 |---|---|---|---|
 | Intrinsic dimension | `d*` | ≈ 9.5 | readout viability; cell scale |
-| Local-density dynamic range | `R` | ≈ `10^3` | places the operating regime (moderate) |
+| Local-density dynamic range | `R` | scale-dependent (§3.7); ≈ 20 at radius `L` | places the operating regime (moderate) |
 | Mode structure | — | connected continuum, no dominant mode | removes the isolated-outlier hazard |
 | Tile-level burst factor | `b` | ≈ 1.2, decays within one batch | permits simple exponential forgetting |
-| Log-density correlation length | `L` | ≈ 0.16 | sets the memory-bound cell scale |
+| Log-density correlation length | `L` | ≈ 0.26 | sets the readout bandwidth |
 | One-off (artifact) rate | `ρ_out` | ≈ `10^{-5}`, no floor | sizes the transient reserve |
 
 Two structural findings from Table 1 guide the design. First, the support is a connected
@@ -237,17 +237,24 @@ decay without becoming stale relative to the encoder that produced them.
 lies and *how densely* each part is populated — the tension underlying §3.4 — the two roles are
 separated. The bank stores anchor signatures that cover the support, and augments each anchor
 with two exponentially decayed counters: a hit count `S_i`, incremented when a tile falls in the
-cell of anchor `i`, and an exposure `E_i`, incremented whenever anchor `i` is the nearest to an
-incoming tile. Their ratio `λ̂_i = S_i / E_i` estimates the local traffic rate. Coverage is
-carried by the anchor positions; frequency is carried by the counters, which — unlike a
-nearest-neighbor distance under a cover — retain their dependence on density.
+cell of anchor `i`, and an *exposure* `E_i` that accumulates the anchor's decayed lifetime —
+incremented once per block for as long as the anchor is live. Their ratio `λ̂_i = S_i / E_i` is
+then a decayed hit-*rate* (hits per unit lifetime), which is the correct per-anchor quantity: it
+scales as `p / g` (data density divided by anchor density), so summing it over a window recovers
+the data density independently of how the anchors are placed (§Readout). Defining the exposure as
+lifetime rather than as traffic is essential — were `E_i` a count of tiles nearest to `i`, it
+would scale as `p / g` just as `S_i` does, their ratio would collapse to a near-constant geometric
+factor carrying no density, and both the readout and the staleness eviction below would fail.
+Coverage is carried by the anchor positions; frequency is carried by the rate `λ̂_i`, which —
+unlike a nearest-neighbor distance under a cover — retains its dependence on density.
 
 - *Placement.* A tile farther than the cell scale `s` from every anchor seeds a new anchor, so
   the anchor set tiles the occupied support. On the measured continuum the density-estimation-
   optimal bandwidth places anchors in near-proportion to the data density (formally, anchor
   density `∝ p^{d*/(d*+2)}`, the classical quantization exponent; Graf and Luschgy, 2000). The
-  cell scale is set by the memory budget: with `M` anchors over a `d* ≈ 9.5`-dimensional support
-  the achievable scale `s ≈ 0.15` coincides with the density correlation length `L`.
+  cell scale is set by the memory budget: with `M = 8192` anchors over a `d* ≈ 9.5`-dimensional
+  support the achievable anchor spacing is `s_M ≈ 0.155` (≈ 0.6 `L`), finer than the correlation
+  length, though the readout pools anchors to an effective bandwidth of ≈ `L` (§3.7).
 - *Readout.* The local density at a query is read from the counters as an *unnormalized*
   kernel sum of the anchor rates,
   `p̂(x) = Σ_i λ̂_i · K_h(x − b_i)`,
@@ -288,7 +295,9 @@ Algorithm 2  Counted-coverage bank (proposed): update and scoring for one batch 
 
   if iteration < T_warm:  return t(x) = 0 for all x
 
-  decay every counter:  S_i ← η · S_i ,  E_i ← η · E_i        # η set by half-life
+  for every live anchor i:                                    # decay, and age the exposure
+      S_i ← η · S_i                                           #   S: decayed hits
+      E_i ← η · E_i + 1                                       #   E: decayed lifetime (blocks alive)
 
   gather signatures of X across workers  →  X_global
   for each x in X_global:                                     # score before updating
@@ -299,9 +308,9 @@ Algorithm 2  Counted-coverage bank (proposed): update and scoring for one batch 
           t(x) ← F̂( log p̂(x) )                                # decayed empirical rank (PIT)
 
   for each x in X_global:                                      # update after scoring
-      i* ← nearest anchor to s(x) ;  E_{i*} ← E_{i*} + 1
+      i* ← nearest anchor to s(x)
       if ‖s(x) − b_{i*}‖ ≤ s:
-          S_{i*} ← S_{i*} + 1
+          S_{i*} ← S_{i*} + 1                                  # a hit (exposure was aged above)
       else:
           admit a new anchor at s(x) into the transient reserve
           if the anchor set is full:  evict argmin_i S_i/E_i outside the reserve
@@ -309,11 +318,12 @@ Algorithm 2  Counted-coverage bank (proposed): update and scoring for one batch 
   return { t(x) : x in this worker's rows }
 ```
 
-A remark on resolution. With `M` anchors over a `d* ≈ 9.5`-dimensional support the smallest
-achievable cell scale coincides with the density correlation length `L` (Table 1). Structure
-finer than `L` is therefore invisible to any bounded summary of this size, whatever its
-readout; refining it would require exponentially more memory or a lower-dimensional signature.
-This bounds both bank designs equally and is a property of the regime, not of either policy.
+A remark on resolution. With `M = 8192` anchors the anchor spacing is finer than the correlation
+length (`s_M ≈ 0.6 L`), but the readout pools `j ≈ 64` anchors to an effective bandwidth of ≈ `L`
+(§3.7), so every readout is `L`-smoothed. Structure finer than `L` is therefore invisible to any
+bounded summary of this size, whatever its readout; refining it would require exponentially more
+memory or a lower-dimensional signature. This bounds both bank designs equally and is a property
+of the regime, not of either policy.
 
 ### 3.6 Modulating the objective
 
@@ -340,7 +350,111 @@ comparison is the subject of Section 4; the sensitivity of the leading configura
 principal hyperparameters (`β` or `α`, the warmup `T_warm`, and, for the counted-coverage bank,
 the decay half-life and cell scale) is studied thereafter.
 
-### 3.7 Limitations
+### 3.7 Empirical determination of the constants, and offline validation
+
+The counted-coverage design rests on two empirical claims: that the constants of Table 1 are
+properties of the model rather than of one sample, and that the bank, run end to end, actually
+recovers tile redundancy. We establish both by inference-only study on the baseline model — a
+convergence analysis of the constants and an offline run of the bank on cached signatures — with
+no retraining.
+
+**Convergence of the constants.** Each constant of Table 1 was first estimated on the single
+76,800-tile probe of §3.3. To rule out sampling artifacts, we re-estimated each on a fresh,
+independent 384,000-tile sample (a disjoint dataloader seed, same tap and checkpoint), reporting
+a bootstrap 95% confidence interval and the estimate as a function of subsample size. A constant
+is taken as converged when the two independent samples agree and the estimate is flat in `N`.
+
+**Table 2.** Convergence of the design constants: original probe vs. a 5× larger independent sample.
+| constant | probe (76.8k) | independent sample (384k), 95% CI | vs. `N` | verdict |
+|---|---|---|---|---|
+| `d*` (participation ratio) | 9.52 | 9.58 [9.54, 9.61] | flat | converged, ≈ 9.5 |
+| `d*` (two-NN) | 9.23 | 9.29 [9.14, 9.45] | mild estimator drift | converged, ≈ 9.3 |
+| burst factor `b` | 1.20 | 1.15 | — | converged |
+| autocorr length `τ_ac` | < 1 batch | < 1 batch | — | converged |
+| one-off rate `ρ_out` | ~10⁻⁵ (slope −0.80) | 1.6×10⁻⁵ (slope −0.87) | power law to 128k, no floor | converged |
+| correlation length `L` | 0.26 | 0.257 / 0.259 | flat | converged, ≈ 0.26 |
+| density skew `R` | — | p99/p1 and log-variance grow with `N` | not flat | **scale-dependent** |
+
+Five constants (`d*`, `b`, `τ_ac`, `ρ_out`, `L`) agree across the two samples and are flat in `N`.
+Two points require care. The correlation length is `L ≈ 0.26` from the neighbor-gradient estimator;
+an earlier value of 0.16 came from a random-pair estimator that is unstable in this dimension and
+is superseded. The density dynamic range `R` is genuinely *not* a fixed constant: both p99/p1 and
+the variance of log-density grow monotonically with sample size (the variance rises from 1.7 at
+5k tiles to 3.1 at 160k), because a `k`-nearest-neighbor estimate's bandwidth shrinks as `N` grows
+and resolves finer structure. The converged, operationally meaningful quantity is the skew at a
+*fixed* bandwidth equal to the bank's resolution: at radius ≈ `L`, the log-density variance is 1.41
+(stable across sample size) and the 90/10 density ratio is ≈ 20. The design does not depend on
+pinning `R`, because the rank/PIT readout (§3.5) is invariant to any monotone rescaling of density.
+
+The same study fixes the resolution scales. The bank's anchor spacing is `s_M ≈ 0.155` (≈ 0.6 `L`),
+but the readout pools `j ≈ 64` anchors, whose enclosing radius — the effective bandwidth — is
+`≈ 0.28 ≈ L`. So although anchors are placed finer than the correlation length, every readout is
+`L`-smoothed, and structure below `L` is unresolvable at this memory budget; this is the ceiling of
+§3.8, and it is set by the pooling bandwidth, not by the finer anchor spacing.
+
+**Offline validation of the bank.** We ran the counted-coverage bank (Algorithm 2, with the
+corrected lifetime exposure) over the 384,000 signatures in stream order and compared its score,
+per tile, against an offline `k`-nearest-neighbor density on the full sample — the best available
+proxy for ground-truth redundancy. With the hit radius set at the covering scale (`s ≈ 0.22`), the
+online score recovers the offline density with **Spearman ρ = 0.75**, on a bounded memory holding
+8,192 of 384,000 tiles; this is close to the ceiling the resolution allows, since the score is an
+`L`-smoothed estimate correlated against a finer reference. The per-anchor rate `λ̂` tracks the
+density at its own location with ρ = 0.72, confirming that the counting itself — not merely the
+kernel smoothing — carries the signal. The bank reaches steady state (8,192 anchors, modest
+turnover).
+
+**Table 3.** Offline bank on 384k signatures: recovery of the offline density vs. the hit radius `s`.
+| hit radius `s` | Spearman(`t`, density) | Spearman(`λ̂`ₐₙ𝒸ₕₒᵣ, density) | anchors | admits/block |
+|---|---|---|---|---|
+| 0.14 | +0.07 | — | 8192 | very high |
+| 0.18 | +0.70 | +0.18 | 8192 | 222 |
+| **0.22** | **+0.75** | **+0.72** | 8192 | 25 |
+| 0.26 | +0.68 | +0.92 | 4967 (underfilled) | ~0 |
+| 0.30 | +0.61 | +0.90 | 2117 (underfilled) | ~0 |
+
+Two controls confirm the design decisions. The normalized (Nadaraya–Watson) readout — which the
+theory of §3.5 predicts collapses toward `p^{1−γ}` — yields ρ ≈ 0, so the unnormalized sum is
+necessary as claimed. And setting the hit radius below the covering radius (`s = 0.14 < s_M`) drives
+constant admission and eviction that prevents the counters from stabilizing, collapsing recovery to
+ρ = 0.07; raising `s` to the covering scale restores it. The single parameter that must be set with
+care is therefore the hit radius, at approximately the covering scale `s_M`. This offline run is the
+prerequisite we place before any training integration (§3.8): it exercises the full mechanism on
+real signatures at low cost, and it is where a readout-inverting error surfaces as a flat,
+uncorrelated score — as the normalized control and the mis-set-radius run both illustrate.
+
+**Portability: which changes invalidate the constants.** The constants above are properties of the
+*signature distribution* — of the composition (encoder × prototypes × data stream) — so it matters
+which configuration changes leave that distribution intact and which do not. Two curator-internal
+knobs leave every constant unchanged. The **bank size `M`** sets only the anchor spacing
+`s_M ∝ M^{−1/d*}` and, through the pooling count, the readout bandwidth; because `d* ≈ 9.5` this
+dependence is very weak (halving `M` coarsens the spacing by ~7.5%, and reaching the `L` ceiling or
+the pooling-locality floor takes order-of-magnitude changes), so `M` is a soft knob over a wide band,
+with the hit radius `s` the only coupled parameter — it must track `s_M`. The **prototype count `K'`**
+also leaves the constants intact provided `K' ≥` the effective prototype rank (measured ≈ 44): the
+signature is then a rotation (`K' = 256`) or a projection that retains the occupied subspace, and the
+intrinsic dimension on which every `d*`-dependent formula rests is preserved. Reducing `K'` below the
+effective rank projects out real structure and does change `d*` and everything downstream; the
+collapse of `R` to effective rank ≈ 44 is evidence that any `K'` in roughly `[64, 256]` behaves
+identically, so an undercomplete choice near 64 is safe and cheaper.
+
+Everything else that alters the learned representation or the stream ordering shifts the constants:
+
+| change | constants affected | note |
+|---|---|---|
+| backbone scale / architecture / SSL recipe | `d*`, `R`, `L`, effective rank | the largest effect; measured at ViT-B, so a ViT-L model — the scale much of the pathology-FM literature uses — will have a different manifold and must be re-measured before porting |
+| training data mix / tissue diversity / QC | `R`, `ρ_out`, mode structure | the single-slice caveat of §3.8; a broader or less-filtered corpus raises the skew and the artifact rate |
+| dataloader: interleave, shard size, batch size, source mixing | `b`, `τ_ac` | burstiness and autocorrelation are properties of the stream *order*; reducing the interleave raises `b` and lengthens `τ_ac`, which the decay half-life must then accommodate |
+| magnification / tile size / augmentation | `d*`, `R` (secondary) | the characterization uses the clean 448→224 tap; heavy train-time augmentation shifts the signature distribution |
+| `R`-training weights (`L_cov`, prototype LR) | effective rank → the `K'` floor | these set how orthogonal and spread the prototypes are |
+
+The practical rule: **`M` and `K' (≥ effective rank)` may be swept freely, but a change of backbone,
+data, or dataloader requires re-running the characterization of §3.7 before the design constants — and
+the parameters `s`, `L`, and the half-life derived from them — can be trusted.** Re-measurement is
+inexpensive (inference-only on cached signatures), and the offline prototype is itself the guard: if
+the constants have drifted under a configuration change, the density-recovery correlation falls, which
+flags the need to re-measure before committing a training run.
+
+### 3.8 Limitations
 
 Three limitations bound the method. First, as noted in §3.5, the estimate is resolution-limited:
 with a fixed memory budget over a support of intrinsic dimension near ten, structure finer than
