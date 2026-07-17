@@ -256,9 +256,9 @@ unlike a nearest-neighbor distance under a cover — retains its dependence on d
   *fill knee*, the value at which seed-on-miss populates exactly `M` anchors (empirically `s ≈ 0.22`
   here; §3.7). This exceeds the covering-radius estimate `s_M ≈ (V/M)^{1/d*} ≈ 0.155` by about 1.4×,
   because seed-on-miss packs anchors at spacing `s` rather than covering at radius `s`; the estimate
-  is a lower bound and `s` should be set empirically. The resulting anchor spacing (≈ 0.6 `L`) is
-  finer than the correlation length, but the readout pools anchors to an effective bandwidth of
-  ≈ `L` (§3.7).
+  is a lower bound and `s` should be set empirically. Because seed-on-miss forces every anchor at
+  least `s` from the others, the *achieved* spacing is ≈ `s` ≈ 0.22 (≈ 0.85 `L`), comparable to the
+  correlation length; the readout then pools anchors to an effective bandwidth of order `L` (§3.7).
 - *Readout.* The local density at a query is read from the counters as an *unnormalized*
   kernel sum of the anchor rates,
   `p̂(x) = Σ_i λ̂_i · K_h(x − b_i)`,
@@ -323,9 +323,9 @@ Algorithm 2  Counted-coverage bank (proposed): update and scoring for one batch 
   return { t(x) : x in this worker's rows }
 ```
 
-A remark on resolution. With `M = 8192` anchors the anchor spacing is finer than the correlation
-length (`s_M ≈ 0.6 L`), but the readout pools `j ≈ 64` anchors to an effective bandwidth of ≈ `L`
-(§3.7), so every readout is `L`-smoothed. Structure finer than `L` is therefore invisible to any
+A remark on resolution. With `M = 8192` anchors the achieved spacing is ≈ 0.85 `L` (set by the seed
+radius `s`; §3.7), and the readout pools `j ≈ 64` anchors to an effective bandwidth of order `L`,
+so every readout is `L`-smoothed. Structure finer than `L` is therefore invisible to any
 bounded summary of this size, whatever its readout; refining it would require exponentially more
 memory or a lower-dimensional signature. This bounds both bank designs equally and is a property
 of the regime, not of either policy.
@@ -391,11 +391,12 @@ and resolves finer structure. The converged, operationally meaningful quantity i
 (stable across sample size) and the 90/10 density ratio is ≈ 20. The design does not depend on
 pinning `R`, because the rank/PIT readout (§3.5) is invariant to any monotone rescaling of density.
 
-The same study fixes the resolution scales. The bank's anchor spacing is `s_M ≈ 0.155` (≈ 0.6 `L`),
-but the readout pools `j ≈ 64` anchors, whose enclosing radius — the effective bandwidth — is
-`≈ 0.28 ≈ L`. So although anchors are placed finer than the correlation length, every readout is
-`L`-smoothed, and structure below `L` is unresolvable at this memory budget; this is the ceiling of
-§3.8, and it is set by the pooling bandwidth, not by the finer anchor spacing.
+The same study fixes the resolution scales. The ideal-tiling estimate `s_M = (V/M)^{1/d*} ≈ 0.155`
+(≈ 0.6 `L`) is a lower bound; because seed-on-miss packs anchors at the seed radius, the *achieved*
+spacing is ≈ 0.22 (≈ 0.85 `L`, the ~1.4× gap of §3.5). The readout pools `j ≈ 64` anchors to an
+effective bandwidth of order `L`, so every readout is `L`-smoothed and structure below `L` is
+unresolvable at this memory budget; this is the ceiling of §3.8, set by the pooling bandwidth, not
+by the anchor spacing.
 
 **Offline validation of the bank.** We ran the counted-coverage bank (Algorithm 2, with the
 corrected lifetime exposure) over the 384,000 signatures in stream order and compared its score,
