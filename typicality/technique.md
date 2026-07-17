@@ -248,12 +248,31 @@ nearest-neighbor distance under a cover — retain their dependence on density.
   density `∝ p^{d*/(d*+2)}`, the classical quantization exponent; Graf and Luschgy, 2000). The
   cell scale is set by the memory budget: with `M` anchors over a `d* ≈ 9.5`-dimensional support
   the achievable scale `s ≈ 0.15` coincides with the density correlation length `L`.
-- *Readout.* The score is read from the counters: `t(x)` is a monotone map of a
-  kernel-weighted, query-centered average of `λ̂_i` over the nearest `j ≈ 32–64` anchors,
-  the centering canceling the leading-order bias of a single-anchor readout. Before the counters
-  have filled, the distance readout of §3.3 serves as a cold-start estimator; once they fill,
-  the counted readout takes over and the distance readout is retained only as a consistency
-  probe.
+- *Readout.* The local density at a query is read from the counters as an *unnormalized*
+  kernel sum of the anchor rates,
+  `p̂(x) = Σ_i λ̂_i · K_h(x − b_i)`,
+  where `K_h` is a smooth, radially symmetric, compactly supported kernel whose bandwidth
+  `h(x)` encloses `j ≈ 32–64` anchors. Summing rather than averaging is essential: each `λ̂_i`
+  is a per-anchor mass, so the sum has expectation `∫ p(y) K_h(x − y) dy`, *independent of the
+  anchor placement density* — the estimate is the same whether anchors are placed proportionally
+  or as a cover, because the number of nearby anchors and the mass each carries are reciprocal
+  and cancel. Normalizing the sum (dividing by `Σ_i K_h`) would cancel the anchor density and
+  instead estimate the mean per-cell mass `∝ p^{1−γ}`, collapsing the density range and
+  vanishing entirely at proportional placement; this is why the readout must be an unnormalized
+  sum. Centering the kernel on the query and using a symmetric profile cancels the leading
+  (gradient) term of the bias exactly — anchors on either side of the query balance — leaving a
+  curvature-order residual, whereas reading only the nearest anchor incurs a first-order,
+  spatially frozen bias of up to half a cell. The bandwidth cannot usefully fall below the
+  storage scale `s ≈ L`, and in `d* ≈ 9.5` a window of `j` anchors already lies within about
+  `1.5×` the local spacing, so pooling costs almost nothing in resolution. The score is the
+  monotone map `t(x) = F̂(log p̂(x))` — the probability integral transform, i.e. the
+  decayed empirical rank of `log p̂(x)` among its values at recent tiles — so that `t` is the
+  fraction of the distribution at lower density than `x` (a density percentile in `[0,1]`) and
+  is invariant to the estimate's unknown multiplicative constant, to error in `d*`, and to
+  exposure normalization. A two-moment probit on `log p̂` is the cheap parametric fallback (the
+  same functional form as the §3.3 scorer, but applied to the log-density rather than to raw
+  distance). Before the counters have filled, the distance readout of §3.3 serves as a
+  cold-start estimator; thereafter it is retained only as a consistency probe.
 - *Eviction and forgetting.* When the anchor set is full, the anchor of lowest traffic rate
   `λ̂_i` is evicted — a least-frequently-used rule with aging — so an anchor that stops receiving
   traffic decays out while active anchors persist. This directly removes the non-eviction of
@@ -273,12 +292,11 @@ Algorithm 2  Counted-coverage bank (proposed): update and scoring for one batch 
 
   gather signatures of X across workers  →  X_global
   for each x in X_global:                                     # score before updating
-      N ← the j anchors nearest to s(x)
       if counters are still filling:
-          t(x) ← monotone( distance readout of §3.3 )          # cold-start
+          t(x) ← distance readout of §3.3                      # cold-start
       else:
-          λ̂(x) ← centered kernel average of { S_i / E_i : i in N }
-          t(x) ← monotone( λ̂(x) )
+          p̂(x) ← Σ_i (S_i / E_i) · K_h( s(x) − b_i )           # unnormalized centered kernel sum
+          t(x) ← F̂( log p̂(x) )                                # decayed empirical rank (PIT)
 
   for each x in X_global:                                      # update after scoring
       i* ← nearest anchor to s(x) ;  E_{i*} ← E_{i*} + 1
