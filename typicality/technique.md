@@ -172,6 +172,21 @@ in the way that matters most: once the bank approximates a cover, the nearest-ne
 with local density, so the typicality score flattens and ceases to distinguish common tiles
 from rare ones — exactly the discrimination the module exists to provide.
 
+Stated in estimator terms, the score of §3.3 is a nearest-neighbor density estimate, and such
+an estimate is faithful only if the bank it queries is itself a representative sample of the
+signature distribution. A representative sample is produced by any *content-independent*
+maintenance rule — retaining the most recent `M` signatures, which is valid here because the
+stream is near-independent at the tile scale (Table 1), or a uniform reservoir over those seen
+— because such a rule evicts by age or at random rather than by position, leaving the surviving
+set distributed as the data. Evict-nearest is content-dependent by construction: it evicts by
+position, which is precisely what drives the bank away from a representative sample and toward
+a cover. The limitation therefore admits two resolutions: restore faithful sampling with a
+content-independent rule, under which the existing distance readout becomes a valid density
+estimate; or estimate density from explicit counts rather than distance. The first is simpler
+and, on the mild stream we measured (§3.5), likely adequate on its own; we nonetheless develop
+the second (§3.5), because explicit counts retain coverage of rare morphology and remain valid
+if the full corpus departs from the mild regime that faithful sampling relies on.
+
 The effect is observable. In an earlier implementation that additionally filled the bank before
 the representation had stabilized — seeding it with diffuse signatures from an untrained encoder
 — the two effects compounded: the seed entries were mutually isolated, were never evicted, and
@@ -326,10 +341,17 @@ target distribution, tightens this coupling relative to the weighted-loss form.
 ### References
 
 Arthur and Vassilvitskii. *k-means++: The Advantages of Careful Seeding.* SODA 2007.
+
 Caron et al. *Emerging Properties in Self-Supervised Vision Transformers.* ICCV 2021.
+
 Chen et al. *Towards a General-Purpose Foundation Model for Computational Pathology (UNI).* Nature Medicine 2024.
+
 Facco et al. *Estimating the Intrinsic Dimension of Datasets by a Minimal Neighborhood Information.* Scientific Reports 2017.
+
 Graf and Luschgy. *Foundations of Quantization for Probability Distributions.* Springer LNM 1730, 2000.
+
 Kornblith et al. *Similarity of Neural Network Representations Revisited.* ICML 2019.
+
 Oquab et al. *DINOv2: Learning Robust Visual Features without Supervision.* TMLR 2024.
+
 Zhou et al. *iBOT: Image BERT Pre-Training with Online Tokenizer.* ICLR 2022.
