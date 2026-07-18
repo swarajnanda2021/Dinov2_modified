@@ -222,7 +222,14 @@ Two counting terms recur below. A *spot* is a small L1 ball of radius `s` around
 the spot radius, fixed by the bank; §3.7). Within a spot we distinguish *tile-crowding* — how many
 streaming tiles land in it, i.e. how common that morphology is — from *anchor-crowding* — how many
 bank entries sit in it, i.e. how the memory happens to be placed. The design turns on keeping these
-two apart. An anchor's *cell* is the spot (ball of radius `s`) around it.
+two apart. An anchor's *cell* is *not* the ball around it but the region for which it is the
+*nearest* anchor, out to radius `s` — its Voronoi cell intersected with the ball of radius `s` — and
+a tile is a hit for its nearest anchor only, never for every anchor within `s` (Algorithm 2). This
+is the load-bearing definition: a Voronoi cell's volume scales as `1/g` (the reciprocal of the local
+anchor-crowding), so an anchor's hit count is `S_i ∝ p · (1/g) = p/g`, tile-crowding divided by
+anchor-crowding — whereas counting *every* tile within a fixed-radius ball would give `S_i ∝ p` and
+break the placement cancellation of the Readout below. At the fill knee, anchors sit ≈ `s` apart, so
+the Voronoi cell lies within the ball and the radius cap rarely binds.
 
 **Table 1.** Design constants of the signature stream, determined on the baseline model (standard
 DINOv2 ViT-B/16, all extensions disabled) over an independent 384,000-tile sample with bootstrap
@@ -246,7 +253,8 @@ connected continuum of intrinsic dimension near ten, the crowding varies only mo
 spots (`R` ≈ 18× at the operating scale `L`; §3.7), and there are no isolated clumps; the
 absorbing-outlier hazard of §3.4 thus has no isolated clumps to attach to, and the design need not
 defend against extreme skew. Second, the stream is near-independent at the tile level (a burst
-factor `b` near 1.2 that decays within one batch — similar tiles do not arrive in long runs) and
+factor `b` near 1.2, and an autocorrelation length `τ_ac` — the lag over which the signature stream
+decorrelates — of under one batch; similar tiles do not arrive in long runs) and
 the signature distribution drifts slowly after activation — by one correlation length only over
 tens of thousands of iterations — so stored statistics can be forgotten by simple exponential decay
 without becoming stale relative to the encoder that produced them.
@@ -313,9 +321,11 @@ common a tile is.
 - *Eviction and forgetting.* When the anchor set is full, the anchor of lowest hit-rate `λ̂_i` is
   evicted — a least-frequently-used rule with aging — so an anchor that stops receiving tiles decays
   out while active anchors persist. This directly removes the non-eviction of §3.4: an isolated
-  anchor accrues no hits and is the first evicted, rather than the last. A transient reserve of order
-  1% of `M`, sized by the measured one-off rate `ρ_out`, holds newly admitted anchors so a one-off
-  tile cannot displace an established anchor before accumulating hits. The counters decay with a
+  anchor accrues no hits and is the first evicted, rather than the last. A transient reserve holds
+  newly admitted anchors so a one-off tile cannot displace an established anchor before accumulating
+  hits; it is sized by the measured one-off rate as `reserve ≈ ρ_out · T_need / M`, which at
+  `ρ_out ≈ 10⁻³` (the L1 value — isolation is metric-dependent, §3.7) and a residency `T_need` of a
+  few hundred blocks is of order 1–2% of `M`. The counters decay with a
   half-life of a few hundred blocks — long relative to the batch autocorrelation, so recurring
   morphology accumulates standing evidence, yet short relative to the drift horizon, so the estimate
   tracks the current distribution.
@@ -358,6 +368,18 @@ readout is smoothed at scale `L`. Structure finer than `L` is therefore invisibl
 summary of this size, whatever its readout; refining it would require exponentially more memory or a
 lower-dimensional signature. This bounds both bank designs equally and is a property of the regime,
 not of either policy.
+
+**Implementation defaults.** For a build-ready specification we fix the four choices left abstract
+above. *Kernel:* an Epanechnikov profile `k(u) = max(0, 1 − u²)` with bandwidth `h(x)` = the L1
+radius to the `j`-th nearest anchor (`j = 64`); the readout is insensitive to the profile (the
+offline study of §3.7 used a truncated Gaussian and gives the same recovery). *Half-life:* 250
+blocks (`η = 0.5^{1/250} ≈ 0.997`) — long relative to the batch autocorrelation, short relative to
+the drift horizon (§3.5); the offline study used 100 blocks with no material difference. *Cold-start
+switchover:* the counted readout activates once the bank is full *and* every anchor has aged at least
+one half-life (median exposure `E ≥ 1/(1−η)`); until then the §3.3 distance readout is used.
+*PIT reference:* a decayed ring buffer of the most recent ≈ 20,000 `log p̂` values, ranked against by
+binary search (this is what §3.7 validated); the two-moment probit on `log p̂` (running mean and
+variance, `t = Φ((log p̂ − m̂)/σ̂)`) is the cheaper fallback that needs no buffer.
 
 ### 3.6 Modulating the objective
 
@@ -456,6 +478,13 @@ hit radius `s` (L1 units; `s_M ≈ 1.97`).
 | 3.15 | +0.70 | +0.91 | 6684 (underfilled) | ~0 |
 | 3.54 | +0.65 | +0.93 | 3178 (underfilled) | ~0 |
 
+The two Spearman columns move in *opposite* directions as `s` grows: the per-anchor rate correlation
+`Spearman(λ̂, density)` rises (0.28 → 0.93) while the readout correlation `Spearman(t, density)` falls
+past the knee (0.75 → 0.65). This is the underfill tradeoff — a larger spot radius gives each anchor a
+bigger catchment and a cleaner per-anchor density estimate, but seeds fewer anchors (the bank drops to
+6,684 then 3,178), leaving it too sparse to cover the space, so the pooled readout coarsens. The knee
+`s = 2.75` is where both are jointly good: a full bank (8,192) and the best readout recovery.
+
 Three controls probe the two load-bearing choices and the hit radius. The one that isolates a design
 decision is the **exposure definition**: replacing the lifetime exposure with the discarded
 traffic-count exposure (§3.5), everything else held at the knee `s = 2.75`, collapses the per-anchor
@@ -480,21 +509,40 @@ mis-set-radius run both illustrate.
 **Portability: which changes invalidate the constants.** The constants above are properties of the
 *signature distribution* — of the composition (encoder × prototypes × data stream) — so it matters
 which configuration changes leave that distribution intact and which do not. Two curator-internal
-knobs leave every constant unchanged. The **bank size `M`** sets only the anchor spacing
-`s_M ∝ M^{−1/d*}` and, through the pooling count, the readout window; because `d* ≈ 9.3` this
-dependence is very weak (halving `M` coarsens the spacing by ~7.5%, and reaching the `L` ceiling or
-the pooling-locality floor takes order-of-magnitude changes), so `M` is a soft knob over a wide band,
-with the hit radius `s` the only coupled parameter — it must be re-tuned to the fill knee, which
-scales with `M` as `s_M` does. The **prototype count `K'`**
-also leaves the constants intact provided `K' ≥` the effective prototype rank (measured ≈ 44): the
-signature is then a rotation (`K' = 256`) or a projection that retains the occupied subspace, and the
-intrinsic dimension on which every `d*`-dependent formula rests is preserved. Reducing `K'` below the
-effective rank projects out real structure and does change `d*` and everything downstream. The
+knobs leave the *dimensionless* constants unchanged; both couple only to the hit radius `s`.
+
+*Bank size `M`.* It sets the anchor spacing `s_M ∝ M^{−1/d*}` and, through the pooling count, the
+readout window. Because `d* ≈ 9.3` this is very weak: over `M ∈ {4096, 8192, 16384}` the fill knee
+moves only `s ≈ {2.97, 2.75, 2.56}` (≈ ±8% per 2×), and reaching the `L` ceiling or the
+pooling-locality floor (`M ≫ j = 64`) takes order-of-magnitude changes. Recovery is essentially
+flat over this band (ρ ≈ 0.72–0.75; §3.7 Table 2 read as an effective-`M` sweep). So changing `M`
+is a config change with `s` the only coupled parameter — either re-tuned by the formula, found
+empirically (sweep `s` until the bank fills to `M`), or, cleanest, **made self-tuning** (adjust `s`
+each step to hold `|B| ≈ M`), which turns `M` into a pure config change. The scratch reserve (~1%
+of `M`), half-life (in blocks), and pooling `j` (a count) all carry over untouched, and no
+re-characterization of §3.7 is needed.
+
+*Prototype count `K'`.* Changing it is also a config change — `L_R` trains any `K'`, no structural
+code change — but it couples more strongly, and has a hard floor. Because the L1 distance sums over
+`K'` coordinates, the distance scale runs roughly *linearly* with `K'`: halving `K'` roughly halves
+`L`, `s_M`, and the fill knee `s`, so `s` needs a ~proportional re-tune (again absorbed by a
+self-tuning `s`). The dimensionless constants stay intact provided `K' ≥` the effective prototype
+rank (measured ≈ 44): the signature is then a rotation (`K' = 256`) or a projection that retains the
+occupied subspace, and the intrinsic dimension on which every `d*`-dependent formula rests is
+preserved; `K'` above 256 is impossible (256 is the orthogonal-frame ceiling, §3.2), and smaller
+`K'` is cheaper (smaller `R`, smaller `cdist`). Reducing `K'` below the effective rank projects out
+real structure and does change `d*` and everything downstream — no longer a config change, but a
+re-characterization. The
 relevant rank here is the ≈ 44 to which an *online-`L_R`* `R` collapses (measured on an `L_R`-active
 run; §3.2) — not the rank-202 synthetic `R` the offline study of §3.7 used as a stand-in. Because the
-intrinsic dimension `d* ≈ 9.3` lies below *both*, the constants are identical at either rank; that
-invariance is exactly why any `K'` in roughly `[64, 256]` behaves the same and an undercomplete choice
-near 64 is safe and cheaper.
+intrinsic dimension `d* ≈ 9.3` lies below *both*, the **dimensionless** constants (`d*`, `R`, `b`) are
+the same at either rank; that invariance is why any `K'` in roughly `[64, 256]` gives the same
+dimensionless regime, and an undercomplete choice near 64 is safe and cheaper. The **distance-valued**
+constants (`L`, `s`, `s_M`), being L1 measurements and L1 not being rotation-invariant, can differ
+between the two `R`'s and must be re-measured on the trained `R` — which the rule below already forces,
+since a change of `R` is a change of the signature distribution. This is the same distinction the
+§3.7 provenance note draws: agreement on the dimensionless constants, no assumed equivalence on the
+distance scales.
 
 Everything else that alters the learned representation or the stream ordering shifts the constants:
 
