@@ -323,9 +323,10 @@ common a tile is.
   out while active anchors persist. This directly removes the non-eviction of §3.4: an isolated
   anchor accrues no hits and is the first evicted, rather than the last. A transient reserve holds
   newly admitted anchors so a one-off tile cannot displace an established anchor before accumulating
-  hits; it is sized by the measured one-off rate as `reserve ≈ ρ_out · T_need / M`, which at
-  `ρ_out ≈ 10⁻³` (the L1 value — isolation is metric-dependent, §3.7) and a residency `T_need` of a
-  few hundred blocks is of order 1–2% of `M`. The counters decay with a
+  hits; it is sized by the arrival rate of one-offs times their residency, `reserve ≈ ρ_out · κ ·
+  T_need / M`, where `κ` is the tiles per block (one-offs arrive at `ρ_out · κ` per block, not
+  `ρ_out`). At `ρ_out ≈ 10⁻³` (the L1 value — isolation is metric-dependent, §3.7), `κ ≈ 10³`, and a
+  residency `T_need` of a few hundred blocks, this is of order a few percent of `M`. The counters decay with a
   half-life of a few hundred blocks — long relative to the batch autocorrelation, so recurring
   morphology accumulates standing evidence, yet short relative to the drift horizon, so the estimate
   tracks the current distribution.
@@ -370,13 +371,17 @@ lower-dimensional signature. This bounds both bank designs equally and is a prop
 not of either policy.
 
 **Implementation defaults.** For a build-ready specification we fix the four choices left abstract
-above. *Kernel:* an Epanechnikov profile `k(u) = max(0, 1 − u²)` with bandwidth `h(x)` = the L1
-radius to the `j`-th nearest anchor (`j = 64`); the readout is insensitive to the profile (the
-offline study of §3.7 used a truncated Gaussian and gives the same recovery). *Half-life:* 250
-blocks (`η = 0.5^{1/250} ≈ 0.997`) — long relative to the batch autocorrelation, short relative to
-the drift horizon (§3.5); the offline study used 100 blocks with no material difference. *Cold-start
-switchover:* the counted readout activates once the bank is full *and* every anchor has aged at least
-one half-life (median exposure `E ≥ 1/(1−η)`); until then the §3.3 distance readout is used.
+above. *Kernel:* a triweight profile `k(u) = (1 − u²)³` on `u ≤ 1` (smooth and compactly supported)
+with bandwidth `h(x)` = the L1 radius to the `j`-th nearest anchor (`j = 64`); the readout is
+insensitive to the profile (the offline study of §3.7 used a truncated Gaussian and gives the same
+recovery). *Half-life:* 250 blocks (`η = 0.5^{1/250} ≈ 0.997`) — long relative to the batch
+autocorrelation, short relative to the drift horizon (§3.5); the offline study used 100 blocks with
+no material difference. *Cold-start switchover:* the counted readout activates once the bank is full
+*and* the median exposure has passed one half-life's accumulation, `median E ≥ 0.5/(1−η)`. (The
+exposure ceiling `1/(1−η)` is approached from below but never reached — a literal `E ≥ 1/(1−η)` test
+would never fire — so the threshold is set at half the ceiling, which is the accumulated `E` at
+exactly one half-life; a *median* avoids waiting on the perpetually-admitted `E = 1` newborns.)
+Until then the §3.3 distance readout is used.
 *PIT reference:* a decayed ring buffer of the most recent ≈ 20,000 `log p̂` values, ranked against by
 binary search (this is what §3.7 validated); the two-moment probit on `log p̂` (running mean and
 variance, `t = Φ((log p̂ − m̂)/σ̂)`) is the cheaper fallback that needs no buffer.
@@ -460,9 +465,13 @@ effective rank 202) — a near-orthonormal frame that stands in for the `L_nn`-a
 grow (`L_nn` pulls the representative prototypes toward exactly these output prototypes). The cached
 signatures are `s = R·z`, and the entire study above — constants and validation — is computed on `s`
 under L1, the bank's metric. (An earlier iteration of this study ran on the bare bottleneck `z` under
-L2; because this `R` is a near-L2-isometry — `‖s₁−s₂‖₂ / ‖z₁−z₂‖₂ = 1.00 ± 0.03` — the two agree on
-the dimensionless constants, and the distance-valued constants simply rescale into L1 units by the
-common factor ≈ 12.7, with all scale *ratios* preserved; the ρ = 0.75 recovery reproduces under both.)
+L2; the tight isometry ratio `‖s₁−s₂‖₂ / ‖z₁−z₂‖₂ = 1.00 ± 0.03` holds *despite* `R`'s condition
+number 25 because the data `z` occupies `R`'s well-conditioned top directions — its ~9.5-dimensional
+manifold sits within them, leaving the ≈ 54 near-null directions of the rank-202 frame essentially
+unpopulated, so `R` acts near-isometrically on the differences that matter. Consequently the two
+metrics agree on the dimensionless constants, the distance-valued constants simply rescale into L1
+units by the common factor ≈ 12.7 with all scale *ratios* preserved, and the ρ = 0.75 recovery
+reproduces under both.)
 One caveat remains, stated as unmeasured: this synthetic `R` has effective rank 202, whereas an
 `L_R`-trained `R` collapses to effective rank ≈ 44 (§3.2), and the study is on the frozen baseline,
 not on the online-`L_R` signatures a training run would grow. Their agreement was not measured; we
@@ -517,10 +526,13 @@ moves only `s ≈ {2.97, 2.75, 2.56}` (≈ ±8% per 2×), and reaching the `L` c
 pooling-locality floor (`M ≫ j = 64`) takes order-of-magnitude changes. Recovery is essentially
 flat over this band (ρ ≈ 0.72–0.75; §3.7 Table 2 read as an effective-`M` sweep). So changing `M`
 is a config change with `s` the only coupled parameter — either re-tuned by the formula, found
-empirically (sweep `s` until the bank fills to `M`), or, cleanest, **made self-tuning** (adjust `s`
-each step to hold `|B| ≈ M`), which turns `M` into a pure config change. The scratch reserve (~1%
-of `M`), half-life (in blocks), and pooling `j` (a count) all carry over untouched, and no
-re-characterization of §3.7 is needed.
+empirically (the fill knee, where admissions per block collapse), or, cleanest, **made self-tuning**.
+The controller must target the *underfill edge* — the largest `s` that still fills the bank to `M`,
+equivalently the smallest admission rate at a full bank — and *not* simply hold `|B| ≈ M`: Table 2
+shows the bank is full across `s ∈ [1.57, 2.75]`, so `|B| = M` alone is a flat signal that admits the
+churning `s = 1.57` (ρ ≈ 0) as readily as the knee `s = 2.75` (ρ = 0.75). Push `s` up until `|B|`
+just begins to drop, then back off. The scratch reserve, half-life (in blocks), and pooling `j` (a
+count) all carry over untouched, and no re-characterization of §3.7 is needed.
 
 *Prototype count `K'`.* Changing it is also a config change — `L_R` trains any `K'`, no structural
 code change — but it couples more strongly, and has a hard floor. Because the L1 distance sums over
