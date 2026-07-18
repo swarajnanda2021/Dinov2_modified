@@ -489,9 +489,12 @@ scales with `M` as `s_M` does. The **prototype count `K'`**
 also leaves the constants intact provided `K' ≥` the effective prototype rank (measured ≈ 44): the
 signature is then a rotation (`K' = 256`) or a projection that retains the occupied subspace, and the
 intrinsic dimension on which every `d*`-dependent formula rests is preserved. Reducing `K'` below the
-effective rank projects out real structure and does change `d*` and everything downstream; the
-collapse of `R` to effective rank ≈ 44 is evidence that any `K'` in roughly `[64, 256]` behaves
-identically, so an undercomplete choice near 64 is safe and cheaper.
+effective rank projects out real structure and does change `d*` and everything downstream. The
+relevant rank here is the ≈ 44 to which an *online-`L_R`* `R` collapses (measured on an `L_R`-active
+run; §3.2) — not the rank-202 synthetic `R` the offline study of §3.7 used as a stand-in. Because the
+intrinsic dimension `d* ≈ 9.3` lies below *both*, the constants are identical at either rank; that
+invariance is exactly why any `K'` in roughly `[64, 256]` behaves the same and an undercomplete choice
+near 64 is safe and cheaper.
 
 Everything else that alters the learned representation or the stream ordering shifts the constants:
 
