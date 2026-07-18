@@ -324,11 +324,16 @@ common a tile is.
 - *Eviction and forgetting.* The bank is split into an **established set** of capacity `M` and a
   separate **reserve** buffer of `≈ reserve` slots on top (total stored `≈ M + reserve`); the
   established set holds the same `M` signatures the distance-calibrated bank holds, for a like-for-like
-  comparison. Established anchors are managed by a least-frequently-used rule with aging: when a
+  comparison. The established set is filled directly — while it holds fewer than `M` anchors,
+  a novel tile (farther than `s` from every anchor) seeds a new established anchor, laying the
+  covering set down first, which is exactly the configuration validated in §3.7; the reserve
+  activates only once the established set is full, which is also when eviction pressure first
+  arises, since a one-off can displace an established anchor only when the set is at capacity.
+  Established anchors are managed by a least-frequently-used rule with aging: when a
   newly graduated anchor would exceed capacity `M`, the anchor of lowest hit-rate `λ̂_i` is evicted, so
   an anchor that stops receiving tiles decays out while active anchors persist. This directly removes
   the non-eviction of §3.4: an isolated anchor accrues no hits and is the first evicted, rather than
-  the last. A novel tile is admitted to the reserve, initialized with `S = 0, E = 0, age = 0` (the
+  the last. Once the established set is full, a novel tile is instead admitted to the reserve, initialized with `S = 0, E = 0, age = 0` (the
   decay-and-age step precedes scoring, so `E ≥ 1` before any anchor is read, and `λ̂ = S/(E+ε)`), so a
   one-off cannot displace an established anchor before accumulating hits. Two rules make the reserve a
   bounded buffer rather than a growing one (Algorithm 2): a newborn *graduates* into the established set
@@ -340,38 +345,50 @@ common a tile is.
   `κ ≈ 10³`, and `T_need` a few hundred blocks, that is ≈ 300 slots — a few percent of `M`. The counters decay with a
   half-life of a few hundred blocks — long relative to the batch autocorrelation, so recurring
   morphology accumulates standing evidence, yet short relative to the drift horizon, so the estimate
-  tracks the current distribution.
+  tracks the current distribution. All tie-breaks — the nearest-anchor argmin, the lowest-`λ̂`
+  eviction, the oldest-reserve eviction, and the `j`-nearest set — resolve by lowest index, so the
+  bank stays byte-identical across workers (as in §3.3).
 
 ```
 Algorithm 2  Counted-coverage bank: update and scoring for one batch X
-             (established capacity M; reserve is a separate buffer of ≈ reserve slots)
+             (established capacity M; the reserve — a separate buffer of ≈ reserve slots —
+              is active only once the established set is full)
 
   if iteration < T_warm:  return t(x) = 0 for all x
 
-  for every live anchor i:                                    # decay, age, expire stale reserve entries
-      S_i ← η · S_i                                           #   S: decayed hits
-      E_i ← η · E_i + 1                                       #   E: decayed lifetime (blocks alive)
+  for every live anchor i:                                     # decay, age, expire stale reserve entries
+      S_i   ← η · S_i                                          #   S: decayed hits
+      E_i   ← η · E_i + 1                                      #   E: decayed lifetime (blocks alive)
       age_i ← age_i + 1
-      if i in reserve and age_i > T_need:  evict i            #   ungraduated one-off expires
+      if i in reserve and age_i > T_need:  evict i             #   ungraduated one-off expires
 
   gather signatures of X across workers  →  X_global
-  for each x in X_global:                                     # score before updating
-      if counters are still filling:
-          t(x) ← distance readout of §3.3                      # cold-start
-      else:
-          p̂(x) ← Σ_i (S_i / (E_i + ε)) · K_h( s(x) − b_i )     # unnormalized centered kernel sum; ε guards E→0
-          t(x) ← F̂( log p̂(x) )                                # decayed empirical rank (PIT)
 
-  for each x in X_global:                                      # update after scoring
-      i* ← nearest anchor to s(x)
-      if ‖s(x) − b_{i*}‖ ≤ s:
-          S_{i*} ← S_{i*} + 1                                  # a hit (exposure was aged above)
+  # ---- score against the pre-update state ----
+  if |established| < M:                                        # bank still building its cover
+      t(x) ← 0 for all x in X_global                           #   module inactive (as in §3.3)
+  else:
+      for each x in X_global:
+          if median over established of E_i  <  0.5/(1−η):     # counters not yet mature
+              t(x) ← distance readout of §3.3 over the established set          # cold-start
+          else:
+              p̂(x) ← Σ_{i ∈ established, j nearest} (S_i / (E_i + ε)) · K_h(s(x) − b_i)   # unnormalized sum
+              t(x) ← F̂( log p̂(x) )                            # decayed empirical rank (PIT)
+
+  # ---- update (runs every block, including fill) ----
+  for each x in X_global:
+      i* ← nearest anchor to s(x)                              # over established ∪ reserve
+      if ‖s(x) − b_{i*}‖ ≤ s:                                  # a hit
+          S_{i*} ← S_{i*} + 1
           if i* in reserve:                                    # graduate on first hit
               if |established| = M:  evict argmin_i S_i/(E_i+ε) over the established set
               move i* from reserve to established set
-      else:                                                    # novel tile: admit to the reserve
-          if reserve is at capacity:  evict its oldest entry
-          new anchor at s(x):  b ← s(x), S ← 0, E ← 0, age ← 0
+      else:                                                    # novel tile
+          if |established| < M:                                # fill phase: seed the cover directly
+              add anchor at s(x) to established:  b ← s(x), S ← 0, E ← 0, age ← 0
+          else:                                                # steady state: stage in the reserve
+              if reserve is at capacity:  evict its oldest entry
+              add anchor at s(x) to reserve:  b ← s(x), S ← 0, E ← 0, age ← 0
 
   return { t(x) : x in this worker's rows }
 ```
@@ -401,7 +418,9 @@ exactly one half-life; a *median* avoids waiting on the perpetually-admitted `E 
 Until then the §3.3 distance readout is used.
 *PIT reference:* a decayed ring buffer of the most recent ≈ 20,000 `log p̂` values, ranked against by
 binary search (this is what §3.7 validated); the two-moment probit on `log p̂` (running mean and
-variance, `t = Φ((log p̂ − m̂)/σ̂)`) is the cheaper fallback that needs no buffer.
+variance, `t = Φ((log p̂ − m̂)/σ̂)`) is the cheaper fallback that needs no buffer. Its running mean and variance are decayed over the
+same recent horizon as the ring (≈ `pit_buffer / batch` ≈ 20 blocks), not the counter half-life, so
+the fallback approximates the same reference the PIT ranks against.
 
 ### 3.6 Modulating the objective
 
@@ -472,12 +491,14 @@ on a bounded memory holding 8,192 of 384,000 tiles; this is close to the ceiling
 allows, since the score is smoothed at scale `L` and correlated against a finer reference. The
 per-anchor rate `λ̂` tracks the density at its own location with ρ = 0.67, confirming that the
 counting itself — not merely the kernel smoothing — carries the signal. The bank reaches steady
-state (8,192 anchors, modest turnover). This run exercises the core mechanism — Voronoi
+state (8,192 anchors, modest turnover). This run exercises the core mechanism — direct seeding of the established set, Voronoi
 hit-counting, lifetime exposure, unnormalized kernel sum, PIT scoring, and least-frequently-used
-eviction — at a single established set of 8,192 anchors; the transient reserve and its graduation
-rule (§3.5), a one-off-protection add-on, were disabled, and newborns were initialized `S = E = 1`
-rather than the `S = E = 0` of §3.5. Those differences are confined to one-off handling and the
-single pre-graduation block, and do not bear on the recovery reported here.
+eviction — at a full established set of 8,192 anchors. Its direct seeding is exactly the fill phase
+of Algorithm 2; what it does not exercise is the steady-state reserve and its graduation rule
+(§3.5), which activate only once the established set is full and serve only to shield established
+anchors from one-off tiles. Newborns were initialized `S = E = 1` rather than the `S = E = 0` of
+§3.5; the offset decays away before the counters mature, so neither difference bears on the
+recovery reported here.
 
 **Provenance of `R`.** The baseline run had typicality disabled, so `L_R` never ran and the
 checkpoint contains no `R`. We therefore constructed a synthetic `R` from the frozen baseline's
