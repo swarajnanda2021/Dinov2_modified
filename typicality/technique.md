@@ -68,23 +68,25 @@ the signature
 s(x) = R · z(x) ∈ ℝ^{K'} ,        s_k(x) = ⟨R_k, z(x)⟩ ,
 ```
 
-the vector of similarities between the tile and each anchor. Signatures are *peaky* for
-well-formed morphology (one anchor dominates) and *diffuse* for representations that resemble
-no anchor (all similarities near the small-angle floor of a random projection), a distinction
-used diagnostically below.
+the vector of similarities between the tile and each representative prototype. Signatures are
+*peaky* for well-formed morphology (one prototype dominates) and *diffuse* for representations
+that resemble no prototype (all similarities near the small-angle floor of a random projection),
+a distinction used diagnostically below. (These `K'` representative prototypes — the rows of `R` —
+are distinct from, and should not be confused with, the *anchors* of the memory bank in §3.5,
+which are stored signatures; the word "anchor" below always denotes a bank entry.)
 
-The anchors are trained online, alongside the backbone but by a dedicated optimizer, to tile
-the occupied region of bottleneck space, using
+The representative prototypes are trained online, alongside the backbone but by a dedicated
+optimizer, to tile the occupied region of bottleneck space, using
 
 ```
 L_R = L_nn + λ_cov · L_cov ,
 ```
 
-where `L_nn` pulls each anchor toward its nearest DINO output prototype, so anchors track the
-morphology directions the model itself has learned, and `L_cov` penalizes the off-diagonal
-entries of `R Rᵀ`, so anchors spread out rather than collapse. The rows of `R` are re-projected
+where `L_nn` pulls each representative prototype toward its nearest DINO output prototype, so they
+track the morphology directions the model itself has learned, and `L_cov` penalizes the off-diagonal
+entries of `R Rᵀ`, so they spread out rather than collapse. The rows of `R` are re-projected
 to the unit sphere after each step, keeping `R` close to an orthonormal frame. Because both the
-anchors and their loss derive from the stop-gradient bottleneck, the signature space is a
+prototypes and their loss derive from the stop-gradient bottleneck, the signature space is a
 passive readout of the representation, not a target the backbone optimizes toward.
 
 ### 3.3 The typicality bank
