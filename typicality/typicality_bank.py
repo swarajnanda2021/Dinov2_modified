@@ -7,6 +7,8 @@ Computes within-bank nearest-neighbor distances for Gaussian calibration of typi
 import torch
 import torch.nn as nn
 
+from .typicality_scorer import TypicalityScorer
+
 
 class TypicalityBank(nn.Module):
     """
@@ -128,3 +130,22 @@ class TypicalityBank(nn.Module):
             'mu': mu,
             'sigma': sigma,
         }
+
+    # ---- Uniform interface (mirrors CountedCoverageBank) so the trainer loop is
+    #      bank-agnostic. update_and_score above is UNCHANGED (Algorithm 1 numerics). ----
+    @torch.no_grad()
+    def score_and_update(self, s_global, current_iteration=0):
+        """Thin wrapper: the unchanged update_and_score + TypicalityScorer.compute_scores,
+        returning t over the gathered batch. Numerically identical to the inline two-step
+        (regression-tested): compute_scores is elementwise, so slicing local rows before or
+        after it gives the same result."""
+        out = self.update_and_score(s_global)
+        if not out['ready']:
+            return {'ready': False, 't': None}
+        t = TypicalityScorer.compute_scores(out['d'], out['mu'], out['sigma'])
+        return {'ready': True, 't': t}
+
+    @torch.no_grad()
+    def sync_fingerprint(self):
+        """Cross-rank state to fingerprint: the bank buffer."""
+        return self.bank.reshape(-1)

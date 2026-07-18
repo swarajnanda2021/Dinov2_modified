@@ -40,7 +40,7 @@ from .helpers import (
     worker_init_fn,
     setup_ddp_model,
 )
-from typicality import RepresentativePrototypes, TypicalityBank, TypicalityScorer
+from typicality import RepresentativePrototypes, TypicalityBank, TypicalityScorer, CountedCoverageBank
 
 
 def _gather_and_compute_weights(patch_tokens, mask, masks_weight=None):
@@ -427,14 +427,28 @@ def train_dinov2(args):
         )
         repr_protos = repr_protos.cuda()
 
-        typicality_bank = TypicalityBank(
-            M=args.typicality_bank_size,
-            K_prime=args.typicality_K_prime,
-            replace_fraction=args.typicality_replace_fraction,
-        )
+        if getattr(args, 'typicality_bank', 'distance') == 'counted':
+            typicality_bank = CountedCoverageBank(
+                M=args.typicality_bank_size,
+                K_prime=args.typicality_K_prime,
+                spot_radius=args.typicality_spot_radius,
+                pool_j=args.typicality_pool_j,
+                halflife_blocks=args.typicality_halflife_blocks,
+                reserve_residency=args.typicality_reserve_residency,
+                reserve_size=args.typicality_reserve_size,
+                readout=args.typicality_readout,
+                pit_buffer=args.typicality_pit_buffer,
+            )
+        else:
+            typicality_bank = TypicalityBank(
+                M=args.typicality_bank_size,
+                K_prime=args.typicality_K_prime,
+                replace_fraction=args.typicality_replace_fraction,
+            )
         typicality_bank = typicality_bank.cuda()
 
         print(f"Created Typicality Dampening:")
+        print(f"  Bank variant: {getattr(args, 'typicality_bank', 'distance')}")
         print(f"  K' = {args.typicality_K_prime}, Bank M = {args.typicality_bank_size}")
         print(f"  Modulation: {args.typicality_modulation}")
         print(f"  Warmup: {args.typicality_warmup_iters} iterations")
@@ -997,22 +1011,19 @@ def train_dinov2(args):
                     # Compute morphology signatures (local, detached)
                     s_batch = repr_protos.compute_signatures(z_global1)
 
-                    # Global bank: all-gather signatures so the evict-nearest churn runs
-                    # on the full gathered batch identically on every rank (rank order
-                    # preserved -> banks stay byte-identical, multi-node). The gate is
-                    # iteration-based/rank-invariant, so all ranks reach the collective.
+                    # Bank-agnostic (distance / counted, selected by --typicality_bank).
+                    # All-gather signatures so the bank runs identically on every rank (rank
+                    # order preserved -> byte-identical, fingerprint-checked below). The bank
+                    # returns t over the gathered batch; take this rank's local rows for the
+                    # local loss. The gate is iteration-based/rank-invariant, so all ranks
+                    # reach the collective together.
                     s_global = _all_gather_signatures(s_batch.detach())
-                    bank_output = typicality_bank.update_and_score(s_global)
-                    if bank_output['ready'] and current_iteration % 2000 == 0:
-                        _assert_bank_synced(typicality_bank.bank, tag=f"@it{current_iteration}")
+                    out = typicality_bank.score_and_update(s_global, current_iteration)
+                    if out['ready'] and current_iteration % 2000 == 0:
+                        _assert_bank_synced(typicality_bank.sync_fingerprint(), tag=f"@it{current_iteration}")
 
-                    if bank_output['ready'] and current_iteration >= args.typicality_warmup_iters:
-                        # d is over the gathered batch; take this rank's local rows to
-                        # weight the local loss.
-                        d_local = _local_rows(bank_output['d'], batch_size)
-                        t = TypicalityScorer.compute_scores(
-                            d_local, bank_output['mu'], bank_output['sigma']
-                        )
+                    if out['ready'] and current_iteration >= args.typicality_warmup_iters:
+                        t = _local_rows(out['t'], batch_size)
 
                         if args.typicality_modulation == 'adaptive_temp':
                             typicality_temperatures = TypicalityScorer.adaptive_temperature(
@@ -1453,6 +1464,11 @@ def train_dinov2(args):
                     save_dict['R_optimizer'] = R_optimizer.state_dict()
                 if typicality_bank is not None:
                     save_dict['typicality_bank'] = typicality_bank.state_dict()
+                    # Counted-coverage bank health (logged per checkpoint).
+                    if hasattr(typicality_bank, 'stats'):
+                        _st = typicality_bank.stats()
+                        print(f"  [counted bank] n_est={_st['n_est']}/{args.typicality_bank_size} "
+                              f"reserve={_st['n_reserve']} graduations={_st['graduations']}")
 
             if fp16_scaler is not None:
                 save_dict['fp16_scaler'] = fp16_scaler.state_dict()
