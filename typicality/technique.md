@@ -188,21 +188,20 @@ cover, the nearest-neighbor distance `d(x)` is close to the cover's spacing almo
 no longer varies with crowding, so the typicality score flattens and ceases to distinguish common
 tiles from rare ones — exactly the discrimination the module exists to provide.
 
-Stated in estimator terms, reading crowding from the distance to the single nearest stored
-signature is faithful only if the bank is itself a representative *sample* of the signature
-distribution — a set distributed like the data. Such a sample is produced by any *content-independent*
-maintenance rule — one that evicts by age or at random rather than by position — for instance
-retaining the most recent `M` signatures (valid here because the stream is near-independent at the
-tile scale, Table 1) or a uniform reservoir over those seen; the surviving set is then distributed
-as the data. Evict-nearest is content-dependent by construction: it evicts by position, which is
-precisely what drives the bank away from a sample and toward a cover. There are correspondingly two
-ways to keep the crowding estimate faithful, and they are the two bank variants. A content-independent
-maintenance rule — age or random eviction, for instance retaining the most recent `M` signatures
-(valid here because the stream is near-independent at the tile scale, Table 1) — keeps the bank a
-sample, under which the distance readout of §3.3 is valid; on the mild stream measured here it is
-adequate on its own. The counted-coverage bank of §3.5 instead reads crowding from explicit counts,
-which retain coverage of rare morphology and stay valid if the full corpus departs from the mild
-regime that faithful sampling relies on.
+Stated in estimator terms, the distance readout of §3.3 is a valid crowding estimate only when the
+bank is a representative *sample* of the signature distribution — a set distributed like the data —
+which requires a *content-independent* maintenance rule (eviction by age or at random, e.g. retaining
+the most recent `M` signatures; valid here because the stream is near-independent at the tile scale,
+Table 1), under which the surviving set is distributed as the data. Evict-nearest is content-dependent
+— it evicts by position — which drives the bank away from a sample and toward a cover, degrading the
+readout as the preceding paragraph shows. The distance-calibrated variant is therefore the baseline
+whose failure mode motivates the counted-coverage variant. There are two remedies for this, and they
+are *not* the two bank variants. (i) A content-independent maintenance rule restores faithfulness with
+the existing distance readout, and on the mild stream measured here is adequate on its own — but it is
+an alternative maintenance rule, not one of the two evaluated variants. (ii) The counted-coverage bank
+(§3.5) reads crowding from explicit counts, which is faithful regardless of maintenance and retains
+coverage of rare morphology, and stays valid if the full corpus departs from the mild regime that
+faithful sampling relies on; this is the second variant, and the one developed here.
 
 The failure mode is directly observable. Seeding the bank before the representation stabilizes — with
 diffuse signatures from an untrained encoder — compounds the two effects: the seed entries are
