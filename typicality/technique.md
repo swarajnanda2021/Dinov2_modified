@@ -32,6 +32,114 @@ score, and multiplies the DINO cross-entropy by a factor that decreases with typ
 patch-level iBOT objective is left unmodulated, so dense per-patch supervision is preserved
 while the image-level objective is rebalanced toward rare morphology.
 
+### Notation and terminology
+
+*Symbols used in §3, grouped by role; constant values are in Table 1 and the Implementation
+defaults, not repeated here. Two kinds of "prototype" recur and are kept distinct throughout: an
+**output prototype** is one of the DINO head's `out_dim = 65,536` output-layer directions (the
+model's own), a **representative prototype** is one of the 256 rows of `R`, and an **anchor** is
+neither — it is a stored signature in the counted-coverage bank.*
+
+**Representation and signature**
+| Symbol | Meaning |
+|---|---|
+| `z(x)` | student DINO-head bottleneck for tile `x` (256-d, unit-norm, stop-gradient) |
+| `R` | representative-prototype matrix (`K'×256`, unit-norm rows) |
+| representative prototype | a row of `R` |
+| output prototype | one of the DINO head's `out_dim = 65,536` output directions |
+| `s(x) = R·z(x)` | the signature: the `K'`-vector of cosines to the representative prototypes |
+| `K'` | number of representative prototypes |
+
+**The bank (both variants)**
+| Symbol | Meaning |
+|---|---|
+| `B` | the bank — the stored signatures (distance-calibrated) or the anchor set (counted-coverage) |
+| `M` | bank capacity (established anchors, counted-coverage) |
+| anchor | a stored signature in the counted-coverage bank |
+| established set / reserve | the counted-coverage bank's main store and its transient staging buffer |
+| `N` | total tiles seen over training (order `10⁸`) |
+| block | one update step — one processing of a gathered batch (the unit half-lives are quoted in) |
+
+**Distance-calibrated bank (§3.3)**
+| Symbol | Meaning |
+|---|---|
+| `d(x)` | L1 distance from `s(x)` to its nearest stored signature |
+| `μ_B, σ_B` | mean and standard deviation of the within-bank nearest-neighbour distances |
+| `Φ` | standard normal CDF |
+| `t(x)` | typicality score, `∈ [0,1]` (high = typical, low = rare) |
+
+**Counted-coverage bank (§3.5)**
+| Symbol | Meaning |
+|---|---|
+| `p` | tile-crowding — the local density of tiles (the §3.7 "density" reference) |
+| `g` | anchor-crowding — the local density of anchors |
+| `s` | spot / hit radius (set at the fill knee) |
+| `S_i, E_i` | anchor `i`'s decayed hit count and decayed exposure (lifetime in blocks) |
+| `λ̂_i = S_i/E_i` | anchor `i`'s decayed hit-rate |
+| `p̂(x)` | estimated tile-crowding at `x` (the unnormalised kernel sum) |
+| `K_h, h` | pooling kernel (triweight) and its bandwidth |
+| `j` | number of anchors pooled in the readout |
+| `η` | per-block decay factor (`= 0.5^{1/H}`, half-life `H`) |
+| `ε` | numerical guard in `λ̂ = S/(E+ε)` |
+| `κ` | tiles per block |
+
+**Stream constants (Table 1; §3.7)**
+| Symbol | Meaning |
+|---|---|
+| `d*` | intrinsic dimension of the signature cloud |
+| `L` | correlation length — L1 distance over which crowding changes appreciably |
+| `b` | tile burst factor |
+| `ρ_out` | one-off (artifact) rate |
+
+(The local-density dynamic range, ≈ 18× at scale `L`, is written descriptively, not with a symbol
+— see the definitions below.)
+
+**Modulation (§3.6)**
+| Symbol | Meaning |
+|---|---|
+| `w(x) = 1 − β·t(x)` | weighted-loss multiplier on the DINO term |
+| `τ(x) = τ_base·(1 + α·t(x))` | per-tile student temperature |
+| `α, β` | modulation strengths |
+
+**Terminology.**
+
+- **Density / tile-crowding (`p`).** The local density of tiles in signature space — how many land
+  near a point per unit volume. The offline "density" reference and the design's "tile-crowding"
+  are the same quantity; redundant morphology is high `p`, rare morphology low `p`.
+- **Cover vs sample.** A *sample* is a point set drawn like the data, so its local point density
+  matches the data density `p`. A *cover* is a point set chosen to fill the occupied region evenly
+  (controlled spacing), so its nearest-neighbour distance reflects the cover's spacing, not `p`.
+  Reading crowding from a nearest-neighbour distance is valid for a sample, not a cover — the
+  distinction §3.4 turns on.
+- **Voronoi cell.** The region of signature space closer to a given anchor than to any other
+  anchor. The counted-coverage bank assigns each tile to its nearest anchor, so an anchor's
+  catchment — the tiles it counts as hits — is its Voronoi cell, capped at radius `s`. A Voronoi
+  cell's volume scales as `1/g`, which is what makes the hit count `S ∝ p/g`.
+- **Intrinsic dimension (`d*`).** The number of effective coordinates the signatures actually
+  occupy, far below the ambient 256; estimated from the ratio of first- to second-nearest-neighbour
+  distances (Facco et al., 2017). Every `d*`-dependent formula rests on it.
+- **Correlation length (`L`).** The L1 distance over which the log-density (crowding) field changes
+  appreciably. Below `L` the field has no structure a bounded bank can resolve, which sets the
+  readout's pooling scale.
+- **Local-density dynamic range.** How much the crowding `p` varies from the emptiest to the
+  densest regions, measured at a fixed scale; ≈ 18× at radius `L` (the 90/10 density ratio; Table
+  1). It is a measured property of the stream, not a tuning knob.
+- **Probability integral transform (PIT).** Mapping a value through its own cumulative distribution
+  to its percentile, giving a score uniform on `[0,1]`. The counted-coverage bank scores a tile by
+  the percentile of its log-crowding among recent tiles, so the score is invariant to the crowding
+  estimate's unknown scale.
+- **Kernel and bandwidth (`K_h`, `h`).** A smooth, radially symmetric, compactly supported weight
+  that falls off with distance; its bandwidth `h` is the radius enclosing the `j` nearest anchors.
+  The readout is a kernel-weighted sum over those anchors.
+- **Effective rank.** The number of significant directions of a matrix (participation ratio of its
+  singular values). Used for `R`: an `L_R`-trained `R` collapses to effective rank ≈ 44, whereas
+  the synthetic frame of §3.7 has effective rank 202.
+- **Exposure — lifetime vs traffic (`E`).** *Lifetime* exposure counts the blocks an anchor has
+  been alive (a clock); *traffic* exposure would count the tiles routed to it. The design uses
+  lifetime, so `λ̂ = S/E` retains its dependence on crowding (§3.5).
+- **Stop-gradient.** Detaching a tensor from the backward pass so no gradient flows through it. The
+  entire typicality path is stop-gradient, so it never perturbs the backbone.
+
 ### 3.1 Overview
 
 The module has three stages, applied in sequence to each tile `x` in the batch.
@@ -238,22 +346,22 @@ the Voronoi cell lies within the ball and the radius cap rarely binds.
 DINOv2 ViT-B/16, all extensions disabled) over an independent 384,000-tile sample with bootstrap
 95% confidence intervals (§3.7), and the design quantity each fixes. Distance-valued constants
 (`L`, and the spacings below) are in L1 units on the signatures `s = R·z`, the metric the bank
-queries in (§3.7); the dimensionless constants (`d*`, `R`, `b`) are metric-invariant.
+queries in (§3.7); the dimensionless constants (`d*`, the dynamic range, `b`) are metric-invariant.
 | Property | Symbol | Value (95% CI) | Design role |
 |---|---|---|---|
 | Intrinsic dimension | `d*` | 9.3 [9.1–9.4] | readout viability; cell scale |
-| Local-density dynamic range | `R` | scale-dependent; ≈ 18 at radius `L` | operating regime (moderate) |
+| Local-density dynamic range | — | scale-dependent; ≈ 18 at radius `L` | operating regime (moderate) |
 | Mode structure | — | connected continuum, no dominant mode | removes the isolated-outlier hazard |
 | Tile-level burst factor | `b` | ≈ 1.2 (decays within one batch) | permits exponential forgetting |
 | Log-density correlation length | `L` | 3.34 | sets the readout bandwidth |
 | One-off (artifact) rate | `ρ_out` | ≈ 10⁻³ (no floor) | sizes the transient reserve |
 
 In Table 1, `d*` is the intrinsic dimension — the number of effective directions the signatures
-actually occupy (far below the ambient 256); `R` is how much the tile-crowding varies from the
+actually occupy (far below the ambient 256); the dynamic range is how much the tile-crowding varies from the
 emptiest to the most crowded spots; and `L` is the correlation length — the L1 distance over which
 crowding changes appreciably. Two structural findings guide the design. First, the support is a
 connected continuum of intrinsic dimension near ten, the crowding varies only moderately across
-spots (`R` ≈ 18× at the operating scale `L`; §3.7), and there are no isolated clumps; the
+spots (≈ 18× at the operating scale `L`; §3.7), and there are no isolated clumps; the
 absorbing-outlier hazard of §3.4 thus has no isolated clumps to attach to, and the design need not
 defend against extreme skew. Second, the stream is near-independent at the tile level (a burst
 factor `b` near 1.2, and an autocorrelation length `τ_ac` — the lag over which the signature stream
@@ -406,7 +514,7 @@ not of either policy.
 
 **Implementation defaults.** For a build-ready specification we fix the four choices left abstract
 above. *Kernel:* a triweight profile `k(u) = (1 − u²)³` on `u ≤ 1` (smooth and compactly supported)
-with bandwidth `h(x)` = the L1 radius to the `j`-th nearest anchor (`j = 64`); the readout is
+with bandwidth `h(x)` = the L1 radius to the `j`-th nearest anchor (`j = 64`); `j = 64` is the value in the 32–64 range at which the pooling radius reaches `L` — the 64th-nearest anchor sits at L1 ≈ 3.5 ≈ `L` (§3.7), so the readout pools over exactly one correlation length, the scale below which the crowding field has no structure; the readout is
 insensitive to the profile (the offline study of §3.7 used a truncated Gaussian and gives the same
 recovery). *Half-life:* 250 blocks (`η = 0.5^{1/250} ≈ 0.997`) — long relative to the batch
 autocorrelation, short relative to the drift horizon (§3.5); the offline study used 100 blocks with
@@ -467,12 +575,12 @@ from k-nearest-neighbor density; the burst factor from the signature autocorrela
 run-lengths in arrival order; the correlation length from the log-density field; and the one-off
 rate from the isolation rate as a function of sample size. Two points on the estimators. The
 correlation length is `L ≈ 3.34` (L1 units) from a neighbor-gradient estimator; a random-pair
-estimator is unstable in this dimension. The density range `R` is not a fixed constant: both p99/p1
+estimator is unstable in this dimension. The density dynamic range is not a fixed constant: both p99/p1
 and the variance of log-density grow with sample size, because a `k`-nearest-neighbor estimate's
 bandwidth shrinks as `N` grows and resolves finer structure. The converged, operationally meaningful
 quantity is the skew at a *fixed* bandwidth equal to the bank's resolution: at radius ≈ `L` the
 log-density variance is 1.33 and the 90/10 density ratio is ≈ 18 (Table 1), stable across sample
-size. The design does not depend on pinning `R`, because the rank/PIT readout (§3.5) is invariant to
+size. The design does not depend on pinning the dynamic range, because the rank/PIT readout (§3.5) is invariant to
 any monotone rescaling of crowding.
 
 The same study fixes the resolution scales (L1 units on `s`). The ideal-tiling estimate
@@ -590,7 +698,7 @@ real structure and does change `d*` and everything downstream — no longer a co
 re-characterization. The
 relevant rank here is the ≈ 44 to which an *online-`L_R`* `R` collapses (measured on an `L_R`-active
 run; §3.2) — not the rank-202 synthetic `R` the offline study of §3.7 used as a stand-in. Because the
-intrinsic dimension `d* ≈ 9.3` lies below *both*, the **dimensionless** constants (`d*`, `R`, `b`) are
+intrinsic dimension `d* ≈ 9.3` lies below *both*, the **dimensionless** constants (`d*`, the dynamic range, `b`) are
 the same at either rank; that invariance is why any `K'` in roughly `[64, 256]` gives the same
 dimensionless regime, and an undercomplete choice near 64 is safe and cheaper. The **distance-valued**
 constants (`L`, `s`, `s_M`), being L1 measurements and L1 not being rotation-invariant, can differ
@@ -603,10 +711,10 @@ Everything else that alters the learned representation or the stream ordering sh
 
 | change | constants affected | note |
 |---|---|---|
-| backbone scale / architecture / SSL recipe | `d*`, `R`, `L`, effective rank | the largest effect; measured at ViT-B, so a ViT-L model — the scale much of the pathology-FM literature uses — will have a different manifold and must be re-measured before porting |
-| training data mix / tissue diversity / QC | `R`, `ρ_out`, mode structure | the single-slice caveat of §3.8; a broader or less-filtered corpus raises the skew and the artifact rate |
+| backbone scale / architecture / SSL recipe | `d*`, dynamic range, `L`, effective rank | the largest effect; measured at ViT-B, so a ViT-L model — the scale much of the pathology-FM literature uses — will have a different manifold and must be re-measured before porting |
+| training data mix / tissue diversity / QC | dynamic range, `ρ_out`, mode structure | the single-slice caveat of §3.8; a broader or less-filtered corpus raises the skew and the artifact rate |
 | dataloader: interleave, shard size, batch size, source mixing | `b`, `τ_ac` | burstiness and autocorrelation are properties of the stream *order*; reducing the interleave raises `b` and lengthens `τ_ac`, which the decay half-life must then accommodate |
-| magnification / tile size / augmentation | `d*`, `R` (secondary) | the characterization uses the clean 448→224 tap; heavy train-time augmentation shifts the signature distribution |
+| magnification / tile size / augmentation | `d*`, dynamic range (secondary) | the characterization uses the clean 448→224 tap; heavy train-time augmentation shifts the signature distribution |
 | `R`-training weights (`L_cov`, prototype LR) | effective rank → the `K'` floor | these set how orthogonal and spread the prototypes are |
 
 The practical rule: **`M` and `K' (≥ effective rank)` may be swept freely, but a change of backbone,
