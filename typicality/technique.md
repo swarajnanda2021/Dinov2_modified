@@ -323,10 +323,13 @@ common a tile is.
   out while active anchors persist. This directly removes the non-eviction of §3.4: an isolated
   anchor accrues no hits and is the first evicted, rather than the last. A transient reserve holds
   newly admitted anchors so a one-off tile cannot displace an established anchor before accumulating
-  hits; it is sized by the arrival rate of one-offs times their residency, `reserve ≈ ρ_out · κ ·
-  T_need / M`, where `κ` is the tiles per block (one-offs arrive at `ρ_out · κ` per block, not
-  `ρ_out`). At `ρ_out ≈ 10⁻³` (the L1 value — isolation is metric-dependent, §3.7), `κ ≈ 10³`, and a
-  residency `T_need` of a few hundred blocks, this is of order a few percent of `M`. The counters decay with a
+  hits, with two rules that make it a bounded buffer rather than a growing one (Algorithm 2): a
+  newborn *graduates* out of the reserve into the established set on its first hit, and an ungraduated
+  anchor whose age exceeds the residency `T_need` is evicted. Its steady-state occupants are therefore
+  the non-graduating one-offs, and its size is their arrival rate times their residency,
+  `reserve ≈ ρ_out · κ · T_need`, where `κ` is the tiles per block (one-offs arrive at `ρ_out · κ` per
+  block, not `ρ_out`). At `ρ_out ≈ 10⁻³` (the L1 value — isolation is metric-dependent, §3.7),
+  `κ ≈ 10³`, and `T_need` a few hundred blocks, that is ≈ 300 slots — a few percent of `M`. The counters decay with a
   half-life of a few hundred blocks — long relative to the batch autocorrelation, so recurring
   morphology accumulates standing evidence, yet short relative to the drift horizon, so the estimate
   tracks the current distribution.
@@ -336,9 +339,11 @@ Algorithm 2  Counted-coverage bank (proposed): update and scoring for one batch 
 
   if iteration < T_warm:  return t(x) = 0 for all x
 
-  for every live anchor i:                                    # decay, and age the exposure
+  for every live anchor i:                                    # decay, age, expire stale reserve entries
       S_i ← η · S_i                                           #   S: decayed hits
       E_i ← η · E_i + 1                                       #   E: decayed lifetime (blocks alive)
+      age_i ← age_i + 1
+      if i in reserve and age_i > T_need:  evict i            #   ungraduated one-off expires
 
   gather signatures of X across workers  →  X_global
   for each x in X_global:                                     # score before updating
@@ -352,9 +357,10 @@ Algorithm 2  Counted-coverage bank (proposed): update and scoring for one batch 
       i* ← nearest anchor to s(x)
       if ‖s(x) − b_{i*}‖ ≤ s:
           S_{i*} ← S_{i*} + 1                                  # a hit (exposure was aged above)
+          if i* in reserve:  move i* to the established set    # graduate on first hit
       else:
-          admit a new anchor at s(x) into the transient reserve
-          if the anchor set is full:  evict argmin_i S_i/E_i outside the reserve
+          admit a new anchor at s(x) into the reserve, age ← 0
+          if the established set is full:  evict argmin_i S_i/E_i over the established set
 
   return { t(x) : x in this worker's rows }
 ```
