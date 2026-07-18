@@ -1,10 +1,9 @@
 # Typicality Dampening
 
 *Method section (manuscript draft). This document describes the typicality-dampening module:
-the morphology-signature representation it operates on, the memory bank at its core as
-currently implemented, a structural limitation of that bank, a proposed alternative that
-addresses the limitation, and the two ways the module's output modulates the learning
-objective. The two bank designs and the two modulations define the four configurations
+the morphology-signature representation it operates on, two interchangeable memory-bank variants
+that turn a signature into a typicality score, and the two ways that score modulates the learning
+objective. The two bank variants crossed with the two modulations define the four configurations
 evaluated in Section 4. Quantitative statements are inference-only measurements on a baseline
 ViT-B/16 DINOv2 model with all extensions of this work disabled; the empirical basis is
 described in §3.3 and full protocols are given in Appendix A.*
@@ -49,11 +48,14 @@ The module has three stages, applied in sequence to each tile `x` in the batch.
 
 Throughout, a signature is a 256-dimensional vector, the bank is a set of such vectors, and every
 "nearby" or "distance" below is an L1 distance between signatures (a `cdist`); "crowded" means many
-stored signatures fall within a short L1 distance. The signature (§3.2) and the modulation (§3.6)
-are shared across all configurations of the method. The memory bank is the component that varies:
-§3.3 describes the bank as currently implemented, §3.4 identifies a structural limitation of it,
-and §3.5 describes a proposed alternative. The two bank designs, crossed with the two modulations,
-give the four configurations studied in Section 4.
+stored signatures fall within a short L1 distance. The signature construction (§3.2) and the
+modulation (§3.6) are common to the whole method; the bank comes in two interchangeable variants.
+The **distance-calibrated bank** (§3.3) scores a tile by the calibrated distance to its nearest
+stored signature; the **counted-coverage bank** (§3.5) scores it from explicit hit counts on a
+covering set of anchors. §3.4 is the estimator analysis that relates the two — it identifies the
+regime in which the distance readout is a valid crowding estimate, and the maintenance rule under
+which it is not, which is what the counted-coverage variant is designed for. The two banks, crossed
+with the two modulations (§3.6), give the four configurations studied in Section 4.
 
 ### 3.2 Morphology signatures
 
@@ -100,7 +102,7 @@ of `R` are grown online by `L_R` above (the DINO output prototypes it references
 `out_dim = 65,536`); the offline study of §3.7 instead uses a frozen baseline with no online `L_R`,
 as detailed there.
 
-### 3.3 The typicality bank
+### 3.3 The distance-calibrated bank
 
 The score measures how crowded a tile's neighborhood is: how many stored signatures sit close to it
 in L1 distance. Let the tile stream have length `N` — the total number of tiles seen over training,
@@ -157,7 +159,7 @@ nodes. Two health statistics — the fraction of the bank that is diffuse and th
 tiles scored extremely rare — are logged throughout training. Algorithm 1 states the procedure.
 
 ```
-Algorithm 1  Typicality bank (implemented): update and scoring for one batch X
+Algorithm 1  Distance-calibrated bank: update and scoring for one batch X
 
   if iteration < T_warm:                                # signatures not yet stable
       return t(x) = 0 for all x                          #   module inactive
@@ -175,9 +177,9 @@ Algorithm 1  Typicality bank (implemented): update and scoring for one batch X
   return { t(x) : x in this worker's rows }
 ```
 
-### 3.4 A limitation: non-eviction of isolated signatures
+### 3.4 Bank maintenance and the crowding estimate
 
-The evict-nearest rule has a structural consequence. An entry that is far from all others is,
+The evict-nearest rule of §3.3 has a structural consequence. An entry that is far from all others is,
 by definition, never the nearest neighbor of an incoming tile, and so is never selected for
 eviction: isolated entries are absorbing. Over training the bank therefore drifts toward an even
 grid that fills the occupied space (a *cover*) rather than a set distributed like the data itself
@@ -193,30 +195,32 @@ maintenance rule — one that evicts by age or at random rather than by position
 retaining the most recent `M` signatures (valid here because the stream is near-independent at the
 tile scale, Table 1) or a uniform reservoir over those seen; the surviving set is then distributed
 as the data. Evict-nearest is content-dependent by construction: it evicts by position, which is
-precisely what drives the bank away from a sample and toward a cover. The limitation therefore
-admits two resolutions: restore faithful sampling with a content-independent rule, under which the
-existing distance readout becomes valid; or read crowding from explicit counts rather than distance.
-The first is simpler and, on the mild stream we measured (§3.5), likely adequate on its own; we
-nonetheless develop the second (§3.5), because explicit counts retain coverage of rare morphology
-and remain valid if the full corpus departs from the mild regime that faithful sampling relies on.
+precisely what drives the bank away from a sample and toward a cover. There are correspondingly two
+ways to keep the crowding estimate faithful, and they are the two bank variants. A content-independent
+maintenance rule — age or random eviction, for instance retaining the most recent `M` signatures
+(valid here because the stream is near-independent at the tile scale, Table 1) — keeps the bank a
+sample, under which the distance readout of §3.3 is valid; on the mild stream measured here it is
+adequate on its own. The counted-coverage bank of §3.5 instead reads crowding from explicit counts,
+which retain coverage of rare morphology and stay valid if the full corpus departs from the mild
+regime that faithful sampling relies on.
 
-The effect is observable. In an earlier implementation that additionally filled the bank before
-the representation had stabilized — seeding it with diffuse signatures from an untrained encoder
-— the two effects compounded: the seed entries were mutually isolated, were never evicted, and
-at the end of training occupied 78% of the bank, whose signatures formed a bimodal distribution
-(a diffuse cluster at the random-projection floor and a smaller peaky remainder). Every real
-tile then scored far from this bank, the typicality score was nearly constant across the stream,
-and the modulation was effectively inert. Deferring the fill to `T_warm` (§3.3) removes the
-seeding component of this failure, but not its cause: the non-eviction of isolated entries is a
-property of the evict-nearest rule itself and persists for any admission schedule. The design in
-§3.5 is motivated by removing it.
+The failure mode is directly observable. Seeding the bank before the representation stabilizes — with
+diffuse signatures from an untrained encoder — compounds the two effects: the seed entries are
+mutually isolated, are never evicted, and by the end of training occupy 78% of the bank, whose
+signatures form a bimodal distribution (a diffuse cluster at the random-projection floor and a
+smaller peaky remainder). Every real tile then scores far from this bank, the typicality score is
+nearly constant across the stream, and the modulation is inert. Deferring the fill to `T_warm`
+(§3.3) removes the seeding component but not its cause: the non-eviction of isolated entries is a
+property of the evict-nearest rule itself and persists for any admission schedule — which is what
+the counted-coverage bank removes.
 
-### 3.5 A proposed alternative: the counted-coverage bank
+### 3.5 The counted-coverage bank
 
-We describe a bank design, not yet implemented, that retains a covering set of anchors but reads
-crowding from explicit hit counts rather than from nearest-neighbor distance, thereby removing the
-non-eviction pathology of §3.4. Its parameters are fixed by a direct characterization of the tile
-stream, summarized in Table 1 and determined and validated in §3.7.
+The counted-coverage bank retains a covering set of anchors but reads crowding from explicit hit
+counts rather than from nearest-neighbor distance, so it is faithful without requiring the bank to be
+a representative sample — it removes the non-eviction dependence of §3.4. Its parameters are fixed by
+a direct characterization of the tile stream, summarized in Table 1 and determined and validated
+in §3.7.
 
 Two counting terms recur below. A *spot* is a small L1 ball of radius `s` around a point (`s` is
 the spot radius, fixed by the bank; §3.7). Within a spot we distinguish *tile-crowding* — how many
@@ -318,13 +322,18 @@ common a tile is.
   to the log-crowding rather than to raw distance). Before the counters have filled, the distance
   readout of §3.3 serves as a cold-start estimator; thereafter it is retained only as a consistency
   probe.
-- *Eviction and forgetting.* When the anchor set is full, the anchor of lowest hit-rate `λ̂_i` is
-  evicted — a least-frequently-used rule with aging — so an anchor that stops receiving tiles decays
-  out while active anchors persist. This directly removes the non-eviction of §3.4: an isolated
-  anchor accrues no hits and is the first evicted, rather than the last. A transient reserve holds
-  newly admitted anchors so a one-off tile cannot displace an established anchor before accumulating
-  hits, with two rules that make it a bounded buffer rather than a growing one (Algorithm 2): a
-  newborn *graduates* out of the reserve into the established set on its first hit, and an ungraduated
+- *Eviction and forgetting.* The bank is split into an **established set** of capacity `M` and a
+  separate **reserve** buffer of `≈ reserve` slots on top (total stored `≈ M + reserve`); the
+  established set holds the same `M` signatures the distance-calibrated bank holds, for a like-for-like
+  comparison. Established anchors are managed by a least-frequently-used rule with aging: when a
+  newly graduated anchor would exceed capacity `M`, the anchor of lowest hit-rate `λ̂_i` is evicted, so
+  an anchor that stops receiving tiles decays out while active anchors persist. This directly removes
+  the non-eviction of §3.4: an isolated anchor accrues no hits and is the first evicted, rather than
+  the last. A novel tile is admitted to the reserve, initialized with `S = 0, E = 0, age = 0` (the
+  decay-and-age step precedes scoring, so `E ≥ 1` before any anchor is read, and `λ̂ = S/(E+ε)`), so a
+  one-off cannot displace an established anchor before accumulating hits. Two rules make the reserve a
+  bounded buffer rather than a growing one (Algorithm 2): a newborn *graduates* into the established set
+  on its first hit (evicting the lowest-`λ̂` established anchor if the set is full), and an ungraduated
   anchor whose age exceeds the residency `T_need` is evicted. Its steady-state occupants are therefore
   the non-graduating one-offs, and its size is their arrival rate times their residency,
   `reserve ≈ ρ_out · κ · T_need`, where `κ` is the tiles per block (one-offs arrive at `ρ_out · κ` per
@@ -335,7 +344,8 @@ common a tile is.
   tracks the current distribution.
 
 ```
-Algorithm 2  Counted-coverage bank (proposed): update and scoring for one batch X
+Algorithm 2  Counted-coverage bank: update and scoring for one batch X
+             (established capacity M; reserve is a separate buffer of ≈ reserve slots)
 
   if iteration < T_warm:  return t(x) = 0 for all x
 
@@ -350,17 +360,19 @@ Algorithm 2  Counted-coverage bank (proposed): update and scoring for one batch 
       if counters are still filling:
           t(x) ← distance readout of §3.3                      # cold-start
       else:
-          p̂(x) ← Σ_i (S_i / E_i) · K_h( s(x) − b_i )           # unnormalized centered kernel sum
+          p̂(x) ← Σ_i (S_i / (E_i + ε)) · K_h( s(x) − b_i )     # unnormalized centered kernel sum; ε guards E→0
           t(x) ← F̂( log p̂(x) )                                # decayed empirical rank (PIT)
 
   for each x in X_global:                                      # update after scoring
       i* ← nearest anchor to s(x)
       if ‖s(x) − b_{i*}‖ ≤ s:
           S_{i*} ← S_{i*} + 1                                  # a hit (exposure was aged above)
-          if i* in reserve:  move i* to the established set    # graduate on first hit
-      else:
-          admit a new anchor at s(x) into the reserve, age ← 0
-          if the established set is full:  evict argmin_i S_i/E_i over the established set
+          if i* in reserve:                                    # graduate on first hit
+              if |established| = M:  evict argmin_i S_i/(E_i+ε) over the established set
+              move i* from reserve to established set
+      else:                                                    # novel tile: admit to the reserve
+          if reserve is at capacity:  evict its oldest entry
+          new anchor at s(x):  b ← s(x), S ← 0, E ← 0, age ← 0
 
   return { t(x) : x in this worker's rows }
 ```
@@ -461,7 +473,12 @@ on a bounded memory holding 8,192 of 384,000 tiles; this is close to the ceiling
 allows, since the score is smoothed at scale `L` and correlated against a finer reference. The
 per-anchor rate `λ̂` tracks the density at its own location with ρ = 0.67, confirming that the
 counting itself — not merely the kernel smoothing — carries the signal. The bank reaches steady
-state (8,192 anchors, modest turnover).
+state (8,192 anchors, modest turnover). This run exercises the core mechanism — Voronoi
+hit-counting, lifetime exposure, unnormalized kernel sum, PIT scoring, and least-frequently-used
+eviction — at a single established set of 8,192 anchors; the transient reserve and its graduation
+rule (§3.5), a one-off-protection add-on, were disabled, and newborns were initialized `S = E = 1`
+rather than the `S = E = 0` of §3.5. Those differences are confined to one-off handling and the
+single pre-graduation block, and do not bear on the recovery reported here.
 
 **Provenance of `R`.** The baseline run had typicality disabled, so `L_R` never ran and the
 checkpoint contains no `R`. We therefore constructed a synthetic `R` from the frozen baseline's
@@ -480,7 +497,7 @@ units by the common factor ≈ 12.7 with all scale *ratios* preserved, and the �
 reproduces under both.)
 One caveat remains, stated as unmeasured: this synthetic `R` has effective rank 202, whereas an
 `L_R`-trained `R` collapses to effective rank ≈ 44 (§3.2), and the study is on the frozen baseline,
-not on the online-`L_R` signatures a training run would grow. Their agreement was not measured; we
+not on the online-`L_R` signatures a training run produces. Their agreement was not measured; we
 assert no equivalence.
 
 **Table 2.** Offline bank on 384k signatures `s = R·z` (L1): recovery of the offline density vs. the
