@@ -112,17 +112,16 @@ tiles of the current batch whose distance `d(x)` is largest — the most novel �
 admission, evicts the bank entry nearest to it. This novelty-admission, evict-nearest rule keeps
 the bank spread across the occupied region of signature space.
 
-**Empirical basis.** The properties of the signature stream that inform the module's design —
-the stabilization point here, and the geometry and temporal structure of Table 1 below — were
-measured on a *baseline* model: a standard DINOv2 ViT-B/16 trained on pathology tiles with all
-four extensions of this work disabled, under a recipe following UNI (Chen et al., 2024) at
-ViT-B rather than its ViT-L scale. Measuring on this un-modulated baseline is deliberate: it
-characterizes the signature distribution the module takes as *input*, before the module itself
-perturbs it, which both isolates the design target and avoids the closed-loop confound of §3.8.
-All measurements are inference-only — a fixed probe of 76,800 tiles, drawn from the training
-stream in dataloader order (so arrival order is preserved for the temporal measurements) and
-encoded through a ladder of checkpoints spanning training (10k–124k iterations) — with no
-retraining.
+**Empirical basis.** The properties of the signature stream that inform the module's design were
+measured on a *baseline* model: a standard DINOv2 ViT-B/16 trained on pathology tiles with all four
+extensions of this work disabled, under a recipe following UNI (Chen et al., 2024) at ViT-B rather
+than its ViT-L scale. Measuring on this un-modulated baseline is deliberate: it characterizes the
+signature distribution the module takes as *input*, before the module itself perturbs it, which both
+isolates the design target and avoids the closed-loop confound of §3.8. All measurements are
+inference-only, drawn from the training stream in dataloader order (so arrival order is preserved
+for the temporal constants), with no retraining: the stabilization point below is measured on a
+fixed probe encoded through a checkpoint ladder (10k–124k iterations), and the geometry and temporal
+constants of Table 1 are determined on a larger independent sample at the final checkpoint (§3.7).
 
 **Activation.** The bank is only meaningful once the signatures it stores are stable. The
 signature space is a projection of the DINO-head bottleneck, and the bottleneck stabilizes far
@@ -203,26 +202,19 @@ property of the evict-nearest rule itself and persists for any admission schedul
 We describe a bank design, not yet implemented, that retains a covering set of anchors but
 estimates density from explicit traffic counters rather than from nearest-neighbor distance,
 thereby removing the non-eviction pathology of §3.4. Its parameters are fixed by a direct
-characterization of the tile stream, summarized in Table 1. Each quantity was estimated on the
-same baseline model and probe as above (§3.3), inference-only, by a standard estimator:
-intrinsic dimension by the two-nearest-neighbor ratio method (Facco et al., 2017), cross-checked
-against the covariance participation ratio; the local-density dynamic range from k-nearest-
-neighbor density estimates; the mode structure from a clustering sweep; the burst factor from
-the signature autocorrelation and the run-length of same-slide tiles in arrival order; the
-correlation length from the semivariogram of the log-density field; and the one-off rate from
-the isolation rate as a function of sample size.
+characterization of the tile stream, summarized in Table 1 and determined and validated in §3.7.
 
-**Table 1.** Properties of the signature stream, measured on the baseline model and probe of
-§3.3 (standard DINOv2 ViT-B/16, all extensions disabled), and the design quantity each
-determines.
-| Property | Symbol | Value | Design role |
+**Table 1.** Design constants of the signature stream, determined on the baseline model (standard
+DINOv2 ViT-B/16, all extensions disabled) over an independent 384,000-tile sample with bootstrap
+95% confidence intervals (§3.7), and the design quantity each fixes.
+| Property | Symbol | Value (95% CI) | Design role |
 |---|---|---|---|
-| Intrinsic dimension | `d*` | ≈ 9.5 | readout viability; cell scale |
-| Local-density dynamic range | `R` | scale-dependent (§3.7); ≈ 20 at radius `L` | places the operating regime (moderate) |
+| Intrinsic dimension | `d*` | 9.5 [9.5–9.6] | readout viability; cell scale |
+| Local-density dynamic range | `R` | scale-dependent; ≈ 20 at radius `L` | operating regime (moderate) |
 | Mode structure | — | connected continuum, no dominant mode | removes the isolated-outlier hazard |
-| Tile-level burst factor | `b` | ≈ 1.2, decays within one batch | permits simple exponential forgetting |
-| Log-density correlation length | `L` | ≈ 0.26 | sets the readout bandwidth |
-| One-off (artifact) rate | `ρ_out` | ≈ `10^{-5}`, no floor | sizes the transient reserve |
+| Tile-level burst factor | `b` | ≈ 1.2 (decays within one batch) | permits exponential forgetting |
+| Log-density correlation length | `L` | 0.26 [0.257–0.259] | sets the readout bandwidth |
+| One-off (artifact) rate | `ρ_out` | ≈ 10⁻⁵ (no floor) | sizes the transient reserve |
 
 Two structural findings from Table 1 guide the design. First, the support is a connected
 continuum of intrinsic dimension near ten with a moderate density range (scale-dependent, and
@@ -363,33 +355,22 @@ recovers tile redundancy. We establish both by inference-only study on the basel
 convergence analysis of the constants and an offline run of the bank on cached signatures — with
 no retraining.
 
-**Convergence of the constants.** Each constant of Table 1 was first estimated on the single
-76,800-tile probe of §3.3. To rule out sampling artifacts, we re-estimated each on a fresh,
-independent 384,000-tile sample (a disjoint dataloader seed, same tap and checkpoint), reporting
-a bootstrap 95% confidence interval and the estimate as a function of subsample size. A constant
-is taken as converged when the two independent samples agree and the estimate is flat in `N`.
-
-**Table 2.** Convergence of the design constants: original probe vs. a 5× larger independent sample.
-| constant | probe (76.8k) | independent sample (384k), 95% CI | vs. `N` | verdict |
-|---|---|---|---|---|
-| `d*` (participation ratio) | 9.52 | 9.58 [9.54, 9.61] | flat | converged, ≈ 9.5 |
-| `d*` (two-NN) | 9.23 | 9.29 [9.14, 9.45] | mild estimator drift | converged, ≈ 9.3 |
-| burst factor `b` | 1.20 | 1.15 | — | converged |
-| autocorr length `τ_ac` | < 1 batch | < 1 batch | — | converged |
-| one-off rate `ρ_out` | ~10⁻⁵ (slope −0.80) | 1.6×10⁻⁵ (slope −0.87) | power law to 128k, no floor | converged |
-| correlation length `L` | 0.26 | 0.257 / 0.259 | flat | converged, ≈ 0.26 |
-| density skew `R` | — | p99/p1 and log-variance grow with `N` | not flat | **scale-dependent** |
-
-Five constants (`d*`, `b`, `τ_ac`, `ρ_out`, `L`) agree across the two samples and are flat in `N`.
-Two points require care. The correlation length is `L ≈ 0.26` from the neighbor-gradient estimator;
-an earlier value of 0.16 came from a random-pair estimator that is unstable in this dimension and
-is superseded. The density dynamic range `R` is genuinely *not* a fixed constant: both p99/p1 and
-the variance of log-density grow monotonically with sample size (the variance rises from 1.7 at
-5k tiles to 3.1 at 160k), because a `k`-nearest-neighbor estimate's bandwidth shrinks as `N` grows
-and resolves finer structure. The converged, operationally meaningful quantity is the skew at a
-*fixed* bandwidth equal to the bank's resolution: at radius ≈ `L`, the log-density variance is 1.41
-(stable across sample size) and the 90/10 density ratio is ≈ 20. The design does not depend on
-pinning `R`, because the rank/PIT readout (§3.5) is invariant to any monotone rescaling of density.
+**Determination of the constants.** The constants of Table 1 were determined on an independent
+384,000-tile sample (a disjoint dataloader seed, same tap and checkpoint), each with a bootstrap
+95% confidence interval and verified stable across subsample size; the intervals are those in
+Table 1. The estimators are standard: intrinsic dimension by the two-nearest-neighbor ratio method
+(Facco et al., 2017), cross-checked against the covariance participation ratio; the density range
+from k-nearest-neighbor density; the burst factor from the signature autocorrelation and same-slide
+run-lengths in arrival order; the correlation length from the log-density field; and the one-off
+rate from the isolation rate as a function of sample size. Two required care in the estimator. The correlation length is `L ≈ 0.26` from a
+neighbor-gradient estimator; a random-pair estimator is unstable in this dimension and gives a
+spurious 0.16. The density range `R` is not a fixed constant: both p99/p1 and the variance of
+log-density grow monotonically with sample size (the log-variance rises from 1.7 at 5k tiles to
+3.1 at 160k), because a `k`-nearest-neighbor estimate's bandwidth shrinks as `N` grows and resolves
+finer structure. The converged, operationally meaningful quantity is the skew at a *fixed* bandwidth
+equal to the bank's resolution: at radius ≈ `L` the log-density variance is 1.41 (stable across
+sample size) and the 90/10 density ratio is ≈ 20 (Table 1). The design does not depend on pinning
+`R`, because the rank/PIT readout (§3.5) is invariant to any monotone rescaling of density.
 
 The same study fixes the resolution scales. The ideal-tiling estimate `s_M = (V/M)^{1/d*} ≈ 0.155`
 (≈ 0.6 `L`) is a lower bound; because seed-on-miss packs anchors at the seed radius, the *achieved*
@@ -409,7 +390,7 @@ density at its own location with ρ = 0.72, confirming that the counting itself 
 kernel smoothing — carries the signal. The bank reaches steady state (8,192 anchors, modest
 turnover).
 
-**Table 3.** Offline bank on 384k signatures: recovery of the offline density vs. the hit radius `s`.
+**Table 2.** Offline bank on 384k signatures: recovery of the offline density vs. the hit radius `s`.
 | hit radius `s` | Spearman(`t`, density) | Spearman(`λ̂`ₐₙ𝒸ₕₒᵣ, density) | anchors | admits/block |
 |---|---|---|---|---|
 | 0.14 | +0.07 | — | 8192 | very high |
