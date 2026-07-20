@@ -4,7 +4,7 @@
 typicality-dampening module: the morphology-signature representation it operates on, two
 interchangeable memory-bank variants that turn a signature into a typicality score, and the two ways
 that score modulates the learning objective. The two bank variants crossed with the two modulations
-define the four configurations evaluated in Section 4. Quantitative statements are inference-only
+define the four configurations evaluated in Section 4. Except where explicitly attributed to the online-trained run (§3.5), quantitative statements are inference-only
 measurements on a baseline ViT-B/16 DINOv2 model with all extensions of this work disabled; the
 empirical basis is described in §3.3 and full protocols are given in Appendix A.*
 
@@ -150,7 +150,7 @@ keep it distinct from the matrix `R`.
   scales as `1/g`, which is what makes the hit count `S ∝ p/g`.
 - **Probability integral transform (PIT).** Replacing a number by its percentile in a reference
   distribution, yielding a score uniform on `[0,1]`. The counted-coverage bank scores a tile by the
-  percentile of its density among recent tiles ("denser than 70% of recent tiles" → `t = 0.70`), so
+  percentile of its density among recent tiles ("denser than 75% of recent tiles" → `t = 0.75`), so
   the score is bounded, centred, and immune to the density estimate's arbitrary scale.
 - **Kernel and bandwidth (`K_h`, `h`).** A smooth, radially symmetric, compactly supported weight
   that falls off with distance; its bandwidth `h` is the radius enclosing the `j` nearest stored signatures.
@@ -396,15 +396,17 @@ radius that still fills the bank to `M`, the knee, which `s` then tracks, lightl
 a few sweeps). Measuring the knee live is not optional; it is forced by the same portability logic §3.7
 makes. The knee is a property of the signature *scale*, which the online-trained `R` sets and which
 *drifts*: the offline synthetic `R` of §3.7 has a knee of `s ≈ 2.75` (L1 units), but the live
-trained-`R` signatures are several times larger, and the measured live knee is far larger — `s ≈ 13`
+trained-`R` signatures are several times larger, and the measured live knee is correspondingly larger: on the online-trained run it is `s ≈ 13`
 at activation (iteration 50k), drifting *downward* to ≈ 11 by iteration 70k as `R`'s effective rank and
 scale contract over training. A radius frozen at the offline 2.75 would sit far inside every stored
 signature's neighbourhood: almost nothing would count as a hit, the counts would stay ≈ 0, and the bank
-would go inert — which is exactly why `s` must be measured on the live signatures rather than fixed. The
-knee exceeds the ideal even-tiling estimate `s_M = (V/M)^{1/d*} ≈ 1.97` (offline, a lower bound) by
-about 1.4×, because seed-on-miss packs stored signatures at spacing `s` rather than tiling at radius
-`s`. The achieved spacing is therefore ≈ `s` (offline, ≈ 2.75 ≈ 0.82 `L`), comparable to the
-correlation length; the readout then pools stored signatures over a window of order `L` (§3.7).
+would go inert — which is exactly why `s` must be measured on the live signatures rather than fixed. Offline, this
+knee exceeds the ideal even-tiling estimate `s_M = (V/M)^{1/d*} ≈ 1.97` (a lower bound) by about 1.4× —
+seed-on-miss packs stored signatures at spacing `s` rather than tiling at radius `s` — for an achieved
+spacing ≈ `s` ≈ 2.75 (≈ 0.82 `L`), comparable to the correlation length and to the scale over which the
+readout pools (a window of order `L`; §3.7). This ratio is a property of the offline geometry and is not
+assumed to transfer: on the online-trained run `s` is measured directly, so no downstream quantity
+depends on the relationship between `s_M` and the knee.
 
 **Readout: sum the rates, don't average them.** The tile density at a query is estimated as an
 *unnormalised* kernel sum over the `j` nearest stored signatures,
@@ -532,8 +534,14 @@ whatever its readout; refining it would need exponentially more memory or a lowe
 signature. This bounds both bank variants equally and is a property of the regime, not of either
 policy.
 
-**Implementation defaults.** For a build-ready specification we fix the four choices left abstract
-above. *Kernel:* a triweight profile `k(u) = (1 − u²)³` on `u ≤ 1` (smooth and compactly supported)
+**Implementation defaults.** For a build-ready specification we fix the five choices left abstract
+above. *Hit radius:* self-tuned online rather than fixed (§3.5, "Placement"). The bank maintains a rolling
+buffer of the most recent ≈ 60,000 signatures and, every ≈ 500 steps, replays seed-on-miss over the
+buffer on a radius grid re-centered on the current median inter-signature distance — a geometric grid
+spanning ≈ 0.3–2× that scale, refined once across the fill-to-underfill transition — and sets `s` to the
+largest radius that still fills the bank to `M`, smoothed by an exponential moving average with a
+≈ 5-sweep time constant. Because the radius is re-measured on the live signatures, it tracks the scale
+drift of the online-trained `R` that a fixed value cannot (§3.7, "Bank size `M`"). *Kernel:* a triweight profile `k(u) = (1 − u²)³` on `u ≤ 1` (smooth and compactly supported)
 with bandwidth `h(x)` = the L1 distance to the `j`-th nearest stored signature (`j = 64`). `j = 64` is the value
 in the 32–64 range at which the pooling radius reaches `L` — the 64th-nearest stored signature sits at L1 ≈ 3.5
 ≈ `L` (§3.7), so the readout pools over exactly one correlation length, the scale below which the

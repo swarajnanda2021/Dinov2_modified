@@ -699,8 +699,13 @@ def train_dinov2(args):
             print(f"Prototype Bank Statistics:")
             print(f"  Weight norm mean: {proto_stats['weight_norm_mean']:.6f}")
             print(f"  Weight norm std: {proto_stats['weight_norm_std']:.6f}")
-        if args.use_typicality_dampening:
-            print(f"Typicality Bank: {typicality_bank.bank_filled.item()}/{typicality_bank.M} filled")
+        if args.use_typicality_dampening and typicality_bank is not None:
+            if hasattr(typicality_bank, 'bank_filled'):          # distance bank (Algorithm 1)
+                print(f"Typicality Bank: {typicality_bank.bank_filled.item()}/{typicality_bank.M} filled")
+            else:                                                # counted bank (Algorithm 2): no bank_filled
+                _st = typicality_bank.stats()
+                print(f"Typicality Bank (counted): n_est={_st['n_est']}/{typicality_bank.M} "
+                      f"reserve={_st['n_reserve']} graduations={_st['graduations']} s={_st['s']:.4f}")
         print("="*50 + "\n")
 
     metric_logger = utils.IterationMetricLogger(total_iterations=args.total_iterations)
