@@ -230,8 +230,9 @@ def main():
     args.typicality_repr_lr = 1e-3
     args.typicality_replace_fraction = 0.1 # evict-nearest churn rate (bank refreshed ~10%/step)
     args.typicality_bank = 'distance'      # 'distance' (Alg.1, baseline) | 'counted' (Alg.2). Counted
-                                           # knobs (spot_radius/pool_j/halflife/reserve*/readout/pit_buffer)
-                                           # default from config; override here for a counted run.
+                                           # knobs (pool_j/halflife_steps/reserve*/readout/pit_buffer and
+                                           # the s-tuning s_* knobs) default from config; the hit radius s
+                                           # is self-tuned online (no fixed radius). Override here if needed.
 
     # Adversarial-mask-as-student-view augmentation (re-uses mask_checkpoint above)
     args.use_adversarial_mask_augmentation = False

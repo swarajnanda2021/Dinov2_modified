@@ -388,12 +388,23 @@ stored signatures tile the occupied support. On the measured continuum the estim
 stored signatures in near-proportion to tile density (formally, stored-signature density `∝ p^{d*/(d*+2)}`, the classical
 quantization exponent of Graf and Luschgy, 2000 — this motivates the placement but never enters the
 code). The hit radius `s` — the single radius used for *both* seeding and hit-counting (Algorithm 2)
-— is set at the *fill knee*: the value at which seed-on-miss populates exactly `M` stored signatures
-(empirically `s ≈ 2.75` in L1 units here; §3.7). This exceeds the ideal even-tiling estimate
-`s_M = (V/M)^{1/d*} ≈ 1.97` by about 1.4×, because seed-on-miss packs stored signatures at spacing `s` rather
-than tiling at radius `s`; the estimate is a lower bound and `s` should be set empirically. The
-achieved spacing is therefore ≈ `s` ≈ 2.75 (≈ 0.82 `L`), comparable to the correlation length; the
-readout then pools stored signatures over a window of order `L` (§3.7).
+— is set at the *fill knee*: the largest radius at which seed-on-miss populates exactly `M` stored
+signatures. It is **self-tuned online, not a fixed constant.** The bank keeps a rolling buffer of the
+most recent ≈ 60,000 signatures and, every ≈ 500 steps, sweeps it — replaying seed-on-miss from empty
+over the buffer across a grid of radii *re-centered on the live signature scale* — to find the largest
+radius that still fills the bank to `M`, the knee, which `s` then tracks, lightly smoothed (an EMA over
+a few sweeps). Measuring the knee live is not optional; it is forced by the same portability logic §3.7
+makes. The knee is a property of the signature *scale*, which the online-trained `R` sets and which
+*drifts*: the offline synthetic `R` of §3.7 has a knee of `s ≈ 2.75` (L1 units), but the live
+trained-`R` signatures are several times larger, and the measured live knee is far larger — `s ≈ 13`
+at activation (iteration 50k), drifting *downward* to ≈ 11 by iteration 70k as `R`'s effective rank and
+scale contract over training. A radius frozen at the offline 2.75 would sit far inside every stored
+signature's neighbourhood: almost nothing would count as a hit, the counts would stay ≈ 0, and the bank
+would go inert — which is exactly why `s` must be measured on the live signatures rather than fixed. The
+knee exceeds the ideal even-tiling estimate `s_M = (V/M)^{1/d*} ≈ 1.97` (offline, a lower bound) by
+about 1.4×, because seed-on-miss packs stored signatures at spacing `s` rather than tiling at radius
+`s`. The achieved spacing is therefore ≈ `s` (offline, ≈ 2.75 ≈ 0.82 `L`), comparable to the
+correlation length; the readout then pools stored signatures over a window of order `L` (§3.7).
 
 **Readout: sum the rates, don't average them.** The tile density at a query is estimated as an
 *unnormalised* kernel sum over the `j` nearest stored signatures,
@@ -680,13 +691,15 @@ readout window. Because `d* ≈ 9.3` this is very weak: over `M ∈ {4096, 8192,
 moves only `s ≈ {2.97, 2.75, 2.56}` (≈ ±8% per 2×), and reaching the `L` ceiling or the
 pooling-locality floor (`M ≫ j = 64`) takes order-of-magnitude changes. Recovery is essentially flat
 over this band (ρ ≈ 0.72–0.75; Table 2 read as an effective-`M` sweep). So changing `M` is a config
-change with `s` the only coupled parameter — either re-tuned by the formula, found empirically (the
-fill knee, where admits per step collapse), or, cleanest, **made self-tuning**. The controller must
-target the *underfill edge* — the largest `s` that still fills the bank to `M`, equivalently the
-smallest admission rate at a full bank — and *not* simply hold `|B| ≈ M`: Table 2 shows the bank is
-full across `s ∈ [1.57, 2.75]`, so `|B| = M` alone is a flat signal that admits the churning `s = 1.57`
-(ρ ≈ 0) as readily as the knee `s = 2.75` (ρ = 0.75). Push `s` up until `|B|` just begins to drop,
-then back off. The scratch reserve, half-life (in steps), and pooling `j` (a count) all carry over
+change with `s` the only coupled parameter. `s` **is self-tuned online** (§3.5, Placement): every
+≈ 500 steps the bank replays seed-on-miss over a rolling ≈ 60,000-signature buffer, on a grid
+re-centered on the live signature scale, and sets `s` to the largest radius that still fills the bank
+to `M` — the *underfill edge* — lightly smoothed. Targeting that edge, and *not* simply holding
+`|B| ≈ M`, is what makes it correct: Table 2 shows the bank is full across `s ∈ [1.57, 2.75]`, so
+`|B| = M` alone is a flat signal that would admit the churning `s = 1.57` (ρ ≈ 0) as readily as the
+knee `s = 2.75` (ρ = 0.75); the sweep instead pushes `s` up until `|B|` just begins to drop. Because
+the edge is re-measured continuously it also absorbs the scale *drift* of the online-trained `R` — the
+reason a fixed radius fails — so a change of `M` needs no manual re-tune. The scratch reserve, half-life (in steps), and pooling `j` (a count) all carry over
 untouched, and no re-characterization of §3.7 is needed.
 
 *Prototype count `K'`.* Changing it is also a config change — `L_R` trains any `K'`, no structural code

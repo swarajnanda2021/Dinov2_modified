@@ -155,16 +155,16 @@ def get_args_parser():
                         help='Typicality bank variant: distance (Algorithm 1, baseline) or '
                              'counted (Algorithm 2, counted-coverage). Default distance keeps '
                              'existing runs byte-for-byte.')
-    parser.add_argument('--typicality_spot_radius', default=2.75, type=float,
-                        help='Counted bank spot radius s (L1). MUST be re-tuned per encoder/data '
-                             '(manuscript S3.7 portability).')
+    # NOTE: the counted-bank hit radius s is self-tuned online (rolling buffer + periodic
+    # seed-on-miss sweep; see CountedCoverageBank and the s-tuning knobs below). There is no
+    # fixed spot_radius: the offline synthetic-R knee ~2.75 is far too small for the live R.
     parser.add_argument('--typicality_pool_j', default=64, type=int,
-                        help='Counted bank: number of nearest anchors in the kernel sum (j).')
-    parser.add_argument('--typicality_halflife_blocks', default=250, type=int,
-                        help='Counted bank counter half-life in blocks (eta = 0.5**(1/H)).')
+                        help='Counted bank: number of nearest stored signatures in the kernel sum (j).')
+    parser.add_argument('--typicality_halflife_steps', default=250, type=int,
+                        help='Counted bank counter half-life in steps (eta = 0.5**(1/H)).')
     parser.add_argument('--typicality_reserve_residency', default=300, type=int,
-                        help='Counted bank reserve residency T_need (blocks before an ungraduated '
-                             'reserve anchor expires).')
+                        help='Counted bank reserve residency T_need (steps before an ungraduated '
+                             'reserve stored signature expires).')
     parser.add_argument('--typicality_reserve_size', default=300, type=int,
                         help='Counted bank reserve buffer size, on top of M (~a few percent of M).')
     parser.add_argument('--typicality_readout', default='pit', type=str,
@@ -172,6 +172,25 @@ def get_args_parser():
                         help='Counted bank readout: pit (decayed empirical rank) or probit.')
     parser.add_argument('--typicality_pit_buffer', default=20000, type=int,
                         help='Counted bank PIT reference ring size (recent log p_hat values).')
+    # ---- counted-bank self-tuning hit radius s (Algorithm 2, section 3.5 Placement) ----
+    parser.add_argument('--typicality_s_buffer_size', default=60000, type=int,
+                        help='Counted bank: rolling signature ring-buffer size N for the s sweep.')
+    parser.add_argument('--typicality_s_sweep_interval', default=500, type=int,
+                        help='Counted bank: steps between s edge-sweeps.')
+    parser.add_argument('--typicality_s_grid_points', default=9, type=int,
+                        help='Counted bank: radius grid points per sweep (before one bisection).')
+    parser.add_argument('--typicality_s_grid_span', default=[0.3, 2.0], type=float, nargs=2,
+                        help='Counted bank: sweep grid span as (lo, hi) multiples of the live '
+                             'signature scale m -> geomspace(lo*m, hi*m).')
+    parser.add_argument('--typicality_s_ema_alpha', default=0.2, type=float,
+                        help='Counted bank: EMA weight for s <- (1-a)*s + a*edge (~5-sweep '
+                             'time-constant at 0.2).')
+    parser.add_argument('--typicality_s_min_buffer', default=60000, type=int,
+                        help='Counted bank: signatures buffered before the first sweep sets s '
+                             '(startup gate; module scores t=0 and does not seed until then).')
+    parser.add_argument('--typicality_s_headroom', default=0.0, type=float,
+                        help='Counted bank: optional fraction to sit under the edge, s <- '
+                             'edge*(1-headroom). Default 0.')
 
     # ========== Adversarial mask-as-student-view augmentation parameters ==========
     # Note: --num_masks, --mask_model_arch, --mask_checkpoint are already declared

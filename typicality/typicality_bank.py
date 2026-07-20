@@ -143,7 +143,9 @@ class TypicalityBank(nn.Module):
         if not out['ready']:
             return {'ready': False, 't': None}
         t = TypicalityScorer.compute_scores(out['d'], out['mu'], out['sigma'])
-        return {'ready': True, 't': t}
+        # Surface the calibration stats too (numerics unchanged) so the trainer can log the
+        # distance-bank health path (mu/sigma/d); the counted bank has its own health().
+        return {'ready': True, 't': t, 'mu': out['mu'], 'sigma': out['sigma'], 'd': out['d']}
 
     @torch.no_grad()
     def sync_fingerprint(self):

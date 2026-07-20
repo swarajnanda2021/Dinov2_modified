@@ -431,13 +431,19 @@ def train_dinov2(args):
             typicality_bank = CountedCoverageBank(
                 M=args.typicality_bank_size,
                 K_prime=args.typicality_K_prime,
-                spot_radius=args.typicality_spot_radius,
                 pool_j=args.typicality_pool_j,
-                halflife_blocks=args.typicality_halflife_blocks,
+                halflife_steps=args.typicality_halflife_steps,
                 reserve_residency=args.typicality_reserve_residency,
                 reserve_size=args.typicality_reserve_size,
                 readout=args.typicality_readout,
                 pit_buffer=args.typicality_pit_buffer,
+                s_buffer_size=args.typicality_s_buffer_size,
+                s_sweep_interval=args.typicality_s_sweep_interval,
+                s_grid_points=args.typicality_s_grid_points,
+                grid_span=tuple(args.typicality_s_grid_span),
+                s_ema_alpha=args.typicality_s_ema_alpha,
+                s_min_buffer=args.typicality_s_min_buffer,
+                s_headroom=args.typicality_s_headroom,
             )
         else:
             typicality_bank = TypicalityBank(
@@ -1000,7 +1006,7 @@ def train_dinov2(args):
             # ========== Typicality Dampening ==========
             typicality_temperatures = None
             typicality_weights = None
-            bank_output = {'ready': False}
+            out = {'ready': False}
             t = None
 
             if args.use_typicality_dampening and repr_protos is not None and current_iteration >= args.typicality_warmup_iters:
@@ -1374,12 +1380,34 @@ def train_dinov2(args):
         if args.use_typicality_dampening and repr_protos is not None:
             metric_logger.update(repr_L_nn=l_nn.item())
             metric_logger.update(repr_L_cov=l_cov.item())
-            if bank_output['ready']:
-                metric_logger.update(typicality_mu=bank_output['mu'].item())
-                metric_logger.update(typicality_sigma=bank_output['sigma'].item())
+            is_counted = getattr(args, 'typicality_bank', 'distance') == 'counted'
+            if is_counted and current_iteration >= args.typicality_warmup_iters:
+                # Counted-coverage telemetry — active from warmup onward (through the s-tuning
+                # startup and the fill), so the inert-bank failure would show here, live.
+                h = typicality_bank.health()
+                metric_logger.update(typicality_s=h['s'])                      # self-tuned hit radius
+                metric_logger.update(typicality_n_est=h['n_est'])
+                metric_logger.update(typicality_reserve=h['n_reserve'])
+                metric_logger.update(typicality_graduations=h['graduations'])
+                metric_logger.update(typicality_admits=h['admits'])           # seeds this step
+                metric_logger.update(typicality_lam_median=h['lam_median'])   # core strength: S/E
+                metric_logger.update(typicality_lam_q10=h['lam_q10'])
+                metric_logger.update(typicality_lam_q90=h['lam_q90'])
+                metric_logger.update(typicality_strong_core=h['strong_core_frac'])
+                metric_logger.update(typicality_evict_lam=h['evict_lam_mean'])  # should stay ~0
+                if out.get('t') is not None:
+                    tg = out['t']                                             # global-batch scores
+                    metric_logger.update(typicality_t_mean=tg.mean().item())
+                    metric_logger.update(typicality_t_std=tg.std().item())
+                    metric_logger.update(typicality_t_lt0p1=(tg < 0.1).float().mean().item())
+                    metric_logger.update(typicality_t_gt0p9=(tg > 0.9).float().mean().item())
+            elif not is_counted and out['ready']:
+                # Distance-calibrated bank (Algorithm 1) — existing logging path, intact.
+                metric_logger.update(typicality_mu=out['mu'].item())
+                metric_logger.update(typicality_sigma=out['sigma'].item())
                 metric_logger.update(typicality_t_mean=t.mean().item())
                 metric_logger.update(typicality_t_std=t.std().item())
-                metric_logger.update(typicality_d_mean=bank_output['d'].mean().item())
+                metric_logger.update(typicality_d_mean=out['d'].mean().item())
                 metric_logger.update(typicality_diffuse_frac=(typicality_bank.bank.max(dim=1).values < 0.5).float().mean().item())
                 metric_logger.update(typicality_t_lt0p1=(t < 0.1).float().mean().item())
 
@@ -1468,7 +1496,8 @@ def train_dinov2(args):
                     if hasattr(typicality_bank, 'stats'):
                         _st = typicality_bank.stats()
                         print(f"  [counted bank] n_est={_st['n_est']}/{args.typicality_bank_size} "
-                              f"reserve={_st['n_reserve']} graduations={_st['graduations']}")
+                              f"reserve={_st['n_reserve']} graduations={_st['graduations']} "
+                              f"s={_st['s']:.4f}")
 
             if fp16_scaler is not None:
                 save_dict['fp16_scaler'] = fp16_scaler.state_dict()
