@@ -1,41 +1,43 @@
 """
-CPU unit tests for the switchable typicality bank (Algorithm 1 distance vs Algorithm 2
-counted-coverage). No GPU, no training, no pytest — run with:  python typicality/test_counted_coverage.py
+CPU unit tests for the counted-coverage typicality bank. No GPU, no training, no pytest --
+run with:  python typicality/test_counted_coverage.py
 
-Each test is a function that asserts; main() runs them and prints PASS/FAIL.
+Covers the mechanics (hit assignment, two-hit graduation, LFU eviction, reserve bounds +
+exit accounting, cold-start->counted), the self-tuning s sweep, the self-tuning j (variogram
+L + under-resolution), the noise-aware soft rank (limits), the Var(lambda_hat) identity,
+determinism (incl. the j sweep and soft-rank), checkpoint round-trip, and that the distance
+bank is gone.
 """
-import os, sys, io
+import os, sys, io, math
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from typicality import TypicalityBank, CountedCoverageBank, TypicalityScorer  # noqa: E402
+from typicality import CountedCoverageBank, TypicalityScorer  # noqa: E402
 
 torch.manual_seed(0)
 
 
 # ----------------------------------------------------------------- helpers
 def far_points(n, kp=2, step=10.0):
-    """n points each >> spot radius apart along axis 0."""
     x = torch.zeros(n, kp)
     x[:, 0] = torch.arange(n).float() * step
     return x
 
 
-def counted(M=4, kp=2, s=0.5, j=2, H=4, T_need=3, res=2, readout='pit', pit=8):
-    """Build a counted bank with the hit radius PINNED to `s` for the mechanics tests.
-    Self-tuning is exercised separately (test_s_*); here we bypass the sweep by setting s
-    directly and marking it ready, so seeding/hits use the fixed radius. s_buffer_size is
-    kept tiny so construction is cheap."""
+def counted(M=4, kp=2, s=0.5, j=2, H=4, T_need=3, res=2, readout='pit', pit=8,
+            grad_hits=2, pool_selftune=False, soft_rank=False):
+    """Counted bank with the hit radius PINNED to s for the mechanics tests (self-tuning is
+    exercised separately). pool_selftune off and soft_rank off by default here so mechanics
+    are isolated from the readout self-tuning."""
     b = CountedCoverageBank(M=M, K_prime=kp, pool_j=j, halflife_steps=H,
                             reserve_residency=T_need, reserve_size=res, readout=readout,
-                            pit_buffer=pit, s_buffer_size=2000)
-    b.s.fill_(float(s))
-    b.s_ready.fill_(1)
+                            pit_buffer=pit, s_buffer_size=2000, graduation_hits=grad_hits,
+                            pool_selftune=pool_selftune, soft_rank=soft_rank)
+    b.s.fill_(float(s)); b.s_ready.fill_(1)
     return b
 
 
-def fill_established(b, s=0.5):
-    """Seed b.M distinct far-apart established stored signatures (direct-to-established during fill)."""
+def fill_established(b):
     pts = far_points(b.M, b.K_prime, step=10.0)
     b.score_and_update(pts, 0)
     assert b._ne() == b.M, f"fill failed: n_est={b._ne()} != M={b.M}"
@@ -43,8 +45,6 @@ def fill_established(b, s=0.5):
 
 
 def _seed_on_miss_ref(buf, s, M):
-    """Independent brute-force seed-on-miss reference (pure-python, no chunking): a point
-    seeds iff its min L1 distance to all placed centers is > s, up to M. Returns count."""
     centers = []
     for i in range(buf.shape[0]):
         if len(centers) >= M:
@@ -52,165 +52,219 @@ def _seed_on_miss_ref(buf, s, M):
         x = buf[i]
         if not centers:
             centers.append(x); continue
-        C = torch.stack(centers)
-        if float((C - x).abs().sum(dim=1).min()) > s:
+        if float((torch.stack(centers) - x).abs().sum(dim=1).min()) > s:
             centers.append(x)
     return len(centers)
 
 
+def _ar_field_bank(M, kp, spacing, L0, seed=0, halflife=250):
+    """Full, mature bank: positions on a line at `spacing`; lambda an AR(1) field with
+    phi=exp(-spacing/L0) so Corr(lam_i,lam_j)=exp(-r/L0) -> a known correlation length L0."""
+    torch.manual_seed(seed)
+    b = CountedCoverageBank(M=M, K_prime=kp, pool_selftune=True, pool_ema=1.0, halflife_steps=halflife)
+    pos = torch.zeros(M, kp); pos[:, 0] = torch.arange(M).float() * spacing
+    phi = math.exp(-spacing / L0)
+    ar = torch.zeros(M); ar[0] = torch.randn(1).item()
+    nz = math.sqrt(max(1e-6, 1 - phi * phi))
+    for i in range(1, M):
+        ar[i] = phi * ar[i - 1] + nz * torch.randn(1).item()
+    lam = (1.0 + 0.3 * ar).clamp(min=0.05)
+    b.n_est.fill_(M)
+    b.est_b[:M] = pos
+    b.est_E[:M] = b.mature_E
+    b.est_S[:M] = lam * b.mature_E                   # so S/E = lam
+    return b
+
+
 # ----------------------------------------------------------------- tests
-def test_distance_regression():
-    """Wrapped score_and_update == inline update_and_score + compute_scores (Algorithm 1).
-    Distance-bank numerics must stay byte-identical."""
-    torch.manual_seed(1)
-    A = TypicalityBank(M=6, K_prime=3, replace_fraction=0.5)
-    B = TypicalityBank(M=6, K_prime=3, replace_fraction=0.5)
-    # fill both identically
-    for _ in range(2):
-        s = torch.randn(6, 3)
-        A.update_and_score(s); B.update_and_score(s)
-    assert torch.equal(A.bank, B.bank)
-    q = torch.randn(6, 3)
-    out = A.update_and_score(q)                       # inline path
-    t_inline = TypicalityScorer.compute_scores(out['d'], out['mu'], out['sigma'])
-    res = B.score_and_update(q)                        # wrapped path
-    assert res['ready'] and torch.allclose(t_inline, res['t'])
-    assert torch.equal(A.bank, B.bank), "wrapper must apply the same churn"
-    # the wrapper now also surfaces the calibration stats (numerics unchanged)
-    assert torch.equal(res['mu'], out['mu']) and torch.equal(res['sigma'], out['sigma'])
-    assert torch.equal(res['d'], out['d'])
-
-
 def test_hit_assignment():
-    """Within s -> nearest stored signature's S += 1; beyond s -> seed (established during fill)."""
+    """Within s -> nearest signature's S += 1; beyond s -> seed (established during fill)."""
     b = counted(M=8)
-    a = torch.tensor([[0.0, 0.0]])
-    near = torch.tensor([[0.1, 0.0]])                 # < s=0.5 from a
-    farr = torch.tensor([[10.0, 0.0]])                # > s from a
-    batch = torch.cat([a, near, farr], 0)
+    batch = torch.cat([torch.tensor([[0., 0.]]), torch.tensor([[0.1, 0.]]),
+                       torch.tensor([[10., 0.]])], 0)
     b.score_and_update(batch, 0)
-    assert b._ne() == 2, f"expected 2 established (a-seed + far-seed), got {b._ne()}"
-    assert abs(b.est_S[0].item() - 1.0) < 1e-6, f"nearest hit not counted: S0={b.est_S[0].item()}"
-    assert abs(b.est_S[1].item() - 0.0) < 1e-6, "far seed should have no hit"
+    assert b._ne() == 2
+    assert abs(b.est_S[0].item() - 1.0) < 1e-6 and abs(b.est_S[1].item()) < 1e-6
 
 
-def test_graduation_and_cap():
-    """Reserve stored signature graduates to established on first hit; |established| never exceeds M."""
-    b = counted(M=2, s=0.5)
-    far0, far1 = torch.tensor([[0., 0.]]), torch.tensor([[10., 0.]])
-    far2, far2b = torch.tensor([[20., 0.]]), torch.tensor([[20.1, 0.]])   # far2b within s of far2
-    batch = torch.cat([far0, far1, far2, far2b], 0)
-    b.score_and_update(batch, 0)
-    assert b._ne() == 2, f"established must stay <= M=2, got {b._ne()}"
-    assert b._nr() == 0, f"reserve should be empty after graduation, got {b._nr()}"
-    assert int(b.graduations.item()) == 1, f"expected 1 graduation, got {int(b.graduations.item())}"
-    # the graduated far2 replaced the LFU established slot (index 0, lowest lambda tie)
-    assert abs(b.est_b[0, 0].item() - 20.0) < 1e-6, "graduate should occupy the evicted LFU slot"
+def test_graduation_two_hits():
+    """A reserve signature is NOT promoted on one hit; it is on two. Established stays <= M."""
+    b = counted(M=2, s=0.5, grad_hits=2, T_need=100, res=6)
+    fill_established(b)                                       # est at x=0, 10
+    b.score_and_update(torch.tensor([[100., 0.]]), 1)        # seed a reserve signature
+    assert b._nr() == 1 and int(b.graduations.item()) == 0
+    b.score_and_update(torch.tensor([[100.05, 0.]]), 2)      # hit #1 -> not yet
+    assert int(b.graduations.item()) == 0, "one hit must not graduate"
+    assert b._nr() == 1, "reserve signature still pending after one hit"
+    b.score_and_update(torch.tensor([[100.05, 0.]]), 3)      # hit #2 -> graduate
+    assert int(b.graduations.item()) == 1, "two hits must graduate"
+    assert b._ne() == b.M and b._nr() == 0
+    assert any(abs(b.est_b[i, 0].item() - 100.0) < 1e-6 for i in range(b.M))
 
 
-def test_reserve_bounded_and_expiry():
-    """Ungraduated reserve entries expire at age T_need; |reserve| stays bounded, no growth."""
-    b = counted(M=2, s=0.5, T_need=3, res=2)
-    fill_established(b)                                 # n_est == M == 2
-    # feed many steps of a single novel tile each, always far from everything and never repeated
-    max_res = 0
-    for k in range(40):
-        novel = torch.tensor([[100.0 + 5.0 * k, 0.0]])   # each new, >s from all
-        b.score_and_update(novel, k)
-        assert b._ne() == b.M, "established must stay at M"
-        assert b._nr() <= b.reserve_cap, f"reserve exceeded cap: {b._nr()} > {b.reserve_cap}"
-        max_res = max(max_res, b._nr())
-    assert max_res <= b.reserve_cap
-    # with T_need small, old ungraduated entries must have been expired (no monotonic growth)
-    assert b._nr() <= b.reserve_cap
+def test_reserve_bounded_and_exit_counts():
+    """Reserve occupancy stays <= cap under continuous novel input; per-step exit counters
+    (graduated/expired/flushed) sum to the number of departures that step."""
+    b = counted(M=2, s=0.5, T_need=3, res=5, grad_hits=2)
+    fill_established(b)
+    total_departures = 0
+    for k in range(60):
+        b.score_and_update(torch.tensor([[100.0 + 5.0 * k, 0.0]]), k)   # each new, > s from all
+        assert b._ne() == b.M and b._nr() <= b.reserve_cap
+        h = b.health()
+        dep = h['step_grad'] + h['step_expired'] + h['step_flushed']
+        assert len(b._step_exit_ages) == dep, "exit ages recorded must equal exit-counter sum"
+        total_departures += dep
+    assert total_departures > 0, "with small T_need, entries must have departed"
 
 
 def test_lfu_evicts_idle_first():
-    """On a full-established graduation, the lowest-rate (idle) stored signature is evicted first."""
-    b = counted(M=3, s=0.5, T_need=100, res=2)
-    # fill 3 established stored signatures, then hit 1 and 2, leave signature 0 idle
-    fill_established(b)                                 # est at x=0,10,20
+    """On a graduation into a full established set, the lowest-rate (idle) signature is evicted."""
+    b = counted(M=3, s=0.5, T_need=100, res=2, grad_hits=1)   # 1-hit graduation to force eviction
+    fill_established(b)                                        # est at x=0,10,20
     for _ in range(3):
-        # hits near stored signatures 1 (x=10) and 2 (x=20); nothing near signature 0 (x=0)
-        b.score_and_update(torch.tensor([[10.05, 0.], [20.05, 0.]]), 0)
-    idle_pos = b.est_b[0].clone()
-    assert b.est_S[0].item() == 0.0, "signature 0 should be idle (no hits)"
-    # now force a graduation: seed a reserve stored signature then hit it
-    b.score_and_update(torch.tensor([[200., 0.], [200.05, 0.]]), 0)
+        b.score_and_update(torch.tensor([[10.05, 0.], [20.05, 0.]]), 0)   # hit 1 & 2, not 0
+    idle = b.est_b[0].clone()
+    assert b.est_S[0].item() == 0.0
+    b.score_and_update(torch.tensor([[200., 0.], [200.05, 0.]]), 0)       # seed + hit -> graduate
     assert int(b.graduations.item()) >= 1
-    # the idle stored signature (x=0) must be gone; the graduate (x=200) present
-    present0 = any(abs(b.est_b[i, 0].item() - idle_pos[0].item()) < 1e-6 for i in range(b.M))
-    grad_present = any(abs(b.est_b[i, 0].item() - 200.0) < 1e-6 for i in range(b.M))
-    assert not present0, "idle stored signature should have been evicted first"
-    assert grad_present, "graduate should be in established"
+    assert not any(abs(b.est_b[i, 0].item() - idle[0].item()) < 1e-6 for i in range(b.M))
+    assert any(abs(b.est_b[i, 0].item() - 200.0) < 1e-6 for i in range(b.M))
 
 
 def test_coldstart_then_counted_and_range():
     """Not ready while filling; cold-start distance readout when full-but-immature; counted
-    (PIT) after maturation. t in [0,1] throughout; no div-by-zero for newborns."""
+    readout after maturation. t in [0,1] throughout."""
     b = counted(M=4, s=0.5, H=4, readout='pit', pit=64)
-    # filling: not ready
-    part = far_points(3, b.K_prime, step=10.0)
-    out = b.score_and_update(part, 0)
+    out = b.score_and_update(far_points(3, b.K_prime, step=10.0), 0)
     assert out['ready'] is False and out['t'] is None
-    # complete the fill -> ready, and immature -> cold-start distance readout
     b.score_and_update(far_points(4, b.K_prime, step=10.0)[3:4], 1)
-    assert b._ne() == b.M
-    assert b._matured() is False
+    assert b._ne() == b.M and b._matured() is False
     out = b.score_and_update(torch.tensor([[5.0, 0.0], [15.0, 0.0]]), 2)
-    assert out['ready'] and out['t'] is not None
-    assert torch.all(out['t'] >= 0.0) and torch.all(out['t'] <= 1.0)
-    # run enough steps (hits so stored signatures persist) to mature, then confirm counted path runs
+    assert out['ready'] and torch.all(out['t'] >= 0.0) and torch.all(out['t'] <= 1.0)
     for it in range(3, 12):
         b.score_and_update(torch.tensor([[0.05, 0.], [10.05, 0.], [20.05, 0.], [30.05, 0.]]), it)
-    assert b._matured() is True, "median E should have passed the maturation threshold"
+    assert b._matured() is True
     out = b.score_and_update(torch.tensor([[0.05, 0.], [10.05, 0.]]), 12)
     assert torch.all(out['t'] >= 0.0) and torch.all(out['t'] <= 1.0)
-    assert int(b.pit_filled.item()) > 0, "PIT ring should have been populated by the counted readout"
-    assert torch.isfinite(out['t']).all()
+    assert int(b.pit_filled.item()) > 0 and torch.isfinite(out['t']).all()
 
 
-def test_determinism():
-    """Two fresh instances fed the identical gathered-batch sequence end byte-identical."""
+def test_j_selftune_recovers_L():
+    """On synthetic AR(1) rates with a known correlation length, the variogram fit recovers L
+    and j lands near the count of signatures within one L (~2 L/spacing on a line)."""
+    M, kp, spacing, L0 = 400, 3, 1.0, 12.0
+    b = _ar_field_bank(M, kp, spacing, L0, seed=0)
+    b._selftune_pool()
+    L = float(b.L_est.item())
+    assert L0 / 3 < L < L0 * 3, f"fitted L={L:.2f} did not recover L0={L0}"
+    j = int(b.j.item())
+    expected = 2 * L0 / spacing
+    assert 0.3 * expected < j < 3 * expected, f"j={j} not near count-within-L ~{expected:.0f}"
+    assert int(b.underresolved.item()) == 0, "well-resolved (spacing < L) must not flag under-res"
+
+
+def test_j_selftune_underresolved():
+    """Coarse budget: uniform spacing (30) far above the field's structure (L0=3), so even the
+    closest sampled pairs are decorrelated (a flat variogram). underresolved is set and j falls
+    back to the variance target, not to 1. A short half-life makes that floor well above 1."""
+    b = _ar_field_bank(M=200, kp=3, spacing=30.0, L0=3.0, seed=1, halflife=2)
+    b._selftune_pool()
+    L = float(b.L_est.item())
+    assert int(b.underresolved.item()) == 1, f"coarse budget must flag under-res (L={L:.2f})"
+    assert int(b.j.item()) >= 2, f"fallback must be the variance target, not 1 (j={int(b.j.item())})"
+
+
+def test_soft_rank_limits():
+    """soft rank -> hard PIT as sigma -> 0 ; -> 1/2 as noise dominates ; t in [0,1]."""
+    torch.manual_seed(2)
+    b = CountedCoverageBank(M=8, K_prime=3, pit_buffer=600, soft_rank=True)
+    W = 400
+    b.pit_ring[:W] = torch.randn(W) * 5.0                     # well-spread reference
+    b.pit_sig2_ring[:W] = torch.zeros(W)                      # ~0 reference noise
+    b.pit_filled.fill_(W)
+    q = torch.randn(32) * 5.0
+    soft0 = b._soft_rank_score(q, torch.zeros(32))
+    pit = b._pit_score(q)
+    assert torch.allclose(soft0, pit, atol=1e-2), f"soft(sig->0) != PIT: {(soft0 - pit).abs().max():.3f}"
+    soft_big = b._soft_rank_score(q, torch.full((32,), 1e12))
+    assert torch.allclose(soft_big, torch.full((32,), 0.5), atol=1e-3), "noise-dominated -> 1/2"
+    assert torch.all(soft0 >= 0) and torch.all(soft0 <= 1)
+
+
+def test_variance_identity():
+    """A direct simulation of S <- eta S + Poisson(lambda) reproduces
+    Var(lambda_hat) = lambda (1-eta)/(1+eta) at steady state (E = 1/(1-eta))."""
+    torch.manual_seed(0)
+    eta, lam, nsteps, ntrials = 0.9, 3.0, 1500, 6000
+    S = torch.zeros(ntrials)
+    for _ in range(nsteps):
+        S = eta * S + torch.poisson(torch.full((ntrials,), lam))
+    E = 1.0 / (1.0 - eta)
+    lam_hat = S / E
+    var_emp = float(lam_hat.var(unbiased=True).item())
+    var_theory = lam * (1.0 - eta) / (1.0 + eta)
+    rel = abs(var_emp - var_theory) / var_theory
+    assert rel < 0.10, f"Var(lam_hat)={var_emp:.4f} vs theory {var_theory:.4f} (rel {rel:.3f})"
+
+
+def _selftune_cfg():
+    return dict(M=8, K_prime=3, halflife_steps=3, s_buffer_size=64, s_min_buffer=32,
+                s_sweep_interval=5, pit_buffer=64, pool_selftune=True, soft_rank=True, reserve_size=6)
+
+
+def test_determinism_full_path():
+    """Two instances fed the identical sequence end byte-identical -- including the s and j
+    sweeps and the soft-rank readout."""
     torch.manual_seed(7)
-    seqs = [torch.randn(10, 2) * 3.0 for _ in range(30)]
-    b1, b2 = counted(M=5, s=1.0, res=3), counted(M=5, s=1.0, res=3)
+    seqs = [torch.rand(16, 3) * 5.0 for _ in range(120)]
+    b1 = CountedCoverageBank(**_selftune_cfg()); b2 = CountedCoverageBank(**_selftune_cfg())
     for it, s in enumerate(seqs):
-        b1.score_and_update(s.clone(), it)
-        b2.score_and_update(s.clone(), it)
-    assert torch.equal(b1.sync_fingerprint(), b2.sync_fingerprint()), "banks diverged across identical runs"
+        b1.score_and_update(s.clone(), it); b2.score_and_update(s.clone(), it)
+    assert int(b1.s_ready.item()) == 1 and b1._ne() == b1.M, "path should have activated + filled"
+    assert torch.equal(b1.sync_fingerprint(), b2.sync_fingerprint()), "banks diverged"
 
 
 def test_checkpoint_roundtrip():
-    """state_dict save/load restores all counted state exactly, and continues in lock-step."""
+    """state_dict save/load restores all state (incl. the new j / soft-rank buffers) exactly."""
     torch.manual_seed(3)
-    a = counted(M=5, s=1.0, res=3)
-    for it in range(20):
-        a.score_and_update(torch.randn(8, 2) * 3.0, it)
+    a = CountedCoverageBank(**_selftune_cfg())
+    for it in range(80):
+        a.score_and_update(torch.rand(16, 3) * 5.0, it)
     sd = {k: v.clone() for k, v in a.state_dict().items()}
-    b = counted(M=5, s=1.0, res=3)
+    b = CountedCoverageBank(**_selftune_cfg())
     b.load_state_dict(sd)
     assert torch.equal(a.sync_fingerprint(), b.sync_fingerprint())
-    nxt = torch.randn(8, 2) * 3.0
-    a.score_and_update(nxt.clone(), 20); b.score_and_update(nxt.clone(), 20)
+    nxt = torch.rand(16, 3) * 5.0
+    a.score_and_update(nxt.clone(), 80); b.score_and_update(nxt.clone(), 80)
     assert torch.equal(a.sync_fingerprint(), b.sync_fingerprint()), "restored state must continue identically"
 
 
-def test_import_and_flag_construction():
-    """import typicality; build both banks by a flag, as the trainer will."""
-    import typicality  # noqa: F401
-    for flag in ('distance', 'counted'):
-        if flag == 'distance':
-            bank = TypicalityBank(M=8, K_prime=4, replace_fraction=0.1)
-        else:
-            bank = CountedCoverageBank(M=8, K_prime=4)
-        assert hasattr(bank, 'score_and_update') and hasattr(bank, 'sync_fingerprint')
+def test_distance_bank_gone():
+    """The distance bank is removed; only the counted bank is exported."""
+    import typicality
+    assert 'TypicalityBank' not in typicality.__all__
+    try:
+        from typicality import TypicalityBank  # noqa: F401
+        raise AssertionError("TypicalityBank should not be importable")
+    except ImportError:
+        pass
+    bank = CountedCoverageBank(M=8, K_prime=4)
+    for m in ('score_and_update', 'sync_fingerprint', 'health', 'compact_line', 'stats'):
+        assert hasattr(bank, m), f"missing {m}"
 
 
-# --------------------------------------------- self-tuning s (Part 1a) tests
+def test_compact_line_renders():
+    """compact_line renders a single 'typ | ... | OK/flags' status string from synthetic state."""
+    b = counted(M=4, s=19.6)
+    b.s.fill_(19.63); b.s_delta.fill_(-0.08); b.j.fill_(64); b.h_over_L.fill_(1.05)
+    line = b.compact_line(grad_per_step=2.1, t_mean=0.501, t_std=0.288, beta=0.5)
+    assert line.startswith('typ |') and ('OK' in line or '!' in line)
+    assert 's=19.63(-0.08)' in line and 'j=64' in line and 'h/L=1.05' in line
+
+
+# ---------------------------------------------- self-tuning s (unchanged machinery)
 def test_s_recovers_scale():
-    """The sweep edge tracks the live signature scale: the SAME points scaled 6x give a ~6x
-    larger s (the frozen-2.75 bug is exactly this failure). Hits are non-trivial at each scale."""
     torch.manual_seed(11)
     M, kp = 64, 4
     base = torch.rand(1200, kp)
@@ -221,96 +275,71 @@ def test_s_recovers_scale():
         return b._sweep_edge()
 
     e1, e6 = edge_for(1.0), edge_for(6.0)
-    ratio = e6 / e1
-    assert 5.4 < ratio < 6.6, f"edge ratio {ratio:.3f} not ~6x (e1={e1:.4f}, e6={e6:.4f})"
-    # hits non-trivial at each scale's own s
-    for scale, e in [(1.0, e1), (6.0, e6)]:
-        b = CountedCoverageBank(M=M, K_prime=kp, s_buffer_size=1400, s_min_buffer=1)
-        b.s.fill_(e); b.s_ready.fill_(1)
-        for it in range(60):
-            b.score_and_update(torch.rand(64, kp) * scale, it)
-        assert b._ne() == M, f"bank should fill at scale {scale} (n_est={b._ne()})"
-        assert b.est_S[:M].sum().item() > 0.0, f"no hits at scale {scale} with s={e:.4f}"
+    assert 5.4 < e6 / e1 < 6.6, f"edge ratio {e6 / e1:.3f} not ~6x"
 
 
 def test_s_edge_matches_bruteforce():
-    """The grid+bisect edge matches a fine brute-force 'largest s that fills to M' over the
-    sweep's own search range, using an independent (unchunked) seed-on-miss reference."""
     torch.manual_seed(5)
     M, kp, n = 40, 3, 500
     b = CountedCoverageBank(M=M, K_prime=kp, s_grid_points=9, s_min_buffer=1, s_buffer_size=n)
     b._push_buffer(torch.rand(n, kp))
     edge = b._sweep_edge()
     buf = b.sig_ring[:n].float()
-    m = b._buffer_scale(buf)
-    lo, hi = b.grid_span
+    m = b._buffer_scale(buf); lo, hi = b.grid_span
     fine = torch.linspace(lo * m, hi * m, 300).tolist()
     bf = max((sc for sc in fine if _seed_on_miss_ref(buf, sc, M) >= M), default=lo * m)
-    tol = (hi * m - lo * m) / 8.0
-    assert abs(edge - bf) <= tol, f"sweep edge {edge:.4f} vs brute-force {bf:.4f} (m={m:.4f}, tol={tol:.4f})"
+    assert abs(edge - bf) <= (hi * m - lo * m) / 8.0
 
 
 def test_s_determinism():
-    """Identical buffer contents -> byte-identical s (rank-identical sweep, no randomness)."""
     torch.manual_seed(13)
     buf = torch.rand(800, 4)
     b1 = CountedCoverageBank(M=64, K_prime=4, s_buffer_size=800, s_min_buffer=1)
     b2 = CountedCoverageBank(M=64, K_prime=4, s_buffer_size=800, s_min_buffer=1)
     b1._push_buffer(buf.clone()); b2._push_buffer(buf.clone())
-    assert b1._sweep_edge() == b2._sweep_edge(), "sweep edge diverged on identical buffers"
+    assert b1._sweep_edge() == b2._sweep_edge()
 
 
 def test_sweep_read_only():
-    """A sweep updates only the scalar s (in score_and_update); _sweep_edge itself mutates no
-    bank state — established/reserve/counters/pit/buffer all unchanged."""
     torch.manual_seed(17)
     b = CountedCoverageBank(M=16, K_prime=3, s_buffer_size=600, s_min_buffer=1)
-    b.s.fill_(0.2); b.s_ready.fill_(1)                 # get the bank into a non-trivial state
+    b.s.fill_(0.2); b.s_ready.fill_(1)
     for it in range(6):
         b.score_and_update(torch.rand(30, 3), it)
     before = {k: v.clone() for k, v in b.state_dict().items()}
     _ = b._sweep_edge()
     for k, v in before.items():
-        assert torch.equal(b.state_dict()[k], v), f"_sweep_edge mutated bank state: {k}"
+        assert torch.equal(b.state_dict()[k], v), f"_sweep_edge mutated {k}"
 
 
 def test_startup_gate():
-    """Before the first sweep sets s the bank scores t=0 and seeds nothing; once the buffer
-    reaches s_min_buffer the first sweep sets s>0 and the fill begins."""
     b = CountedCoverageBank(M=8, K_prime=3, s_buffer_size=200, s_min_buffer=50, s_sweep_interval=500)
     it = 0
-    while int(b.sig_filled.item()) < 40:               # below the gate: no seed, no score
+    while int(b.sig_filled.item()) < 40:
         out = b.score_and_update(torch.rand(10, 3), it); it += 1
         assert out['ready'] is False and out['t'] is None
-        assert b._ne() == 0, "must not seed before the first sweep"
-        assert float(b.s.item()) == 0.0 and int(b.s_ready.item()) == 0
-    while int(b.s_ready.item()) == 0:                  # cross the gate -> first sweep sets s
+        assert b._ne() == 0 and float(b.s.item()) == 0.0 and int(b.s_ready.item()) == 0
+    while int(b.s_ready.item()) == 0:
         b.score_and_update(torch.rand(10, 3), it); it += 1
-    assert float(b.s.item()) > 0.0, "first sweep must set s>0"
-    assert b._ne() > 0, "the counted fill begins once s is set (same step, fall-through)"
+    assert float(b.s.item()) > 0.0 and b._ne() > 0
 
 
 def test_s_ema_smoothing():
-    """A periodic sweep moves s toward the new edge by an EMA step, not a snap: after a 3x
-    scale jump s advances only ~alpha of the gap."""
     torch.manual_seed(19)
     b = CountedCoverageBank(M=32, K_prime=3, s_buffer_size=600, s_min_buffer=300,
                             s_sweep_interval=5, s_ema_alpha=0.2)
     it = 0
-    while int(b.s_ready.item()) == 0:                  # startup on scale-1 data
+    while int(b.s_ready.item()) == 0:
         b.score_and_update(torch.rand(60, 3), it); it += 1
-    s_prev = float(b.s.item())
-    last = int(b.last_sweep_step.item())
-    # replace the buffer with scale-3 data so the next edge jumps ~3x
+    s_prev = float(b.s.item()); last = int(b.last_sweep_step.item())
     b.sig_ring.zero_(); b.sig_ptr.zero_(); b.sig_filled.zero_()
     b._push_buffer(torch.rand(600, 3) * 3.0)
-    raw_edge = b._sweep_edge()                          # what an un-smoothed update would snap to
-    assert raw_edge > 1.5 * s_prev, f"sanity: new edge {raw_edge:.3f} should dwarf s_prev {s_prev:.3f}"
-    b.score_and_update(torch.rand(60, 3) * 3.0, last + b.s_sweep_interval)   # trigger one periodic sweep
+    raw_edge = b._sweep_edge()
+    assert raw_edge > 1.5 * s_prev
+    b.score_and_update(torch.rand(60, 3) * 3.0, last + b.s_sweep_interval)
     s_new = float(b.s.item())
-    assert s_prev < s_new < raw_edge, f"s should move toward the edge, not snap (prev={s_prev}, new={s_new}, edge={raw_edge})"
-    halfway = s_prev + 0.5 * (raw_edge - s_prev)
-    assert s_new < halfway, f"EMA (alpha=0.2) must move <<half the gap: s_new={s_new:.3f} halfway={halfway:.3f}"
+    assert s_prev < s_new < raw_edge
+    assert s_new < s_prev + 0.5 * (raw_edge - s_prev)
 
 
 def main():

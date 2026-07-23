@@ -1,10 +1,10 @@
 # Typicality Dampening
 
 *Method section (manuscript draft, readability revision). This document describes the
-typicality-dampening module: the morphology-signature representation it operates on, two
-interchangeable memory-bank variants that turn a signature into a typicality score, and the two ways
-that score modulates the learning objective. The two bank variants crossed with the two modulations
-define the four configurations evaluated in Section 4. Except where explicitly attributed to the online-trained run (§3.5), quantitative statements are inference-only
+typicality-dampening module: the morphology-signature representation it operates on, the
+counted-coverage memory bank that turns a signature into a typicality score, and the two ways
+that score modulates the learning objective. The bank with each of the two modulations defines
+the two configurations evaluated in Section 4. Except where explicitly attributed to the online-trained run (§3.5), quantitative statements are inference-only
 measurements on a baseline ViT-B/16 DINOv2 model with all extensions of this work disabled; the
 empirical basis is described in §3.3 and full protocols are given in Appendix A.*
 
@@ -58,12 +58,14 @@ The module runs in three stages on each tile `x`:
 3. **Modulation.** `t(x)` modulates that tile's DINO objective, either as a loss weight or as a
    softmax temperature (§3.6).
 
-The signature (§3.2) and the modulation (§3.6) are common to the whole method; only the bank varies.
-§3.4 is the analysis that relates the two banks — it identifies the condition under which the
-nearest-neighbour readout is a valid density estimate, and the maintenance rule that breaks it, which
-is what the counted-coverage variant is built for. The two banks crossed with the two modulations
-give the four configurations of Section 4; the distance-calibrated bank is the baseline (it is what
-is implemented and instrumented), and the counted-coverage bank is the new variant.
+The signature (§3.2) and the modulation (§3.6) are common to the whole method; the bank is the
+counted-coverage bank (§3.5). §3.3–§3.4 are the estimator analysis that motivates it: a
+nearest-neighbour distance readout is a faithful density estimate only if the stored set is a
+representative *sample*, novelty-driven maintenance instead drives that set toward an even *cover*,
+and so the counted-coverage bank reads density from explicit hit counts rather than from distance.
+The distance readout is retained only as the cold-start estimator (§3.3) while the counters fill; it
+is no longer a selectable bank. The counted-coverage bank with each of the two modulations gives the
+two configurations of Section 4.
 
 ### Notation and terminology
 
@@ -433,6 +435,39 @@ enclosing the `j` stored signatures, ≈ `L` (§3.7) — and going finer resolve
 has no structure below `L`; in `d* ≈ 9.3` those `j` stored signatures already lie within about `1.5×` the local
 spacing, so pooling costs almost nothing in resolution.
 
+**Bandwidth: self-tune `j` to `h ≈ L`.** `j` fixes the readout bandwidth, since `h(x)` is the distance
+to the `j`-th nearest stored signature, and the target is `h ≈ L` — below `L` there is no structure to
+resolve, above it real structure is smoothed away. A fixed `j` does not port: the value that gives
+`h ≈ L` on one instance gives `h ≈ 2.3 L` on another. `j` is therefore *measured*, on the same cadence
+as the radius sweep, by Algorithm 3. `L` is estimated by a **variogram with a nugget** — fitting
+`γ(r) = c₀ + c₁(1 − exp(−r/L))` to the squared `λ̂` differences of established-signature pairs binned by
+separation `r`, over signatures mature enough to be low-noise — rather than by a raw correlation
+threshold: counting noise attenuates correlation at every lag (biasing `L` down) and queries sharing
+stored signatures correlate their noise (biasing it up), and the nugget `c₀` absorbs the former. `j` is
+then the median number of stored signatures within `L` of a query. Two guards bound it. A **variance
+target** sets the floor: since the relative standard error of `p̂` falls as ≈ `1/√j` and the
+per-signature rate variance is `λ̂ (1−η)/(1+η)`, `j_min` is the smallest `j` meeting a target relative
+SE on `log p̂` (default `0.05`), clamped to `j ≤ j_max` (default 256) — a variance target, not an
+arbitrary floor. And **under-resolution** is reported, not hidden: if the median stored-signature
+spacing exceeds `L` (equivalently, the variogram is already at its sill at the smallest lag), no
+`j ≥ 1` can reach `h = L` — the design is coarser than the structure, a property of the memory budget
+rather than a tuning failure. The bank then flags `underresolved`, surfaces `spacing/L`, and falls back
+to the variance-target `j` rather than collapsing to a nearest-signature readout (a first-order,
+spatially frozen bias, strictly worse than a moderate `j`). `j` is EMA-smoothed across sweeps and
+rounded to an integer.
+
+```
+Algorithm 3  Self-tune the pooling count j   (on the radius-sweep cadence)
+  fit  γ(r) = c₀ + c₁(1 − exp(−r/L))  to binned pair semivariances of λ̂ over mature signatures
+       → L         (nugget c₀ absorbs counting noise; subsample pairs, do not form all M²)
+  j_count ← median over queries of  #{ i : ‖x − b_i‖₁ ≤ L }
+  j_min   ← smallest j with relative SE(log p̂) ≤ rse_target,  from Var(λ̂) = λ̂ (1−η)/(1+η)
+  if median-spacing > L  or  variogram flat at the smallest lag:        # under-resolved
+        underresolved ← 1 ;  j_target ← j_min                           #   fall back to variance target
+  else  underresolved ← 0 ;  j_target ← clamp(j_count, j_min, j_max)
+  j ← round( EMA( j, j_target ) )
+```
+
 **Score: the density's percentile, not its value.** The kernel sum `p̂` has no meaningful units — it
 could come out 4 or 800 depending on the kernel — so a tile is scored not by `p̂` but by its **rank**:
 
@@ -440,15 +475,36 @@ could come out 4 or 800 depending on the kernel — so a tile is scored not by `
 t(x) = F̂( log p̂(x) ) ,
 ```
 
-the fraction of *recent tiles* whose density was below this one's. "Denser than 75% of recent tiles"
-means `t = 0.75`. This is the probability integral transform (PIT), and it buys two things: every
-score lands in `[0,1]` with the typical tile near the middle (interpretable), and the score is
-invariant to `p̂`'s unknown scale, to error in `d*`, and to exposure normalization (robust). "Recent
-tiles" is a rolling window of the last ≈ 20,000 `log p̂` values — about twenty steps' worth — long
-enough for the rank to be steady, short enough to move with the stream. A two-moment probit on
-`log p̂` (a running mean and variance) is the cheap parametric fallback that needs no window. Before
-the counters have filled, the nearest-neighbour readout of §3.3 serves as a cold-start estimator;
-after that it is kept only as a consistency probe.
+the fraction of *recent tiles* whose density was below this one's. A hard percentile — the
+probability integral transform (PIT), "denser than 75% of recent tiles" means `t = 0.75` — is uniform
+on `[0,1]` *by construction*: it spreads scores across the range whatever `p̂` is, so a homogeneous
+stream and a strongly structured one produce the same score distribution, and it fails silently. We
+therefore use a **noise-aware soft rank**: a pairwise exceedance probability that folds in each query's
+estimation variance,
+
+```
+t(x) = (1/W) Σ_k Φ( ( log p̂(x) − log p̂_k ) / sqrt( σ²(x) + σ²_k ) ) ,
+```
+
+over the same rolling window of `W ≈ 20,000` reference values `(log p̂_k, σ²_k)`. The variance is
+propagated from the counters by the delta method,
+
+```
+Var(p̂(x)) = Σ_{i ∈ jNN(x)} K_h(x − b_i)² · Var(λ̂_i) ,   Var(λ̂_i) = λ̂_i (1 − η)/(1 + η) ,
+σ²(x)     = Var(p̂(x)) / p̂(x)² ,
+```
+
+where the `(1 − η)/(1 + η)` factor is exact (the naive `S/E²` overstates the counter variance by
+≈ 2×). The soft rank has the two limits that make it safe: as `σ → 0` each term becomes a hard
+indicator and `t` reduces *exactly* to the PIT; as noise dominates, every term → `Φ(0) = 1/2`, so
+`t → 1/2` and the modulation goes neutral rather than manufacturing structure from noise. It is built
+from counts and a rank, so it carries no units. (`σ²_k` is stored alongside `log p̂_k` in the window;
+the cost is `O(W)` per query, reducible to a fixed set of quantile bins if it slows the step. The hard
+PIT and a two-moment probit on `log p̂` remain available as ablations.) The same variance identity fixes
+the estimator's floor: the effective sample size `n_eff = (1 + η)/(1 − η)` (≈ 721 at half-life 250) is
+set by the decay half-life alone, independent of stream length. Before the counters have filled, the
+nearest-neighbour readout of §3.3 serves as the cold-start estimator; after that it is kept only as a
+consistency probe.
 
 **Adding and dropping stored signatures.** The bank is split into an **established set** of capacity `M` and a
 small **reserve** buffer of `≈ reserve` slots on top (total stored `≈ M + reserve`); the established
@@ -467,12 +523,20 @@ persist. This directly reverses the §3.4 pathology — an isolated stored signa
 (`S = 0, E = 0, age = 0`; the decay-and-age step precedes scoring, so `E ≥ 1` before any stored signature is
 read, and `λ̂ = S/(E+ε)`), so a one-off cannot displace an established stored signature before earning hits. Two
 rules keep the reserve a bounded buffer rather than a growing one: a newborn **graduates** into the
-established set on its first hit (evicting the lowest-`λ̂` established stored signature if the set is full), and
-an ungraduated stored signature is **evicted when its age exceeds `T_need`**. Its steady-state occupants are
-therefore the non-graduating one-offs, and its size is their arrival rate times their residency,
-`reserve ≈ ρ_out · κ · T_need`, where `κ` is the tiles per step (one-offs arrive at `ρ_out · κ` per
-step, not `ρ_out`). At `ρ_out ≈ 10⁻³` (the L1 value — isolation is metric-dependent, §3.7),
-`κ ≈ 10³`, and `T_need` a few hundred steps, that is ≈ 300 slots — a few percent of `M`. The two
+established set once it has accrued **two corroborating hits** (evicting the lowest-`λ̂` established
+stored signature if the set is full), and an ungraduated stored signature is **evicted when its age
+exceeds `T_need`**. Two hits rather than one is a stability requirement, not a tuning choice. A
+candidate promoted on a single hit displaces an established stored signature whose rate is estimated
+over hundreds of steps of exposure — one observation set against many. Selecting the genuinely lowest-
+rate signature by `argmin` over `M` noisy estimates needs of order `2 ln M / δ²` accumulated counts to
+resolve rate from noise; at the observed bottom-decile rate that is several thousand steps of exposure,
+whereas one-hit graduation gave a mean slot occupancy several times short of it — so the evicted
+signatures were under-sampled, not genuinely quiet (their measured rate sat near the bottom decile).
+Its steady-state occupants are the non-graduating one-offs, and its size is their arrival rate times
+their residency, `reserve ≈ ρ_out · κ · T_need`, where `κ` is the tiles per step. At `ρ_out ≈ 10⁻³`
+(the L1 value — isolation is metric-dependent, §3.7), `κ ≈ 10³`, and `T_need` a few hundred steps,
+that is a few hundred slots — a few percent of `M`; because the two-hit rule cuts the graduation rate,
+the reserve default is raised to ≈ 550 so occupancy lands just past the stability bound. The two
 decayed counters `S`, `E` fade with a half-life of a few hundred steps — long relative to the batch
 autocorrelation, so recurring morphology builds standing evidence, yet short relative to the drift
 horizon, so the estimate tracks the current distribution. All tie-breaks — the nearest-signature
@@ -510,9 +574,11 @@ Algorithm 2  Counted-coverage bank: update and scoring for one batch X
       i* ← nearest stored signature to s(x)                              # over established ∪ reserve
       if ‖s(x) − b_{i*}‖ ≤ s:                                  # a hit
           S_{i*} ← S_{i*} + 1
-          if i* in reserve:                                    # graduate on first hit
-              if |established| = M:  evict argmin_i S_i/(E_i+ε) over the established set
-              move i* from reserve to established set
+          if i* in reserve:                                    # count corroborating hits
+              hits_{i*} ← hits_{i*} + 1
+              if hits_{i*} ≥ graduation_hits:                  #   graduate on the k-th hit (default 2)
+                  if |established| = M:  evict argmin_i S_i/(E_i+ε) over the established set
+                  move i* from reserve to established set
       else:                                                    # novel tile
           if |established| < M:                                # fill: seed the cover directly
               add a signature to established at s(x):  b ← s(x), S ← 0, E ← 0, age ← 0
@@ -577,7 +643,7 @@ prototypes rather than only down-scaling the tile's contribution. It is a strong
 can actively flatten over-represented modes in the assignment itself, at the cost of coupling the
 typicality estimate more tightly into the representation geometry.
 
-The two banks (§3.3, §3.5) and the two modulations thus define four configurations. Their comparison
+The counted-coverage bank (§3.5) with each of the two modulations thus defines two configurations. Their comparison
 is the subject of Section 4; the sensitivity of the leading configuration to its principal
 hyperparameters (`β` or `α`, the warmup `T_warm`, and, for the counted-coverage bank, the decay
 half-life and hit radius) is studied thereafter.
@@ -632,6 +698,16 @@ Algorithm 2; what it does not exercise is the steady-state reserve and its gradu
 which activate only once the established set is full and serve only to shield established stored signatures from
 one-off tiles. Newborns were initialized `S = E = 1` rather than the `S = E = 0` of §3.5; the offset
 decays away before the counters mature, so neither difference bears on the recovery reported here.
+
+**Scope of these numbers.** The recovery figures in this section — `ρ = 0.75`, the exposure and
+normalization controls, and Table 2 — were produced with the configuration validated at the time: the
+hard PIT score, a fixed `j = 64`, one-hit graduation, and the reserve disabled. The self-tuned `j`
+(Algorithm 3), the noise-aware soft rank, and the two-hit graduation rule change the readout and the
+maintenance, and are **not** covered by this validation; re-running the §3.7 protocol under the
+current configuration is required before their recovery can be quoted. Retiring the distance-calibrated
+bank as a selectable variant likewise does not transfer this evidence to it — these numbers are the
+counted bank's, in the configuration stated, and nothing here should be read as the remaining
+configuration inheriting them.
 
 **Provenance of `R`.** The baseline run had typicality disabled, so `L_R` never ran and the checkpoint
 contains no `R`. We therefore constructed a synthetic `R` from the frozen baseline's `out_dim =

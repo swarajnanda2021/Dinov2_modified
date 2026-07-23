@@ -147,26 +147,24 @@ def get_args_parser():
                         help='Iterations before typicality scores modulate the loss')
     parser.add_argument('--typicality_repr_lr', default=1e-3, type=float,
                         help='Fixed learning rate for representative prototype optimizer')
-    parser.add_argument('--typicality_replace_fraction', default=0.1, type=float,
-                        help='Fraction of bank to refresh per step (distance bank only; ignored by counted)')
-    # ---- Bank variant switch + counted-coverage bank (Algorithm 2) knobs ----
-    parser.add_argument('--typicality_bank', default='distance', type=str,
-                        choices=['distance', 'counted'],
-                        help='Typicality bank variant: distance (Algorithm 1, baseline) or '
-                             'counted (Algorithm 2, counted-coverage). Default distance keeps '
-                             'existing runs byte-for-byte.')
+    # ---- counted-coverage bank knobs (the counted bank is the only implementation) ----
     # NOTE: the counted-bank hit radius s is self-tuned online (rolling buffer + periodic
     # seed-on-miss sweep; see CountedCoverageBank and the s-tuning knobs below). There is no
     # fixed spot_radius: the offline synthetic-R knee ~2.75 is far too small for the live R.
     parser.add_argument('--typicality_pool_j', default=64, type=int,
-                        help='Counted bank: number of nearest stored signatures in the kernel sum (j).')
+                        help='Counted bank: INITIAL number of nearest stored signatures in the kernel '
+                             'sum (j); self-tuned online unless --typicality_pool_selftune=False.')
     parser.add_argument('--typicality_halflife_steps', default=250, type=int,
                         help='Counted bank counter half-life in steps (eta = 0.5**(1/H)).')
     parser.add_argument('--typicality_reserve_residency', default=300, type=int,
                         help='Counted bank reserve residency T_need (steps before an ungraduated '
                              'reserve stored signature expires).')
-    parser.add_argument('--typicality_reserve_size', default=300, type=int,
-                        help='Counted bank reserve buffer size, on top of M (~a few percent of M).')
+    parser.add_argument('--typicality_reserve_size', default=550, type=int,
+                        help='Counted bank reserve buffer size, on top of M (Part 1: raised 300->550 '
+                             'to keep occupancy near the stability bound under two-hit graduation).')
+    parser.add_argument('--typicality_graduation_hits', default=2, type=int,
+                        help='Counted bank: hits a reserve signature needs before graduating to '
+                             'established (Part 1: 2, so promotion is not on a single observation).')
     parser.add_argument('--typicality_readout', default='pit', type=str,
                         choices=['pit', 'probit'],
                         help='Counted bank readout: pit (decayed empirical rank) or probit.')
@@ -191,6 +189,20 @@ def get_args_parser():
     parser.add_argument('--typicality_s_headroom', default=0.0, type=float,
                         help='Counted bank: optional fraction to sit under the edge, s <- '
                              'edge*(1-headroom). Default 0.')
+    # ---- counted-bank self-tuning pool count j (Algorithm 3) ----
+    parser.add_argument('--typicality_pool_selftune', default=True, type=utils.bool_flag,
+                        help='Counted bank: self-tune j online from the variogram L estimate; '
+                             'False pins j to --typicality_pool_j for an ablation.')
+    parser.add_argument('--typicality_pool_rse_target', default=0.05, type=float,
+                        help='Counted bank: target relative SE on log p_hat that sets the j floor.')
+    parser.add_argument('--typicality_pool_max', default=256, type=int,
+                        help='Counted bank: upper clamp on the self-tuned j.')
+    parser.add_argument('--typicality_pool_ema', default=0.2, type=float,
+                        help='Counted bank: EMA weight for j across sweeps.')
+    # ---- counted-bank scoring ----
+    parser.add_argument('--typicality_soft_rank', default=True, type=utils.bool_flag,
+                        help='Counted bank: noise-aware soft rank score; False restores the hard PIT '
+                             'for an ablation.')
 
     # ========== Adversarial mask-as-student-view augmentation parameters ==========
     # Note: --num_masks, --mask_model_arch, --mask_checkpoint are already declared

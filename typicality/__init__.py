@@ -5,13 +5,11 @@ Fully detached from DINO gradients — only R has its own optimizer.
 """
 
 from .representative_prototypes import RepresentativePrototypes
-from .typicality_bank import TypicalityBank
 from .typicality_scorer import TypicalityScorer
 from .counted_coverage_bank import CountedCoverageBank
 
 __all__ = [
     'RepresentativePrototypes',
-    'TypicalityBank',
     'TypicalityScorer',
     'CountedCoverageBank',
 ]

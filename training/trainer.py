@@ -40,7 +40,7 @@ from .helpers import (
     worker_init_fn,
     setup_ddp_model,
 )
-from typicality import RepresentativePrototypes, TypicalityBank, TypicalityScorer, CountedCoverageBank
+from typicality import RepresentativePrototypes, TypicalityScorer, CountedCoverageBank
 
 
 def _gather_and_compute_weights(patch_tokens, mask, masks_weight=None):
@@ -427,34 +427,31 @@ def train_dinov2(args):
         )
         repr_protos = repr_protos.cuda()
 
-        if getattr(args, 'typicality_bank', 'distance') == 'counted':
-            typicality_bank = CountedCoverageBank(
-                M=args.typicality_bank_size,
-                K_prime=args.typicality_K_prime,
-                pool_j=args.typicality_pool_j,
-                halflife_steps=args.typicality_halflife_steps,
-                reserve_residency=args.typicality_reserve_residency,
-                reserve_size=args.typicality_reserve_size,
-                readout=args.typicality_readout,
-                pit_buffer=args.typicality_pit_buffer,
-                s_buffer_size=args.typicality_s_buffer_size,
-                s_sweep_interval=args.typicality_s_sweep_interval,
-                s_grid_points=args.typicality_s_grid_points,
-                grid_span=tuple(args.typicality_s_grid_span),
-                s_ema_alpha=args.typicality_s_ema_alpha,
-                s_min_buffer=args.typicality_s_min_buffer,
-                s_headroom=args.typicality_s_headroom,
-            )
-        else:
-            typicality_bank = TypicalityBank(
-                M=args.typicality_bank_size,
-                K_prime=args.typicality_K_prime,
-                replace_fraction=args.typicality_replace_fraction,
-            )
-        typicality_bank = typicality_bank.cuda()
+        typicality_bank = CountedCoverageBank(
+            M=args.typicality_bank_size,
+            K_prime=args.typicality_K_prime,
+            pool_j=args.typicality_pool_j,
+            halflife_steps=args.typicality_halflife_steps,
+            reserve_residency=args.typicality_reserve_residency,
+            reserve_size=args.typicality_reserve_size,
+            readout=args.typicality_readout,
+            pit_buffer=args.typicality_pit_buffer,
+            s_buffer_size=args.typicality_s_buffer_size,
+            s_sweep_interval=args.typicality_s_sweep_interval,
+            s_grid_points=args.typicality_s_grid_points,
+            grid_span=tuple(args.typicality_s_grid_span),
+            s_ema_alpha=args.typicality_s_ema_alpha,
+            s_min_buffer=args.typicality_s_min_buffer,
+            s_headroom=args.typicality_s_headroom,
+            graduation_hits=args.typicality_graduation_hits,
+            pool_selftune=args.typicality_pool_selftune,
+            pool_rse_target=args.typicality_pool_rse_target,
+            pool_max=args.typicality_pool_max,
+            pool_ema=args.typicality_pool_ema,
+            soft_rank=args.typicality_soft_rank,
+        ).cuda()
 
-        print(f"Created Typicality Dampening:")
-        print(f"  Bank variant: {getattr(args, 'typicality_bank', 'distance')}")
+        print(f"Created Typicality Dampening (counted-coverage bank):")
         print(f"  K' = {args.typicality_K_prime}, Bank M = {args.typicality_bank_size}")
         print(f"  Modulation: {args.typicality_modulation}")
         print(f"  Warmup: {args.typicality_warmup_iters} iterations")
@@ -700,16 +697,16 @@ def train_dinov2(args):
             print(f"  Weight norm mean: {proto_stats['weight_norm_mean']:.6f}")
             print(f"  Weight norm std: {proto_stats['weight_norm_std']:.6f}")
         if args.use_typicality_dampening and typicality_bank is not None:
-            if hasattr(typicality_bank, 'bank_filled'):          # distance bank (Algorithm 1)
-                print(f"Typicality Bank: {typicality_bank.bank_filled.item()}/{typicality_bank.M} filled")
-            else:                                                # counted bank (Algorithm 2): no bank_filled
-                _st = typicality_bank.stats()
-                print(f"Typicality Bank (counted): n_est={_st['n_est']}/{typicality_bank.M} "
-                      f"reserve={_st['n_reserve']} graduations={_st['graduations']} s={_st['s']:.4f}")
+            _st = typicality_bank.stats()
+            print(f"Typicality Bank (counted): n_est={_st['n_est']}/{typicality_bank.M} "
+                  f"reserve={_st['n_reserve']} graduations={_st['graduations']} "
+                  f"s={_st['s']:.4f} j={_st['j']}")
         print("="*50 + "\n")
 
     metric_logger = utils.IterationMetricLogger(total_iterations=args.total_iterations)
     metric_logger.start_time = time.time()
+    typ_last_grad = 0                        # for the per-interval graduations/step diff (compact log)
+    typ_last_grad_iter = int(getattr(args, 'typicality_warmup_iters', 0))
 
     data_iterator = iter(train_loader)
 
@@ -1022,7 +1019,6 @@ def train_dinov2(args):
                     # Compute morphology signatures (local, detached)
                     s_batch = repr_protos.compute_signatures(z_global1)
 
-                    # Bank-agnostic (distance / counted, selected by --typicality_bank).
                     # All-gather signatures so the bank runs identically on every rank (rank
                     # order preserved -> byte-identical, fingerprint-checked below). The bank
                     # returns t over the gathered batch; take this rank's local rows for the
@@ -1385,36 +1381,27 @@ def train_dinov2(args):
         if args.use_typicality_dampening and repr_protos is not None:
             metric_logger.update(repr_L_nn=l_nn.item())
             metric_logger.update(repr_L_cov=l_cov.item())
-            is_counted = getattr(args, 'typicality_bank', 'distance') == 'counted'
-            if is_counted and current_iteration >= args.typicality_warmup_iters:
-                # Counted-coverage telemetry — active from warmup onward (through the s-tuning
-                # startup and the fill), so the inert-bank failure would show here, live.
+            if current_iteration >= args.typicality_warmup_iters:
+                # Reduced, mostly-derived scalar meters for plot_typicality.py; the compact
+                # human-readable status line is printed alongside 'It .../...' below.
                 h = typicality_bank.health()
-                metric_logger.update(typicality_s=h['s'])                      # self-tuned hit radius
-                metric_logger.update(typicality_n_est=h['n_est'])
-                metric_logger.update(typicality_reserve=h['n_reserve'])
-                metric_logger.update(typicality_graduations=h['graduations'])
-                metric_logger.update(typicality_admits=h['admits'])           # seeds this step
-                metric_logger.update(typicality_lam_median=h['lam_median'])   # core strength: S/E
-                metric_logger.update(typicality_lam_q10=h['lam_q10'])
-                metric_logger.update(typicality_lam_q90=h['lam_q90'])
-                metric_logger.update(typicality_strong_core=h['strong_core_frac'])
-                metric_logger.update(typicality_evict_lam=h['evict_lam_mean'])  # should stay ~0
+                metric_logger.update(
+                    typ_s=h['s'], typ_j=h['j'], typ_h_over_L=h['h_over_L'],
+                    typ_n_est=h['n_est'], typ_reserve=h['n_reserve'], typ_hit_frac=h['hit_frac'],
+                    typ_lam_q10=h['lam_q10'], typ_lam_median=h['lam_median'], typ_lam_q90=h['lam_q90'],
+                    typ_lam_spread=h['lam_spread'], typ_evict_over_q10=h['evict_over_q10'],
+                    typ_underresolved=h['underresolved'],
+                )
                 if out.get('t') is not None:
-                    tg = out['t']                                             # global-batch scores
-                    metric_logger.update(typicality_t_mean=tg.mean().item())
-                    metric_logger.update(typicality_t_std=tg.std().item())
-                    metric_logger.update(typicality_t_lt0p1=(tg < 0.1).float().mean().item())
-                    metric_logger.update(typicality_t_gt0p9=(tg > 0.9).float().mean().item())
-            elif not is_counted and out['ready']:
-                # Distance-calibrated bank (Algorithm 1) — existing logging path, intact.
-                metric_logger.update(typicality_mu=out['mu'].item())
-                metric_logger.update(typicality_sigma=out['sigma'].item())
-                metric_logger.update(typicality_t_mean=t.mean().item())
-                metric_logger.update(typicality_t_std=t.std().item())
-                metric_logger.update(typicality_d_mean=out['d'].mean().item())
-                metric_logger.update(typicality_diffuse_frac=(typicality_bank.bank.max(dim=1).values < 0.5).float().mean().item())
-                metric_logger.update(typicality_t_lt0p1=(t < 0.1).float().mean().item())
+                    _tg = out['t']
+                    _tm = _tg.mean().item()
+                    metric_logger.update(typ_t_mean=_tm, typ_t_std=_tg.std().item(),
+                                         typ_w_mean=1.0 - args.typicality_beta * _tm)
+                if current_iteration == args.typicality_warmup_iters and utils.is_main_process():
+                    # n_eff = (1+eta)/(1-eta): the estimator's variance floor, set by the
+                    # half-life alone (independent of stream length).
+                    print(f"[typicality] activated: n_eff = (1+eta)/(1-eta) = {h['n_eff']:.1f} "
+                          f"(variance floor set by the half-life)")
 
         metric_logger.update(lr=optimizer_student.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer_student.param_groups[0]["weight_decay"])
@@ -1433,6 +1420,21 @@ def train_dinov2(args):
             metric_logger.synchronize_between_processes()
             print(f"It {current_iteration}/{args.total_iterations/1000:.0f}k (ETA {eta_string}), "
                 f"Progress: {progress*100:.1f}%, max mem: {memory/1000:.1f} GB : {metric_logger}")
+
+            # compact typicality status line (Part 4): dimensionless health at a glance
+            if (args.use_typicality_dampening and repr_protos is not None
+                    and current_iteration >= args.typicality_warmup_iters):
+                _gnow = int(typicality_bank.graduations.item())
+                _di = max(current_iteration - typ_last_grad_iter, 1)
+                _gps = (_gnow - typ_last_grad) / _di            # graduations/step over the interval
+                typ_last_grad = _gnow
+                typ_last_grad_iter = current_iteration
+                _tt = out.get('t')
+                _tm = _tt.mean().item() if _tt is not None else 0.0
+                _ts = _tt.std().item() if _tt is not None else 0.0
+                metric_logger.update(typ_grad_per_step=_gps,
+                                     typ_turnover=(typicality_bank.M / _gps if _gps > 1e-9 else 0.0))
+                print(typicality_bank.compact_line(_gps, _tm, _ts, args.typicality_beta))
 
         # ========== Write to log file ==========
         if utils.is_main_process() and current_iteration % 100 == 0:

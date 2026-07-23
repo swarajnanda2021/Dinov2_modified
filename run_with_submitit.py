@@ -228,11 +228,9 @@ def main():
     args.typicality_beta = 0.5
     args.typicality_warmup_iters = 50000   # fill bank only after representation has settled (late-fill)
     args.typicality_repr_lr = 1e-3
-    args.typicality_replace_fraction = 0.1 # evict-nearest churn rate (bank refreshed ~10%/step)
-    args.typicality_bank = 'distance'      # 'distance' (Alg.1, baseline) | 'counted' (Alg.2). Counted
-                                           # knobs (pool_j/halflife_steps/reserve*/readout/pit_buffer and
-                                           # the s-tuning s_* knobs) default from config; the hit radius s
-                                           # is self-tuned online (no fixed radius). Override here if needed.
+    # The counted-coverage bank is the only implementation; its knobs (pool_j / halflife_steps /
+    # reserve* / readout / pit_buffer, the s-tuning s_* knobs, and the self-tune-j / soft-rank
+    # knobs) default from config. The hit radius s and the pooling count j are self-tuned online.
 
     # Adversarial-mask-as-student-view augmentation (re-uses mask_checkpoint above)
     args.use_adversarial_mask_augmentation = False
@@ -355,7 +353,7 @@ def main():
         print(f"  Typicality Dampening: ENABLED")
         print(f"    K' = {args.typicality_K_prime}, Bank M = {args.typicality_bank_size}")
         print(f"    Modulation: {args.typicality_modulation}")
-        print(f"    warmup = {args.typicality_warmup_iters}, replace_fraction = {args.typicality_replace_fraction}")
+        print(f"    warmup = {args.typicality_warmup_iters}")
 
     if args.use_adversarial_mask_augmentation:
         print(f"  Adversarial Mask Augmentation: ENABLED")
