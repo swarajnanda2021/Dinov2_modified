@@ -583,6 +583,28 @@ class CountedCoverageBank(nn.Module):
         self._update(s_global)
         return {'ready': True, 't': t}
 
+    def load_state_dict(self, state_dict, strict=False):
+        """Tolerate buffer-size changes across config edits on resume (e.g. reserve_size 300->550,
+        or a changed pit_buffer / s_buffer_size): copy the overlapping prefix of each mismatched
+        buffer and leave the remainder at its init value, so a checkpoint saved under a different
+        size still restores the established set, counters, s, and j. New buffers absent from an
+        older checkpoint (res_hits, pit_sig2_ring, j / j_smooth / L_est / ...) keep their init
+        values. Without this, torch's load_state_dict raises on the reserve shape mismatch even
+        with strict=False (strict only tolerates missing/unexpected keys, not size changes)."""
+        own = self.state_dict()
+        reconciled = {}
+        for k, v in state_dict.items():
+            if k in own and hasattr(v, 'shape') and own[k].shape != v.shape:
+                cur = own[k].clone()
+                sl = tuple(slice(0, min(a, b)) for a, b in zip(cur.shape, v.shape))
+                cur[sl] = v[sl]
+                reconciled[k] = cur
+            else:
+                reconciled[k] = v
+        out = super().load_state_dict(reconciled, strict=False)
+        self.n_res.clamp_(max=self.reserve_cap)          # keep occupancy within the (maybe smaller) cap
+        return out
+
     @torch.no_grad()
     def sync_fingerprint(self):
         """Flat tensor of all cross-rank state (byte-identical on every rank)."""

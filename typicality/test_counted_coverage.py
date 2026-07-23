@@ -240,6 +240,29 @@ def test_checkpoint_roundtrip():
     assert torch.equal(a.sync_fingerprint(), b.sync_fingerprint()), "restored state must continue identically"
 
 
+def test_checkpoint_size_change_on_resume():
+    """Reproduces the resume crash: an OLDER checkpoint (smaller reserve, and without the buffers
+    added later -- res_hits, pit_sig2_ring, j, ...) must load into the current model without a
+    shape-mismatch RuntimeError. The established set, counters, and s restore; the reserve fits the
+    new cap; the missing new buffers keep their init values."""
+    torch.manual_seed(4)
+    a = CountedCoverageBank(**{**_selftune_cfg(), 'reserve_size': 4})
+    for it in range(80):
+        a.score_and_update(torch.rand(16, 3) * 5.0, it)
+    sd = {k: v.clone() for k, v in a.state_dict().items()}
+    for k in ('res_hits', 'pit_sig2_ring', 'j', 'j_smooth', 'L_est', 'h_over_L',
+              'underresolved', 's_delta'):
+        sd.pop(k, None)                                     # simulate a pre-refactor checkpoint
+    b = CountedCoverageBank(**{**_selftune_cfg(), 'reserve_size': 12})   # larger reserve now
+    b.load_state_dict(sd)                                   # must NOT raise (was RuntimeError)
+    assert b.res_b.shape[0] == 12 and int(b.n_res.item()) <= 12
+    assert torch.equal(a.est_b, b.est_b) and torch.equal(a.est_S, b.est_S)
+    assert torch.equal(a.n_est, b.n_est) and float(a.s.item()) == float(b.s.item())
+    nr = int(a.n_res.item())
+    if nr > 0:
+        assert torch.equal(a.res_b[:nr], b.res_b[:nr]), "valid reserve prefix must carry over"
+
+
 def test_distance_bank_gone():
     """The distance bank is removed; only the counted bank is exported."""
     import typicality
