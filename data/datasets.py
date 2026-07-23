@@ -340,6 +340,16 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
                 if s is not None:
                     streams.append(s)
                 continue
+            emitted += 1
+            if emitted <= skip_per_worker:
+                # Resume fast-forward: advance the stream position WITHOUT reading or decoding
+                # the image. The previous order (decode then discard) re-decoded the entire
+                # pre-resume prefix -- ~iter*batch_per_gpu/num_workers images per worker (e.g.
+                # ~2.9M at iter 112k) -- which read as a multi-hour, log-silent hang on every
+                # checkpoint resume/requeue. Corrupt entries are not detected while skipping, so
+                # the resume offset can differ from an uninterrupted run by the corrupt fraction
+                # (~0.1%); immaterial for SSL on this stream.
+                continue
             try:
                 img = Image.open(io.BytesIO(zf.read(name))).convert('RGB')
             except Exception as e:
@@ -358,9 +368,6 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
                     s = _open_next()
                     if s is not None:
                         streams.append(s)
-                continue
-            emitted += 1
-            if emitted <= skip_per_worker:
                 continue
             yield self.transforms(img)
 
