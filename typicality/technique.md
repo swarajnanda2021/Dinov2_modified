@@ -614,7 +614,9 @@ in the 32–64 range at which the pooling radius reaches `L` — the 64th-neares
 density field has no structure; the readout is otherwise insensitive to the profile (the offline study
 of §3.7 used a truncated Gaussian and gives the same recovery). *Half-life:* 250 steps
 (`η = 0.5^{1/250} ≈ 0.997`) — long relative to the batch autocorrelation, short relative to the drift
-horizon (§3.5); the offline study used 100 steps with no material change. *Cold-start switchover:* the
+horizon (§3.5); the offline study used 100 steps with no material change. This is nonetheless the
+method's least-justified constant — hand-picked where every other parameter is self-tuned, budgeted, or
+measured, and alone in fixing the estimator's variance floor (§3.8). *Cold-start switchover:* the
 counted readout activates once the bank is full *and* the median exposure has passed one half-life's
 accumulation, `median E ≥ 0.5/(1−η)`. (The exposure ceiling `1/(1−η)` is approached from below but
 never reached — a literal `E ≥ 1/(1−η)` test would never fire — so the threshold is half the ceiling,
@@ -826,7 +828,7 @@ flags the need to re-measure before committing a training run.
 
 ### 3.8 Limitations
 
-Three limitations bound the method. First, as noted in §3.5, the estimate is resolution-limited: with
+Four limitations bound the method. First, as noted in §3.5, the estimate is resolution-limited: with
 a fixed memory budget over a support of intrinsic dimension near ten, structure finer than the
 correlation length is invisible to any bounded summary. Second, the empirical constants of Table 1
 were measured on a single, morphologically homogeneous slice of the stream; a substantially more
@@ -837,6 +839,30 @@ measures is not exogenous. Deferring activation until the representation has sta
 safeguard we rely on; a formal analysis of the coupled dynamics is left to future work, and the
 adaptive-temperature modulation, which feeds back through the target distribution, tightens this
 coupling relative to the weighted-loss form.
+
+Fourth, the counter half-life `H` is the least-justified constant in the method. Every other parameter
+is either self-tuned online (the hit radius `s` and the pooling count `j`; §3.5), a memory budget
+(`M`), derived from a measured rate (the reserve size; §3.5), or inert in practice (`T_need`); `H`
+alone is hand-picked, and it alone sets the variance floor of the whole estimator. The decay fixes an
+effective sample size `n_eff = (1 + η)/(1 − η) ≈ 721` steps at `H = 250`, a property of the half-life
+alone and independent of stream length — a run of `10⁸` tiles gives the same per-signature precision as
+one of `10⁵`, and at typical hit-rates that is ≈ 12% relative noise on each stored signature's rate.
+Longer training does not sharpen the density estimate; only a longer half-life does. The value was
+*bracketed, not optimised*: it must sit above the tile burst length (which decays within one step;
+§3.5) and below the representation's drift horizon (tens of thousands of steps), leaving roughly two
+orders of magnitude of slack, with 250 chosen inside that range. The only sensitivity evidence is the
+offline `100`-versus-`250` comparison of §3.7, which found no material difference — but that is two
+points, measured offline and under the earlier configuration (hard PIT, fixed `j`, one-hit
+graduation), so it does not transfer to the present method. A post hoc bound does constrain the value
+and is worth recording: a signature's rate must settle before the signature turns over, which requires
+the observed turnover to exceed roughly `2·n_eff`. At the measured turnover of ≈ 2800 steps, a
+half-life of 500 would give `n_eff ≈ 1442` and a ratio of 1.9, below that bound, while halving to 125
+raises per-signature noise to ≈ 17%; the usable window is therefore roughly 150–400 steps, and 250
+sits inside it — but this is a constraint identified after the fact, not the reason the value was
+chosen, and no measurement establishes that it is the best point within it. Finally, `H` is counted in
+*steps*, so it is implicitly tied to the batch size: changing the tiles per step changes the effective
+memory measured in tiles, and the natural clock for this quantity is tiles seen rather than steps, so a
+change of batch size should rescale `H` accordingly.
 
 ---
 
