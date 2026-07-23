@@ -295,6 +295,13 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         rng.shuffle(my_zips)
 
         skip_per_worker = self._resume_global // max(total, 1)
+        # Wrap the resume skip within one pass of this worker's shard, so it can never skip the
+        # whole shard and yield nothing (which, in the multi-dataset wrapper, raises StopIteration
+        # out of the generator -> a PEP-479 RuntimeError that kills the worker on resume).
+        # total_images is the full-dataset count; // total approximates this worker's per-pass share.
+        per_worker_pass = getattr(self, 'total_images', 0) // max(total, 1)
+        if per_worker_pass > 0:
+            skip_per_worker %= per_worker_pass
         emitted = 0
 
         K = self.zip_interleave
@@ -602,9 +609,14 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
             dataset.set_worker_info(worker_id, num_workers)
     
     def set_resume_position(self, global_samples_processed):
-        """Propagate resume position to all datasets"""
-        for dataset in self.datasets:
-            dataset.set_resume_position(global_samples_processed)
+        """Propagate resume position to each sub-dataset as ITS proportional share of the
+        global count. A small dataset contributed only its fraction of the samples, so passing
+        the full global count to every dataset would tell the small ones to skip more images
+        than they have -- emptying them on resume (StopIteration out of the generator below)."""
+        bs = max(self.batch_size_per_gpu, 1)
+        for i, dataset in enumerate(self.datasets):
+            share = int(global_samples_processed * self.samples_per_dataset[i] / bs)
+            dataset.set_resume_position(share)
     
     def __iter__(self):
         """
@@ -640,10 +652,16 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
                     sample = next(self.iterators[dataset_idx])
                     yield sample
                 except StopIteration:
-                    # One dataset exhausted - recreate its iterator
+                    # One dataset exhausted - recreate its iterator and try once more.
                     print(f"Dataset {self.dataset_names[dataset_idx]} exhausted, restarting...")
                     self.iterators[dataset_idx] = iter(self.datasets[dataset_idx])
-                    sample = next(self.iterators[dataset_idx])
+                    try:
+                        sample = next(self.iterators[dataset_idx])
+                    except StopIteration:
+                        # Still empty right after a restart (e.g. an over-skipped resume). Skip
+                        # this slot instead of letting StopIteration escape the generator, which
+                        # Python 3.7+ (PEP 479) converts to RuntimeError and kills the worker.
+                        continue
                     yield sample
     
     def __len__(self):
