@@ -632,8 +632,17 @@ Both banks produce a typicality score `t(x)`, which modulates the image-level DI
 of two ways. The iBOT objective is untouched; the total loss is
 `L = m(x) · CE_DINO + CE_iBOT + λ_sem · CE_iBOT^{sem}`, where the modulation `m(x)` is one of:
 
-**Weighted loss.** The DINO term is scaled per tile by `w(x) = 1 − β · t(x)`, `β ∈ [0,1]`. A typical
-tile contributes a smaller-magnitude gradient while the target it is trained toward is unchanged.
+**Weighted loss.** The DINO term is scaled per tile by `w(x) = 1 − β · t(x)`, `β ∈ [0,1]`, and applied
+as a **weight-normalised mean**, `Σ w(x)·CE(x) / Σ w(x)`. Because the weight sum divides out, the
+batch-level gradient magnitude is unchanged and the modulation acts entirely through the *relative*
+weights — a uniform weight of any value is identical to no weighting. At `β = 0.5` with a percentile
+score the raw weights span `[1 − β, 1] = [0.5, 1]`; normalised by the batch-mean weight (≈ 0.75), a
+typical tile carries ≈ 0.73× the batch-average weight against ≈ 1.27× for a rare one — a spread of
+≈ 1.7× between the two, not an absolute change of scale. The modulation therefore does not attenuate
+the objective overall; it redistributes emphasis *within* each batch, which is the intended behaviour,
+since it avoids silently rescaling the effective learning rate as a side-effect of dampening. (This
+cancellation is specific to the weighted-loss form: the adaptive-temperature variant below reshapes
+the target distribution itself and carries no such normalisation.)
 This is a direct importance weighting — it flattens the effective sampling distribution over
 morphology while leaving each tile's learning signal intact — and is bounded and simple to reason
 about.
