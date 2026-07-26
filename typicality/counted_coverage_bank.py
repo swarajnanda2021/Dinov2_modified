@@ -40,8 +40,6 @@ import math
 import torch
 import torch.nn as nn
 
-from .typicality_scorer import TypicalityScorer
-
 
 def _argmin_lowest(x):
     """argmin with lowest-index tie-break (torch.argmin returns the first/lowest index)."""
@@ -358,17 +356,6 @@ class CountedCoverageBank(nn.Module):
         return bool((torch.median(self.est_E[:self.M]) >= self.mature_E).item())
 
     @torch.no_grad()
-    def _coldstart_readout(self, s_global):
-        """Distance readout (section 3.3) over the established set: t = 1 - Phi((d-mu)/sigma).
-        Used until the counters have matured; the same readout the covering set motivates."""
-        bank = self.est_b[:self.M]
-        d = torch.cdist(s_global, bank, p=1).min(dim=1).values
-        Dbank = torch.cdist(bank, bank, p=1)
-        Dbank.diagonal().fill_(float('inf'))
-        nn = Dbank.min(dim=1).values
-        return TypicalityScorer.compute_scores(d, nn.mean(), nn.std())
-
-    @torch.no_grad()
     def _counted_readout(self, s_global):
         """Fixed-radius kernel sum. p_hat(x) = sum_i lambda_hat_i * K(d_i / R_rad) over the
         established signatures within R_rad = radius_mult * s. The triweight clamps to zero
@@ -520,9 +507,8 @@ class CountedCoverageBank(nn.Module):
             self._update(s_global)
             return {'ready': False, 'p_hat': None}
         if not self._matured():
-            # cold start: counters immature, no p_hat -> apply NO modulation (explicit; the
-            # trainer passes sample_weights=None). _coldstart_readout (distance, section 3.3) is
-            # retained but no longer feeds a weight, since it produces no density.
+            # cold start: counters immature, no p_hat -> apply NO modulation (explicit; the trainer
+            # passes sample_weights=None). The distance readout (section 3.3) is not run at runtime.
             self._update(s_global)
             return {'ready': True, 'p_hat': None}
         p_hat = self._counted_readout(s_global)

@@ -136,13 +136,13 @@ def get_args_parser():
                         help='Number of representative prototypes (128=undercomplete, 256=complete, 512=overcomplete)')
     parser.add_argument('--typicality_bank_size', default=8192, type=int,
                         help='Bank capacity M (number of stored signatures)')
-    parser.add_argument('--typicality_modulation', default='adaptive_temp', type=str,
-                        choices=['adaptive_temp', 'weighted_loss'],
-                        help='Gradient modulation variant')
-    parser.add_argument('--typicality_alpha', default=1.0, type=float,
-                        help='Dampening strength for adaptive temperature variant')
-    # (--typicality_beta removed: the weighted-loss weight is w = 1/(p_hat + c)^a now, set by
-    #  --typicality_a / --typicality_c_frac / --typicality_radius_mult, not 1 - beta*t.)
+    parser.add_argument('--typicality_modulation', default='weighted_loss', type=str,
+                        choices=['weighted_loss'],
+                        help='Gradient modulation variant (weighted_loss only; the counted bank '
+                             'drives w = 1/(p_hat + c)^a)')
+    # (--typicality_alpha removed with the adaptive-temperature variant, and --typicality_beta
+    #  removed earlier: the weighted-loss weight is w = 1/(p_hat + c)^a, set by --typicality_a /
+    #  --typicality_c_frac / --typicality_radius_mult.)
     parser.add_argument('--typicality_warmup_iters', default=15000, type=int,
                         help='Iterations before typicality scores modulate the loss')
     parser.add_argument('--typicality_repr_lr', default=1e-3, type=float,

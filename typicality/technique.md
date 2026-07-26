@@ -2,9 +2,9 @@
 
 *Method section (manuscript draft, readability revision). This document describes the
 typicality-dampening module: the morphology-signature representation it operates on, the
-counted-coverage memory bank that turns a signature into a typicality score, and the two ways
-that score modulates the learning objective. The bank with each of the two modulations defines
-the two configurations evaluated in Section 4. Except where explicitly attributed to the online-trained run (§3.5), quantitative statements are inference-only
+counted-coverage memory bank that turns a signature into a per-tile density, and the weighted-loss
+modulation that density drives. Section 4 evaluates that configuration at two tilt settings.
+Except where explicitly attributed to the online-trained run (§3.5), quantitative statements are inference-only
 measurements on a baseline ViT-B/16 DINOv2 model with all extensions of this work disabled; the
 empirical basis is described in §3.3 and full protocols are given in Appendix A.*
 
@@ -62,9 +62,10 @@ counted-coverage bank (§3.5). §3.3–§3.4 are the estimator analysis that mot
 nearest-neighbour distance readout is a faithful density estimate only if the stored set is a
 representative *sample*, novelty-driven maintenance instead drives that set toward an even *cover*,
 and so the counted-coverage bank reads density from explicit hit counts rather than from distance.
-The distance readout is retained only as the cold-start estimator (§3.3) while the counters fill; it
-is no longer a selectable bank. The counted-coverage bank with each of the two modulations gives the
-two configurations of Section 4.
+The distance readout is no longer used at runtime — §3.3–§3.4 keep it only as the estimator analysis
+that motivates the counted-coverage design — and cold start applies no modulation rather than falling
+back to it (§3.5). The counted-coverage bank with the weighted-loss modulation is the configuration
+evaluated in Section 4, at two tilt settings.
 
 ### Notation and terminology
 
@@ -598,11 +599,15 @@ largest radius that still fills the bank to `M`, smoothed by an exponential movi
 ≈ 5-sweep time constant. Because the radius is re-measured on the live signatures, it tracks the scale
 drift of the online-trained `R` that a fixed value cannot (§3.7, "Bank size `M`"). *Kernel and readout
 radius:* a triweight profile `k(u) = (1 − u²)³` on `u ≤ 1` (smooth and compactly supported), summed over
-the stored signatures within `R_rad = radius_mult · s`, `radius_mult = 1.5`. `1.5` is the multiple at
-which the fixed-radius density agreed best with an offline `k`-NN reference (measured correlation 0.85)
-and the empty-neighbourhood fraction first reached zero in the sweep (§3.7, "Measured basis"); the
-measured `spacing / s ≈ 1.02` makes `s` a valid stand-in for the stored-signature spacing. `j` is no
-longer a readout parameter (it is a resolution diagnostic; §3.5). *Weight:* `w = 1/(p̂ + c)^a`,
+the stored signatures within `R_rad = radius_mult · s`, `radius_mult = 1.5`. The radius is parameterised
+as a multiple of the **self-tuned hit radius `s`**, not of the anchor spacing directly, because `s` is
+what the bank measures online and therefore what tracks the drifting signature scale (§3.5,
+"Placement"). The offline sweep, by contrast, was run in units of median anchor spacing, and the
+fixed-radius density agreed best with the `k`-NN reference at 1.5× spacing (correlation 0.85, and the
+first zero empty-neighbourhood fraction; §3.7, "Measured basis"). The two units differ only by the
+measured `spacing / s ≈ 1.02`, so `radius_mult = 1.5` places the radius at ≈ 1.47× spacing rather than
+1.50× — an immaterial gap, since 1.25× spacing already measured 0.82. `j` is no longer a readout
+parameter (it is a resolution diagnostic; §3.5). *Weight:* `w = 1/(p̂ + c)^a`,
 `c = c_frac · p_ref`, with `c_frac = 0.25` and the tilt `a` the one deliberately swept knob — `a = 0.5`
 and `a = 1.0` give measured gradient tilts of 2.77× and 7.68× (§3.7, "Measured basis"). *Half-life:* 250 steps
 (`η = 0.5^{1/250} ≈ 0.997`) — long relative to the batch autocorrelation, short relative to the drift
@@ -622,8 +627,9 @@ It is a registered buffer, so it checkpoints and survives mid-run preemption.
 ### 3.6 Modulating the objective
 
 The counted-coverage bank produces a per-tile density `p̂(x)`, which modulates the image-level DINO
-cross-entropy one of two ways. The iBOT objective is untouched; the total loss is
-`L = m(x) · CE_DINO + CE_iBOT + λ_sem · CE_iBOT^{sem}`, where the modulation `m(x)` is one of:
+cross-entropy through a per-tile loss weight. The iBOT objective is untouched; the total loss is
+`L = w(x) · CE_DINO + CE_iBOT + λ_sem · CE_iBOT^{sem}`, with the weight `w(x)` set from the density as
+follows.
 
 **Weighted loss.** The DINO term is scaled per tile by the reciprocal-density weight
 `w(x) = 1/(p̂(x) + c)^a` (§3.5), `c = c_frac · p_ref`, and applied as a **weight-normalised mean**,
@@ -639,15 +645,6 @@ redistributes emphasis *within* each batch rather than rescaling the objective, 
 to the effective learning rate. This is a direct importance weighting — it flattens the effective
 sampling distribution over morphology while leaving each tile's learning signal intact — and is simple
 to reason about.
-
-**Adaptive temperature.** The per-tile student softmax temperature is scaled,
-`τ(x) = τ_base · (1 + α · t(x))`, so a typical tile receives a flatter target. This changes not only
-the gradient magnitude but the shape of the target, redistributing probability mass across output
-prototypes rather than only down-scaling the tile's contribution. It is a stronger intervention that
-can actively flatten over-represented modes in the assignment itself, at the cost of coupling the
-typicality estimate more tightly into the representation geometry. It requires a *bounded* score
-`t ∈ [0,1]`, so it is not driven by the fixed-radius density directly — the density would first have to
-be mapped to a bounded score — and it is out of scope for the fixed-radius configuration studied here.
 
 The counted-coverage bank (§3.5) with the weighted-loss modulation, at two tilt settings `a`, is the
 configuration carried forward; its comparison is the subject of Section 4, and the sensitivity of the
@@ -858,14 +855,21 @@ nearest-neighbour-distance p90/p10 = 1.05): with the `j` nearest signatures at a
 `d_i/d_j ≈ 1` and the triweight `(1 − u²)³` annihilates every term — the measured total kernel weight at
 `j = 7` was **0.158**, out of a possible 7. *(iii) The fixed-radius form, same kernel and same counters
 summed over `R_rad` instead of a fixed count, agreed with the reference at 0.85* and was ~4× cheaper (no
-argsort). Its radius multiple `radius_mult = 1.5` had the best measured agreement and the first zero
-empty-neighbourhood fraction in the sweep. *(iv) The realized gradient tilt is modest.* Binning tiles by
-reference density into deciles and computing each decile's share of the normalised DINO loss, the rarest
-decile received **11.15%** (`a = 0.5`, `β`-equivalent low-tilt at 124k) and **12.59%** (`a = 1.0`,
-high-tilt at 104k) against 10% for no modulation — rarest:commonest ratios of **1.25×** and **1.55×**.
-(The 2.77× / 7.68× figures quoted for `a` elsewhere are the ratio of the *weights* at the density
-extremes; these decile figures are the realized share of the *loss*, a milder quantity because most
-tiles sit away from the extremes.)
+argsort). The sweep was run in units of median anchor spacing (best agreement at 1.5× spacing), which
+the code re-expresses in units of the self-tuned hit radius `s` (the conversion is in §3.5,
+Implementation defaults). *(iv) The fixed-radius readout tilts the gradient several-fold harder than the
+readout it replaces.* The measure is each decile's share
+of the normalised DINO loss, with tiles binned into deciles by the offline reference density — the same
+quantity, computed the same way, for both readouts, so the two are directly comparable. Under the
+**retired** fixed-count percentile readout (`w = 1 − β · t`) this tilt was slight: the rarest decile
+received **11.15%** of the loss at `β = 0.5` against 8.90% for the commonest — a rarest:commonest ratio
+of **1.25×**, at 124k — and **12.59%** against 8.12% at `β = 0.9` (a ratio of **1.55×**, at 104k), both
+barely above the 10% of no modulation. The **fixed-radius absolute readout** (`w = 1/(p̂ + c)^a`,
+`c_frac = 0.25`) reaches a rarest:commonest tilt of **2.77×** at `a = 0.5` and **7.68×** at `a = 1.0`,
+with effective sample sizes of **90.5%** and **68.7%** of the batch respectively — a two- to sevenfold
+concentration of gradient mass onto the rare tail, where the retired readout reached at most 1.55×.
+(The per-decile percentages were not recorded for the `c_frac = 0.25` rows, so for the new arms only the
+tilt and the effective sample size are quoted, not a decile breakdown.)
 
 Two things are explicitly **not** claimed. No AUROC or downstream effect has been demonstrated: every
 number here is gradient-mass arithmetic on cached signatures, and nothing has yet run inside training.
@@ -884,9 +888,7 @@ skewed corpus could shift the operating regime, though the counted readout is by
 insensitive to the exact signature-placement exponent. Third, the typicality estimate modulates the
 objective that trains the encoder that produces the signatures, so the distribution the module
 measures is not exogenous. Deferring activation until the representation has stabilized (§3.3) is the
-safeguard we rely on; a formal analysis of the coupled dynamics is left to future work, and the
-adaptive-temperature modulation, which feeds back through the target distribution, tightens this
-coupling relative to the weighted-loss form.
+safeguard we rely on; a formal analysis of the coupled dynamics is left to future work.
 
 Fourth, the counter half-life `H` is the least-justified constant in the method. Every other parameter
 is either self-tuned online (the hit radius `s` and the pooling count `j`; §3.5), a memory budget

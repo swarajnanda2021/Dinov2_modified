@@ -33,8 +33,8 @@
 #           to the old beta values. The hi arm buys its extra tilt with 22 points of effective
 #           sample size (68.7% vs 90.5%), so a difference between the two arms could be gradient
 #           noise from the smaller ESS rather than the tilt itself -- read the pair together.
-#           ADAPTIVE-TEMPERATURE arms are OUT OF SCOPE for rev7 (the fixed-radius readout returns
-#           an absolute density, not a bounded score, so it does not feed adaptive_temperature).
+#           Weighted loss is the only modulation: the fixed-radius readout returns an absolute
+#           density (not a bounded score), and the temperature variant has been removed.
 #       Every run tagged _rev7.
 #
 #       WARM-START: because the counted bank is inert until typicality_warmup_iters (50k), the

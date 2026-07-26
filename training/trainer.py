@@ -1004,7 +1004,6 @@ def train_dinov2(args):
             student_patch_tokens_g2 = student_output['features_list'][1]['patchtokens']
 
             # ========== Typicality Dampening ==========
-            typicality_temperatures = None
             typicality_weights = None
             out = {'ready': False}
             p_hat = None
@@ -1028,25 +1027,21 @@ def train_dinov2(args):
                         _assert_bank_synced(typicality_bank.sync_fingerprint(), tag=f"@it{current_iteration}")
 
                     # Fixed-radius readout: out['p_hat'] is an absolute density (None during the
-                    # cold-start phase -> no modulation, explicit). Only the weighted_loss arm is
-                    # wired for the counted bank; it maps p_hat -> w = 1/(p_hat + c)^a with
-                    # c = c_frac * p_ref. (adaptive_temp needs a bounded score, which the
-                    # fixed-radius density is not; it is out of scope for the counted bank / rev7,
-                    # and TypicalityScorer.adaptive_temperature remains only for bounded-score arms.)
+                    # cold-start phase -> no modulation, explicit). The counted bank drives the
+                    # weighted-loss weight w = 1/(p_hat + c)^a with c = c_frac * p_ref (the only
+                    # modulation; adaptive temperature was removed).
                     if out.get('p_hat') is not None and current_iteration >= args.typicality_warmup_iters:
                         p_hat = _local_rows(out['p_hat'], batch_size)
-                        if args.typicality_modulation == 'weighted_loss':
-                            typicality_weights = TypicalityScorer.absolute_weights(
-                                p_hat, typicality_bank.p_ref,
-                                args.typicality_a, args.typicality_c_frac,
-                            )
+                        typicality_weights = TypicalityScorer.absolute_weights(
+                            p_hat, typicality_bank.p_ref,
+                            args.typicality_a, args.typicality_c_frac,
+                        )
 
             # DINO CLS loss
             dino_class_loss_val = dino_class_loss(
                 student_cls_outputs,
                 teacher_cls_outputs,
                 current_iteration,
-                sample_temperatures=typicality_temperatures,
                 sample_weights=typicality_weights,
             )
 
