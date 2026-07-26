@@ -141,8 +141,8 @@ def get_args_parser():
                         help='Gradient modulation variant')
     parser.add_argument('--typicality_alpha', default=1.0, type=float,
                         help='Dampening strength for adaptive temperature variant')
-    parser.add_argument('--typicality_beta', default=0.5, type=float,
-                        help='Dampening strength for weighted loss variant')
+    # (--typicality_beta removed: the weighted-loss weight is w = 1/(p_hat + c)^a now, set by
+    #  --typicality_a / --typicality_c_frac / --typicality_radius_mult, not 1 - beta*t.)
     parser.add_argument('--typicality_warmup_iters', default=15000, type=int,
                         help='Iterations before typicality scores modulate the loss')
     parser.add_argument('--typicality_repr_lr', default=1e-3, type=float,

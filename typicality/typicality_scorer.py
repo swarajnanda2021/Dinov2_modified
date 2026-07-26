@@ -62,22 +62,6 @@ class TypicalityScorer:
         return tau_base * (1.0 + alpha * t)
     
     @staticmethod
-    def sample_weights(t, beta):
-        """
-        Variant II: Per-sample loss weights.
-
-        w(x) = 1 - beta * t(x)
-
-        Args:
-            t: [B] redundancy scores
-            beta: dampening strength (0 <= beta < 1)
-
-        Returns:
-            w: [B] per-sample loss weights
-        """
-        return 1.0 - beta * t
-
-    @staticmethod
     def absolute_weights(p_hat, p_ref, a, c_frac):
         """
         Variant II (fixed-radius readout): weight from the absolute local density.

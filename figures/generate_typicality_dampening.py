@@ -852,7 +852,7 @@ def make_figure(output_dir='figures',
                      bumps_at_y=[y_S_patch, 4.50], side='right')
     arrowhead(x_otimes, y_S_cls - 0.22, 'up')
     ax.text(14.0, y_return + 0.12,
-            r'$w(x) \;=\; 1 \;-\; \beta \cdot t(x)$',
+            r'$w(x) \;=\; 1 / (\hat{p}(x) + c)^{a}$',
             ha='center', va='bottom', fontsize=14, style='italic',
             color=C['typ_b'])
 
