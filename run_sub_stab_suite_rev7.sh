@@ -350,6 +350,9 @@ case "$RUN" in
     echo "    #   typ_ess    -> $ESS_EXP  (effective fraction of the batch; the health signal, replaces t_std),"
     echo "    #   typ_w_mean -> ORDER 1-3 (NOT below 1: absolute weights are not normalised to mean 1);"
     echo "    #   typ_p_median tracks typ_p_ref; the compact line flags !ess if ESS collapses below 50%."
+    echo "    plot:  python3 plot_typicality.py $exp_dir -g score    # p_median, p_ref, w_mean, ess"
+    echo "           python3 plot_typicality.py $exp_dir -g health   # evict_z, turn_ratio, ess, w_mean"
+    echo "           python3 plot_typicality.py $exp_dir --status-only"
     echo "    (if typ_p_ref stays 0, or typ_w_mean is inf/nan -> p_ref never initialised; re-check that the"
     echo "     clone is rev7 (--typicality_a present) and that the prepared checkpoint dropped typicality_bank)"
     ;;

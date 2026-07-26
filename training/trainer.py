@@ -1380,29 +1380,36 @@ def train_dinov2(args):
             metric_logger.update(repr_L_nn=l_nn.item())
             metric_logger.update(repr_L_cov=l_cov.item())
             if current_iteration >= args.typicality_warmup_iters:
-                # Reduced, mostly-derived scalar meters for plot_typicality.py; the compact
-                # human-readable status line is printed alongside 'It .../...' below.
+                # Compact scalar meters for plot_typicality.py, with a STABLE column set logged
+                # every step -- the readout meters below carry cold-start defaults so the log
+                # format does not change when the bank matures. The one-line 'typ | ...' status
+                # is printed alongside 'It .../...' below and reuses these same values.
                 h = typicality_bank.health()
                 metric_logger.update(
                     typ_s=h['s'], typ_j=h['j'], typ_h_over_L=h['h_over_L'],
                     typ_n_est=h['n_est'], typ_reserve=h['n_reserve'], typ_hit_frac=h['hit_frac'],
                     typ_lam_q10=h['lam_q10'], typ_lam_median=h['lam_median'], typ_lam_q90=h['lam_q90'],
                     typ_lam_spread=h['lam_spread'], typ_evict_over_q10=h['evict_over_q10'],
-                    typ_underresolved=h['underresolved'],
+                    typ_underresolved=h['underresolved'], typ_graduations=h['graduations'],
                 )
+                # Fixed-radius readout: p_median/p_ref are the density and its reference scale
+                # (rank-invariant, from the gathered batch); w_mean/ESS describe the realized
+                # weights. Defaults hold during cold start / non-weighted arms -- no modulation is
+                # a uniform weight of 1 and a full effective batch. typ_ess = sum(w)^2/(sum(w^2)*B)
+                # is the health signal (t_std was uninformative: a rank statistic is uniform on
+                # [0,1] by construction, so it sat at sqrt(1/12) and never moved -- ESS can move).
+                typ_pmed, typ_pref = 0.0, float(typicality_bank.p_ref.item())
+                typ_wmean, typ_ess = 1.0, 1.0
                 if out.get('p_hat') is not None:
-                    # Fixed-radius readout telemetry. p_median/p_ref describe the density; on the
-                    # gathered batch they are rank-invariant. typ_ess = sum(w)^2/(sum(w^2)*B) is
-                    # the health signal (t_std was uninformative -- a rank statistic is uniform on
-                    # [0,1] by construction, so it sat at sqrt(1/12) and never moved).
                     _ph = out['p_hat']
-                    metric_logger.update(typ_p_median=_ph.median().item(),
-                                         typ_p_ref=float(typicality_bank.p_ref.item()))
+                    typ_pmed = _ph.median().item()
                     if args.typicality_modulation == 'weighted_loss':
                         _w = TypicalityScorer.absolute_weights(
                             _ph, typicality_bank.p_ref, args.typicality_a, args.typicality_c_frac)
-                        _ess = (_w.sum() ** 2 / (_w.pow(2).sum() + 1e-12)).item() / _w.numel()
-                        metric_logger.update(typ_w_mean=_w.mean().item(), typ_ess=_ess)
+                        typ_wmean = _w.mean().item()
+                        typ_ess = (_w.sum() ** 2 / (_w.pow(2).sum() + 1e-12)).item() / _w.numel()
+                metric_logger.update(typ_p_median=typ_pmed, typ_p_ref=typ_pref,
+                                     typ_w_mean=typ_wmean, typ_ess=typ_ess)
                 if current_iteration == args.typicality_warmup_iters and utils.is_main_process():
                     # n_eff = (1+eta)/(1-eta): the estimator's variance floor, set by the
                     # half-life alone (independent of stream length).
@@ -1435,18 +1442,10 @@ def train_dinov2(args):
                 _gps = (_gnow - typ_last_grad) / _di            # graduations/step over the interval
                 typ_last_grad = _gnow
                 typ_last_grad_iter = current_iteration
-                _ph = out.get('p_hat')
-                if _ph is not None:
-                    _pmed = _ph.median().item(); _pref = float(typicality_bank.p_ref.item())
-                    _w = TypicalityScorer.absolute_weights(
-                        _ph, typicality_bank.p_ref, args.typicality_a, args.typicality_c_frac)
-                    _wm = _w.mean().item()
-                    _ess = (_w.sum() ** 2 / (_w.pow(2).sum() + 1e-12)).item() / _w.numel()
-                else:
-                    _pmed = _pref = _wm = _ess = 0.0     # cold start: no density yet
                 metric_logger.update(typ_grad_per_step=_gps,
                                      typ_turnover=(typicality_bank.M / _gps if _gps > 1e-9 else 0.0))
-                print(typicality_bank.compact_line(_gps, _pmed, _pref, _wm, _ess))
+                # reuse the scalar meters computed above (same values in the line and the metrics)
+                print(typicality_bank.compact_line(_gps, typ_pmed, typ_pref, typ_wmean, typ_ess))
 
         # ========== Write to log file ==========
         if utils.is_main_process() and current_iteration % 100 == 0:
