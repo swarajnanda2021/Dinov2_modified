@@ -243,19 +243,17 @@ case "$RUN" in
     ;;                                            #   Option B (full stack): set this to 1.0.
 
   # ---- typicality dampening: two weighted-loss arms differing ONLY in the tilt exponent a ----
+  # a is the SOLE per-arm knob; c_frac (0.25) and radius_mult (1.5) live in run_with_submitit.py's
+  # typicality block (the single source of truth) and are shared across both arms.
   bc_weightedloss_lo)
     ensure_arg use_typicality_dampening     True
     ensure_arg typicality_modulation        '"weighted_loss"'   # w = 1/(p_hat + c)^a
     ensure_arg typicality_a                 0.5                 # LO tilt: measured 2.77x, ESS 90.5%
-    ensure_arg typicality_c_frac            0.25                # c = c_frac * p_ref
-    ensure_arg typicality_radius_mult       1.5                 # R_rad = radius_mult * s
     ;;
   bc_weightedloss_hi)
     ensure_arg use_typicality_dampening     True
     ensure_arg typicality_modulation        '"weighted_loss"'   # same modulation as _lo...
     ensure_arg typicality_a                 1.0                 # ...only a changes -> HI tilt: measured 7.68x, ESS 68.7%
-    ensure_arg typicality_c_frac            0.25
-    ensure_arg typicality_radius_mult       1.5
     ;;
 
   pathology_recipe)

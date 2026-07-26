@@ -224,13 +224,18 @@ def main():
     args.typicality_K_prime = 256
     args.typicality_bank_size = 8192
     args.typicality_modulation = 'weighted_loss'   # rev7: the only modulation wired to the counted bank
+    # ---- fixed-radius readout / weighted-loss weight  w = 1 / (p_hat + c)^a,  c = c_frac * p_ref ----
+    # These three REPLACE the old beta. The launcher overrides ONLY `a` per arm
+    # (bc_weightedloss_lo -> 0.5, bc_weightedloss_hi -> 1.0); c_frac and radius_mult are shared,
+    # so this block is the single source of truth for them.
+    args.typicality_a = 1.0            # tilt exponent (rarer tiles up-weighted more as a grows; lo=0.5, hi=1.0)
+    args.typicality_c_frac = 0.25      # weight floor c = c_frac * p_ref
+    args.typicality_radius_mult = 1.5  # readout radius R_rad = radius_mult * s
     args.typicality_warmup_iters = 50000   # fill bank only after representation has settled (late-fill)
     args.typicality_repr_lr = 1e-3
-    # The counted-coverage bank is the only implementation; the fixed-radius readout knobs
-    # (a / c_frac / radius_mult), reserve*/graduation_hits, the s-tuning s_* knobs, and the
-    # self-tune-j knobs all default from config and are set per-arm by the launcher. NB: the old
-    # weighted-loss beta (w = 1 - beta*t) is gone -- the rev7 weight is w = 1/(p_hat + c)^a -- so
-    # it is not set here; the hit radius s and the pooling count j (a diagnostic now) self-tune online.
+    # The remaining counted-bank knobs (reserve* / graduation_hits, the s-tuning s_* knobs, and the
+    # self-tune-j knobs) default from config. The hit radius s and the pooling count j (a diagnostic
+    # now) self-tune online.
 
     # Adversarial-mask-as-student-view augmentation (re-uses mask_checkpoint above)
     args.use_adversarial_mask_augmentation = False
