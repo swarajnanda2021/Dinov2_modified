@@ -434,8 +434,6 @@ def train_dinov2(args):
             halflife_steps=args.typicality_halflife_steps,
             reserve_residency=args.typicality_reserve_residency,
             reserve_size=args.typicality_reserve_size,
-            readout=args.typicality_readout,
-            pit_buffer=args.typicality_pit_buffer,
             s_buffer_size=args.typicality_s_buffer_size,
             s_sweep_interval=args.typicality_s_sweep_interval,
             s_grid_points=args.typicality_s_grid_points,
@@ -448,7 +446,7 @@ def train_dinov2(args):
             pool_rse_target=args.typicality_pool_rse_target,
             pool_max=args.typicality_pool_max,
             pool_ema=args.typicality_pool_ema,
-            soft_rank=args.typicality_soft_rank,
+            radius_mult=args.typicality_radius_mult,
         ).cuda()
 
         print(f"Created Typicality Dampening (counted-coverage bank):")
@@ -700,7 +698,7 @@ def train_dinov2(args):
             _st = typicality_bank.stats()
             print(f"Typicality Bank (counted): n_est={_st['n_est']}/{typicality_bank.M} "
                   f"reserve={_st['n_reserve']} graduations={_st['graduations']} "
-                  f"s={_st['s']:.4f} j={_st['j']}")
+                  f"s={_st['s']:.4f} j={_st['j']} p_ref={_st['p_ref']:.4g}")
         print("="*50 + "\n")
 
     metric_logger = utils.IterationMetricLogger(total_iterations=args.total_iterations)
@@ -1009,7 +1007,7 @@ def train_dinov2(args):
             typicality_temperatures = None
             typicality_weights = None
             out = {'ready': False}
-            t = None
+            p_hat = None
 
             if args.use_typicality_dampening and repr_protos is not None and current_iteration >= args.typicality_warmup_iters:
                 with torch.no_grad():
@@ -1021,7 +1019,7 @@ def train_dinov2(args):
 
                     # All-gather signatures so the bank runs identically on every rank (rank
                     # order preserved -> byte-identical, fingerprint-checked below). The bank
-                    # returns t over the gathered batch; take this rank's local rows for the
+                    # returns p_hat over the gathered batch; take this rank's local rows for the
                     # local loss. The gate is iteration-based/rank-invariant, so all ranks
                     # reach the collective together.
                     s_global = _all_gather_signatures(s_batch.detach())
@@ -1029,19 +1027,19 @@ def train_dinov2(args):
                     if out['ready'] and current_iteration % 2000 == 0:
                         _assert_bank_synced(typicality_bank.sync_fingerprint(), tag=f"@it{current_iteration}")
 
-                    if out['ready'] and current_iteration >= args.typicality_warmup_iters:
-                        t = _local_rows(out['t'], batch_size)
-
-                        if args.typicality_modulation == 'adaptive_temp':
-                            typicality_temperatures = TypicalityScorer.adaptive_temperature(
-                                t, tau_base=dino_class_loss.student_temp, alpha=args.typicality_alpha
+                    # Fixed-radius readout: out['p_hat'] is an absolute density (None during the
+                    # cold-start phase -> no modulation, explicit). Only the weighted_loss arm is
+                    # wired for the counted bank; it maps p_hat -> w = 1/(p_hat + c)^a with
+                    # c = c_frac * p_ref. (adaptive_temp needs a bounded score, which the
+                    # fixed-radius density is not; it is out of scope for the counted bank / rev7,
+                    # and TypicalityScorer.adaptive_temperature remains only for bounded-score arms.)
+                    if out.get('p_hat') is not None and current_iteration >= args.typicality_warmup_iters:
+                        p_hat = _local_rows(out['p_hat'], batch_size)
+                        if args.typicality_modulation == 'weighted_loss':
+                            typicality_weights = TypicalityScorer.absolute_weights(
+                                p_hat, typicality_bank.p_ref,
+                                args.typicality_a, args.typicality_c_frac,
                             )
-                        else:
-                            typicality_weights = TypicalityScorer.sample_weights(
-                                t, beta=args.typicality_beta
-                            )
-                    else:
-                        t = torch.zeros(batch_size, device=z_global1.device)
 
             # DINO CLS loss
             dino_class_loss_val = dino_class_loss(
@@ -1392,11 +1390,19 @@ def train_dinov2(args):
                     typ_lam_spread=h['lam_spread'], typ_evict_over_q10=h['evict_over_q10'],
                     typ_underresolved=h['underresolved'],
                 )
-                if out.get('t') is not None:
-                    _tg = out['t']
-                    _tm = _tg.mean().item()
-                    metric_logger.update(typ_t_mean=_tm, typ_t_std=_tg.std().item(),
-                                         typ_w_mean=1.0 - args.typicality_beta * _tm)
+                if out.get('p_hat') is not None:
+                    # Fixed-radius readout telemetry. p_median/p_ref describe the density; on the
+                    # gathered batch they are rank-invariant. typ_ess = sum(w)^2/(sum(w^2)*B) is
+                    # the health signal (t_std was uninformative -- a rank statistic is uniform on
+                    # [0,1] by construction, so it sat at sqrt(1/12) and never moved).
+                    _ph = out['p_hat']
+                    metric_logger.update(typ_p_median=_ph.median().item(),
+                                         typ_p_ref=float(typicality_bank.p_ref.item()))
+                    if args.typicality_modulation == 'weighted_loss':
+                        _w = TypicalityScorer.absolute_weights(
+                            _ph, typicality_bank.p_ref, args.typicality_a, args.typicality_c_frac)
+                        _ess = (_w.sum() ** 2 / (_w.pow(2).sum() + 1e-12)).item() / _w.numel()
+                        metric_logger.update(typ_w_mean=_w.mean().item(), typ_ess=_ess)
                 if current_iteration == args.typicality_warmup_iters and utils.is_main_process():
                     # n_eff = (1+eta)/(1-eta): the estimator's variance floor, set by the
                     # half-life alone (independent of stream length).
@@ -1429,12 +1435,18 @@ def train_dinov2(args):
                 _gps = (_gnow - typ_last_grad) / _di            # graduations/step over the interval
                 typ_last_grad = _gnow
                 typ_last_grad_iter = current_iteration
-                _tt = out.get('t')
-                _tm = _tt.mean().item() if _tt is not None else 0.0
-                _ts = _tt.std().item() if _tt is not None else 0.0
+                _ph = out.get('p_hat')
+                if _ph is not None:
+                    _pmed = _ph.median().item(); _pref = float(typicality_bank.p_ref.item())
+                    _w = TypicalityScorer.absolute_weights(
+                        _ph, typicality_bank.p_ref, args.typicality_a, args.typicality_c_frac)
+                    _wm = _w.mean().item()
+                    _ess = (_w.sum() ** 2 / (_w.pow(2).sum() + 1e-12)).item() / _w.numel()
+                else:
+                    _pmed = _pref = _wm = _ess = 0.0     # cold start: no density yet
                 metric_logger.update(typ_grad_per_step=_gps,
                                      typ_turnover=(typicality_bank.M / _gps if _gps > 1e-9 else 0.0))
-                print(typicality_bank.compact_line(_gps, _tm, _ts, args.typicality_beta))
+                print(typicality_bank.compact_line(_gps, _pmed, _pref, _wm, _ess))
 
         # ========== Write to log file ==========
         if utils.is_main_process() and current_iteration % 100 == 0:

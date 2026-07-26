@@ -229,8 +229,9 @@ def main():
     args.typicality_warmup_iters = 50000   # fill bank only after representation has settled (late-fill)
     args.typicality_repr_lr = 1e-3
     # The counted-coverage bank is the only implementation; its knobs (pool_j / halflife_steps /
-    # reserve* / readout / pit_buffer, the s-tuning s_* knobs, and the self-tune-j / soft-rank
-    # knobs) default from config. The hit radius s and the pooling count j are self-tuned online.
+    # reserve* / graduation_hits, the fixed-radius readout a / c_frac / radius_mult, the s-tuning
+    # s_* knobs, and the self-tune-j knobs) default from config. The hit radius s and the pooling
+    # count j (now a diagnostic only) are self-tuned online.
 
     # Adversarial-mask-as-student-view augmentation (re-uses mask_checkpoint above)
     args.use_adversarial_mask_augmentation = False

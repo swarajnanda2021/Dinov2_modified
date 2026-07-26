@@ -165,11 +165,20 @@ def get_args_parser():
     parser.add_argument('--typicality_graduation_hits', default=2, type=int,
                         help='Counted bank: hits a reserve signature needs before graduating to '
                              'established (Part 1: 2, so promotion is not on a single observation).')
-    parser.add_argument('--typicality_readout', default='pit', type=str,
-                        choices=['pit', 'probit'],
-                        help='Counted bank readout: pit (decayed empirical rank) or probit.')
-    parser.add_argument('--typicality_pit_buffer', default=20000, type=int,
-                        help='Counted bank PIT reference ring size (recent log p_hat values).')
+    # ---- counted-bank fixed-radius absolute readout (section 3.5) ----
+    parser.add_argument('--typicality_a', default=1.0, type=float,
+                        help='Weighted-loss tilt exponent a in w = 1/(p_hat + c)^a. Larger a '
+                             'emphasises rare tiles more (measured gradient tilt: a=0.5 -> 2.77x, '
+                             'a=1.0 -> 7.68x; ESS 90.5% vs 68.7%).')
+    parser.add_argument('--typicality_c_frac', default=0.25, type=float,
+                        help='Reference fraction setting the weight floor c = c_frac * p_ref, with '
+                             'p_ref an EMA of the batch-median density. Anchors the weight to the '
+                             'live scale of p_hat (scale-invariance); p_hat=0 -> finite 1/c^a.')
+    parser.add_argument('--typicality_radius_mult', default=1.5, type=float,
+                        help='Readout radius R_rad = radius_mult * s (multiple of the self-tuned hit '
+                             'radius s). 1.5 had the best measured correlation (0.85) with an offline '
+                             'kNN density and the first zero empty-neighbourhood fraction; measured '
+                             'spacing/s = 1.02, so s stands in for median anchor spacing.')
     # ---- counted-bank self-tuning hit radius s (Algorithm 2, section 3.5 Placement) ----
     parser.add_argument('--typicality_s_buffer_size', default=60000, type=int,
                         help='Counted bank: rolling signature ring-buffer size N for the s sweep.')
@@ -199,10 +208,6 @@ def get_args_parser():
                         help='Counted bank: upper clamp on the self-tuned j.')
     parser.add_argument('--typicality_pool_ema', default=0.2, type=float,
                         help='Counted bank: EMA weight for j across sweeps.')
-    # ---- counted-bank scoring ----
-    parser.add_argument('--typicality_soft_rank', default=True, type=utils.bool_flag,
-                        help='Counted bank: noise-aware soft rank score; False restores the hard PIT '
-                             'for an ablation.')
 
     # ========== Adversarial mask-as-student-view augmentation parameters ==========
     # Note: --num_masks, --mask_model_arch, --mask_checkpoint are already declared

@@ -4,9 +4,11 @@ run with:  python typicality/test_counted_coverage.py
 
 Covers the mechanics (hit assignment, two-hit graduation, LFU eviction, reserve bounds +
 exit accounting, cold-start->counted), the self-tuning s sweep, the self-tuning j (variogram
-L + under-resolution), the noise-aware soft rank (limits), the Var(lambda_hat) identity,
-determinism (incl. the j sweep and soft-rank), checkpoint round-trip, and that the distance
-bank is gone.
+L + under-resolution; now a diagnostic), the fixed-radius absolute readout (scale sensitivity --
+the property the old fixed-count readout lacked -- zero-neighbour finite weight, p_ref init/EMA,
+weight scale-invariance through the real DINOLoss weighted path), the Var(lambda_hat) identity,
+determinism (incl. the j sweep and p_ref), checkpoint round-trip, and that the distance bank is
+gone.
 """
 import os, sys, io, math
 import torch
@@ -24,15 +26,15 @@ def far_points(n, kp=2, step=10.0):
     return x
 
 
-def counted(M=4, kp=2, s=0.5, j=2, H=4, T_need=3, res=2, readout='pit', pit=8,
-            grad_hits=2, pool_selftune=False, soft_rank=False):
+def counted(M=4, kp=2, s=0.5, j=2, H=4, T_need=3, res=2,
+            grad_hits=2, pool_selftune=False, radius_mult=1.5):
     """Counted bank with the hit radius PINNED to s for the mechanics tests (self-tuning is
-    exercised separately). pool_selftune off and soft_rank off by default here so mechanics
-    are isolated from the readout self-tuning."""
+    exercised separately). pool_selftune off by default here so mechanics are isolated from the
+    readout self-tuning."""
     b = CountedCoverageBank(M=M, K_prime=kp, pool_j=j, halflife_steps=H,
-                            reserve_residency=T_need, reserve_size=res, readout=readout,
-                            pit_buffer=pit, s_buffer_size=2000, graduation_hits=grad_hits,
-                            pool_selftune=pool_selftune, soft_rank=soft_rank)
+                            reserve_residency=T_need, reserve_size=res,
+                            s_buffer_size=2000, graduation_hits=grad_hits,
+                            pool_selftune=pool_selftune, radius_mult=radius_mult)
     b.s.fill_(float(s)); b.s_ready.fill_(1)
     return b
 
@@ -132,22 +134,25 @@ def test_lfu_evicts_idle_first():
     assert any(abs(b.est_b[i, 0].item() - 200.0) < 1e-6 for i in range(b.M))
 
 
-def test_coldstart_then_counted_and_range():
-    """Not ready while filling; cold-start distance readout when full-but-immature; counted
-    readout after maturation. t in [0,1] throughout."""
-    b = counted(M=4, s=0.5, H=4, readout='pit', pit=64)
+def test_coldstart_then_counted_and_pref():
+    """Not ready while filling; ready-but-NO-modulation (p_hat is None) when full-but-immature;
+    fixed-radius density p_hat (>=0, finite -- NOT a bounded rank) after maturation; and p_ref
+    initialised from the first matured batch's median, not before."""
+    b = counted(M=4, s=0.5, H=4)
     out = b.score_and_update(far_points(3, b.K_prime, step=10.0), 0)
-    assert out['ready'] is False and out['t'] is None
+    assert out['ready'] is False and out['p_hat'] is None
     b.score_and_update(far_points(4, b.K_prime, step=10.0)[3:4], 1)
     assert b._ne() == b.M and b._matured() is False
     out = b.score_and_update(torch.tensor([[5.0, 0.0], [15.0, 0.0]]), 2)
-    assert out['ready'] and torch.all(out['t'] >= 0.0) and torch.all(out['t'] <= 1.0)
+    assert out['ready'] and out['p_hat'] is None, "cold start must apply no modulation"
+    assert int(b.p_ref_init.item()) == 0, "p_ref must not be set before maturation"
     for it in range(3, 12):
         b.score_and_update(torch.tensor([[0.05, 0.], [10.05, 0.], [20.05, 0.], [30.05, 0.]]), it)
     assert b._matured() is True
     out = b.score_and_update(torch.tensor([[0.05, 0.], [10.05, 0.]]), 12)
-    assert torch.all(out['t'] >= 0.0) and torch.all(out['t'] <= 1.0)
-    assert int(b.pit_filled.item()) > 0 and torch.isfinite(out['t']).all()
+    ph = out['p_hat']
+    assert ph is not None and torch.all(ph >= 0.0) and torch.isfinite(ph).all()
+    assert int(b.p_ref_init.item()) == 1 and float(b.p_ref.item()) > 0.0
 
 
 def test_j_selftune_recovers_L():
@@ -175,21 +180,109 @@ def test_j_selftune_underresolved():
     assert int(b.j.item()) >= 2, f"fallback must be the variance target, not 1 (j={int(b.j.item())})"
 
 
-def test_soft_rank_limits():
-    """soft rank -> hard PIT as sigma -> 0 ; -> 1/2 as noise dominates ; t in [0,1]."""
-    torch.manual_seed(2)
-    b = CountedCoverageBank(M=8, K_prime=3, pit_buffer=600, soft_rank=True)
-    W = 400
-    b.pit_ring[:W] = torch.randn(W) * 5.0                     # well-spread reference
-    b.pit_sig2_ring[:W] = torch.zeros(W)                      # ~0 reference noise
-    b.pit_filled.fill_(W)
-    q = torch.randn(32) * 5.0
-    soft0 = b._soft_rank_score(q, torch.zeros(32))
-    pit = b._pit_score(q)
-    assert torch.allclose(soft0, pit, atol=1e-2), f"soft(sig->0) != PIT: {(soft0 - pit).abs().max():.3f}"
-    soft_big = b._soft_rank_score(q, torch.full((32,), 1e12))
-    assert torch.allclose(soft_big, torch.full((32,), 0.5), atol=1e-3), "noise-dominated -> 1/2"
-    assert torch.all(soft0 >= 0) and torch.all(soft0 <= 1)
+def _matured_bank(positions, lam, kp, s, radius_mult=1.5, H=250):
+    """Full, mature bank with est_b = positions and S/E = lam, hit radius pinned to s. Lets the
+    fixed-radius readout be exercised directly (p_ref starts unset; _counted_readout inits it)."""
+    M = positions.shape[0]
+    b = CountedCoverageBank(M=M, K_prime=kp, halflife_steps=H, radius_mult=radius_mult,
+                            pool_selftune=False)
+    b.n_est.fill_(M)
+    b.est_b[:M] = positions
+    b.est_E[:M] = b.mature_E
+    b.est_S[:M] = lam * b.mature_E                            # so S/E = lam
+    b.s.fill_(float(s)); b.s_ready.fill_(1)
+    return b
+
+
+def test_scale_sensitivity():
+    """The property the OLD fixed-count readout lacked (it was exactly invariant to local
+    rescaling): p_hat MUST respond to how crowded the neighbourhood is. Scale every query->anchor
+    distance by c; within the fixed radius R_rad, p_hat must move monotonically -- up as the
+    neighbourhood contracts (c down), down as it spreads (c up), and 0 once it clears the radius."""
+    torch.manual_seed(21)
+    kp = 3
+    q = torch.zeros(1, kp)
+    offsets = torch.randn(12, kp) * 0.2                      # anchors clustered near the query
+    s, radius_mult = 1.0, 1.5                                # R_rad = 1.5
+    p = {}
+    for c in (0.5, 1.0, 2.0, 10.0):
+        b = _matured_bank(offsets * c, lam=1.0, kp=kp, s=s, radius_mult=radius_mult)
+        p[c] = float(b._counted_readout(q)[0].item())
+    assert p[0.5] > p[1.0] > p[2.0] > p[10.0], f"p_hat not monotone in crowding: {p}"
+    assert p[10.0] == 0.0, f"neighbourhood scaled past the radius must give p_hat=0: {p}"
+
+
+def test_zero_neighbours_finite_weight():
+    """No anchor inside R_rad -> p_hat = 0, and absolute_weights still returns a FINITE weight
+    1/c^a (no clipping needed)."""
+    kp = 3
+    anchors = torch.zeros(6, kp); anchors[:, 0] = torch.arange(6).float() * 5.0
+    b = _matured_bank(anchors, lam=1.0, kp=kp, s=1.0, radius_mult=1.5)     # R_rad = 1.5
+    q = torch.tensor([[100.0, 0.0, 0.0]])                                  # far from every anchor
+    ph = b._counted_readout(q)
+    assert float(ph[0].item()) == 0.0, "no neighbour in radius -> p_hat = 0"
+    p_ref = torch.tensor(2.0)
+    for a in (0.5, 1.0):
+        w = TypicalityScorer.absolute_weights(ph, p_ref, a=a, c_frac=0.25)
+        c = 0.25 * 2.0
+        assert torch.isfinite(w).all() and abs(float(w[0].item()) - 1.0 / c ** a) < 1e-5
+
+
+def test_pref_init_then_ema():
+    """First matured readout initialises p_ref from the batch median (never 0); the next step
+    EMAs it toward the new median with weight 0.001."""
+    torch.manual_seed(22)
+    kp = 3
+    anchors = torch.randn(16, kp)
+    b = _matured_bank(anchors, lam=1.0, kp=kp, s=1.0, radius_mult=1.5)
+    assert int(b.p_ref_init.item()) == 0 and float(b.p_ref.item()) == 0.0
+    q1 = torch.randn(64, kp) * 0.2
+    med1 = float(torch.median(b._counted_readout(q1)).item())
+    assert int(b.p_ref_init.item()) == 1
+    assert abs(float(b.p_ref.item()) - med1) < 1e-6, "p_ref must init from the first batch median"
+    q2 = torch.randn(64, kp) * 0.2
+    med2 = float(torch.median(b._counted_readout(q2)).item())
+    expected = 0.999 * med1 + 0.001 * med2
+    assert abs(float(b.p_ref.item()) - expected) < 1e-5, "p_ref must EMA at weight 0.001 after init"
+
+
+def test_pref_never_zero_on_empty_first_batch():
+    """1c guardrail: if the FIRST matured batch's median p_hat is 0 (no median-tile neighbour --
+    a cold/mistuned bank), p_ref must still initialise strictly positive so c > 0 and the weights
+    stay finite, rather than latching p_ref = 0 and diverging to inf."""
+    kp = 3
+    anchors = torch.zeros(6, kp); anchors[:, 0] = torch.arange(6).float() * 5.0
+    b = _matured_bank(anchors, lam=1.0, kp=kp, s=1.0, radius_mult=1.5)      # R_rad = 1.5
+    far = torch.tensor([[100.0, 0.0, 0.0]]).repeat(8, 1)                    # every tile empty
+    ph = b._counted_readout(far)
+    assert float(torch.median(ph).item()) == 0.0 and int(b.p_ref_init.item()) == 1
+    assert float(b.p_ref.item()) > 0.0, "p_ref must not latch to 0 on an all-empty first batch"
+    w = TypicalityScorer.absolute_weights(ph, b.p_ref, a=1.0, c_frac=0.25)
+    assert torch.isfinite(w).all(), "weights must stay finite (c > 0)"
+
+
+def test_weight_scale_invariance_dino():
+    """Scaling every p_hat AND p_ref by the same constant leaves the NORMALISED weighted DINO
+    loss unchanged: w = 1/(k*p_hat + k*c)^a = k^-a * w, and (loss*w).sum()/w.sum() cancels the
+    constant. Verified through the real DINOLoss.forward weighted path, not a reimplementation."""
+    from losses.dino_loss import DINOLoss
+    torch.manual_seed(23)
+    ncrops, B, K = 2, 16, 64
+    dino = DINOLoss(ncrops=ncrops, warmup_teacher_temp=0.04, teacher_temp=0.04,
+                    warmup_teacher_temp_iters=10, student_temp=0.1, n_iterations=3)
+    student = torch.randn(ncrops * B, K)
+    teacher = torch.randn(ncrops * B, K) * 0.02      # small: Sinkhorn exp(teacher/temp) must not overflow
+    p_hat = torch.rand(B)
+    p_hat[:3] = 0.0                                          # include empty-neighbourhood tiles
+    p_ref = torch.tensor(0.7)
+    a, c_frac, k = 1.0, 0.25, 37.0
+    w1 = TypicalityScorer.absolute_weights(p_hat, p_ref, a, c_frac)
+    w2 = TypicalityScorer.absolute_weights(k * p_hat, k * p_ref, a, c_frac)
+    l1 = dino(student, teacher, 0, sample_weights=w1)
+    l2 = dino(student, teacher, 0, sample_weights=w2)
+    assert torch.allclose(l1, l2, atol=1e-5, rtol=1e-4), f"scale-variant: {float(l1)} vs {float(l2)}"
+    l0 = dino(student, teacher, 0, sample_weights=None)
+    assert not torch.allclose(l1, l0, atol=1e-4), "weighted path must differ from the mean path"
 
 
 def test_variance_identity():
@@ -210,23 +303,24 @@ def test_variance_identity():
 
 def _selftune_cfg():
     return dict(M=8, K_prime=3, halflife_steps=3, s_buffer_size=64, s_min_buffer=32,
-                s_sweep_interval=5, pit_buffer=64, pool_selftune=True, soft_rank=True, reserve_size=6)
+                s_sweep_interval=5, pool_selftune=True, reserve_size=6)
 
 
 def test_determinism_full_path():
     """Two instances fed the identical sequence end byte-identical -- including the s and j
-    sweeps and the soft-rank readout."""
+    sweeps and the fixed-radius readout's p_ref update (p_ref is in the fingerprint)."""
     torch.manual_seed(7)
     seqs = [torch.rand(16, 3) * 5.0 for _ in range(120)]
     b1 = CountedCoverageBank(**_selftune_cfg()); b2 = CountedCoverageBank(**_selftune_cfg())
     for it, s in enumerate(seqs):
         b1.score_and_update(s.clone(), it); b2.score_and_update(s.clone(), it)
     assert int(b1.s_ready.item()) == 1 and b1._ne() == b1.M, "path should have activated + filled"
+    assert int(b1.p_ref_init.item()) == 1, "path should have matured and exercised the p_ref update"
     assert torch.equal(b1.sync_fingerprint(), b2.sync_fingerprint()), "banks diverged"
 
 
 def test_checkpoint_roundtrip():
-    """state_dict save/load restores all state (incl. the new j / soft-rank buffers) exactly."""
+    """state_dict save/load restores all state (incl. the new j / p_ref buffers) exactly."""
     torch.manual_seed(3)
     a = CountedCoverageBank(**_selftune_cfg())
     for it in range(80):
@@ -235,6 +329,8 @@ def test_checkpoint_roundtrip():
     b = CountedCoverageBank(**_selftune_cfg())
     b.load_state_dict(sd)
     assert torch.equal(a.sync_fingerprint(), b.sync_fingerprint())
+    assert float(a.p_ref.item()) == float(b.p_ref.item()) and \
+        int(a.p_ref_init.item()) == int(b.p_ref_init.item()), "p_ref must round-trip exactly"
     nxt = torch.rand(16, 3) * 5.0
     a.score_and_update(nxt.clone(), 80); b.score_and_update(nxt.clone(), 80)
     assert torch.equal(a.sync_fingerprint(), b.sync_fingerprint()), "restored state must continue identically"
@@ -242,15 +338,15 @@ def test_checkpoint_roundtrip():
 
 def test_checkpoint_size_change_on_resume():
     """Reproduces the resume crash: an OLDER checkpoint (smaller reserve, and without the buffers
-    added later -- res_hits, pit_sig2_ring, j, ...) must load into the current model without a
-    shape-mismatch RuntimeError. The established set, counters, and s restore; the reserve fits the
-    new cap; the missing new buffers keep their init values."""
+    added later -- res_hits, p_ref / p_ref_init, j, ...) must load into the current model without
+    a shape-mismatch RuntimeError. The established set, counters, and s restore; the reserve fits
+    the new cap; the missing new buffers keep their init values."""
     torch.manual_seed(4)
     a = CountedCoverageBank(**{**_selftune_cfg(), 'reserve_size': 4})
     for it in range(80):
         a.score_and_update(torch.rand(16, 3) * 5.0, it)
     sd = {k: v.clone() for k, v in a.state_dict().items()}
-    for k in ('res_hits', 'pit_sig2_ring', 'j', 'j_smooth', 'L_est', 'h_over_L',
+    for k in ('res_hits', 'p_ref', 'p_ref_init', 'j', 'j_smooth', 'L_est', 'h_over_L',
               'underresolved', 's_delta'):
         sd.pop(k, None)                                     # simulate a pre-refactor checkpoint
     b = CountedCoverageBank(**{**_selftune_cfg(), 'reserve_size': 12})   # larger reserve now
@@ -278,12 +374,14 @@ def test_distance_bank_gone():
 
 
 def test_compact_line_renders():
-    """compact_line renders a single 'typ | ... | OK/flags' status string from synthetic state."""
+    """compact_line renders a single 'typ | ... | OK/flags' status string from synthetic state,
+    now reporting p/ref/w/ess (not t±std)."""
     b = counted(M=4, s=19.6)
     b.s.fill_(19.63); b.s_delta.fill_(-0.08); b.j.fill_(64); b.h_over_L.fill_(1.05)
-    line = b.compact_line(grad_per_step=2.1, t_mean=0.501, t_std=0.288, beta=0.5)
+    line = b.compact_line(grad_per_step=2.1, p_median=0.42, p_ref=0.55, w_mean=1.8, ess=0.69)
     assert line.startswith('typ |') and ('OK' in line or '!' in line)
     assert 's=19.63(-0.08)' in line and 'j=64' in line and 'h/L=1.05' in line
+    assert 'ess=69%' in line and 'w=1.8' in line
 
 
 # ---------------------------------------------- self-tuning s (unchanged machinery)
@@ -340,7 +438,7 @@ def test_startup_gate():
     it = 0
     while int(b.sig_filled.item()) < 40:
         out = b.score_and_update(torch.rand(10, 3), it); it += 1
-        assert out['ready'] is False and out['t'] is None
+        assert out['ready'] is False and out['p_hat'] is None
         assert b._ne() == 0 and float(b.s.item()) == 0.0 and int(b.s_ready.item()) == 0
     while int(b.s_ready.item()) == 0:
         b.score_and_update(torch.rand(10, 3), it); it += 1

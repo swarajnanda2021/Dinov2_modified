@@ -35,10 +35,9 @@ image-level objective is rebalanced toward rare morphology.
 
 **The one quantity both bank variants estimate is local density** — how crowded a tile's
 neighbourhood is in morphology space. Common morphology sits in dense neighbourhoods; rare morphology
-sits in sparse ones. The typicality score is simply where a tile's density falls in the recent
-distribution: high density → typical → dampen; low density → rare → preserve. The two bank variants
-are two standard ways of estimating that density, and naming them this way is the cleanest way to see
-how they relate:
+sits in sparse ones. The typicality signal is simply a tile's local density: high density → typical →
+dampen; low density → rare → preserve. The two bank variants are two standard ways of estimating that
+density, and naming them this way is the cleanest way to see how they relate:
 
 - The **distance-calibrated bank** (§3.3) is a *nearest-neighbour* density estimator. In a dense
   neighbourhood the stored points are packed close together, so a short distance to the nearest one
@@ -53,10 +52,10 @@ The module runs in three stages on each tile `x`:
 1. **Signature.** The student's L2-normalized 256-dimensional DINO-head bottleneck `z(x)` is taken
    under stop-gradient and projected onto a small set of learned *representative prototypes* `R`,
    giving a compact morphology signature `s(x)` (§3.2).
-2. **Typicality score.** `s(x)` is turned into a scalar `t(x) ∈ [0,1]` by one of the two banks — high
-   when the tile lands in a dense neighbourhood, low when it lands in a sparse one (§3.3, §3.5).
-3. **Modulation.** `t(x)` modulates that tile's DINO objective, either as a loss weight or as a
-   softmax temperature (§3.6).
+2. **Local density.** `s(x)` is turned into a local density `p̂(x)` by the counted-coverage bank —
+   high when the tile lands in a dense neighbourhood, low when it lands in a sparse one (§3.5).
+3. **Modulation.** `p̂(x)` modulates that tile's DINO objective through a reciprocal-density loss
+   weight `w = 1/(p̂ + c)^a` (§3.6).
 
 The signature (§3.2) and the modulation (§3.6) are common to the whole method; the bank is the
 counted-coverage bank (§3.5). §3.3–§3.4 are the estimator analysis that motivates it: a
@@ -115,9 +114,11 @@ output-layer directions (the model's own), a **representative prototype** is one
 | `E_i` | stored signature `i`'s decayed **exposure** — steps it has been alive (a clock, not a hit count) |
 | `age_i` | stored signature `i`'s **age** — undecayed count of steps since it was created |
 | `λ̂_i = S_i/E_i` | stored signature `i`'s decayed **hit-rate** (hits per step of life) |
-| `p̂(x)` | estimated tile density at `x` (the unnormalised kernel sum) |
-| `K_h, h` | pooling kernel (triweight) and its bandwidth |
-| `j` | number of stored signatures pooled in the readout |
+| `p̂(x)` | estimated tile density at `x` (the unnormalised fixed-radius kernel sum) |
+| `K, R_rad` | pooling kernel (triweight) and the fixed readout radius `R_rad = radius_mult · s` |
+| `p_ref` | reference density scale (EMA of the batch-median `p̂`); fixes the weight floor `c = c_frac · p_ref` |
+| `w(x), a` | per-tile loss weight `w = 1/(p̂ + c)^a` and its tilt exponent `a` |
+| `j` | resolution diagnostic: median count of stored signatures within `L` (no longer pools the readout) |
 | `η` | per-step decay factor (`= 0.5^{1/H}`, half-life `H` steps) |
 | `ε` | numerical guard in `λ̂ = S/(E+ε)` |
 | `κ` | tiles per step (the gathered batch size) |
@@ -151,12 +152,13 @@ keep it distinct from the matrix `R`.
   tiles it counts as hits — is its Voronoi cell (capped at radius `s`). A Voronoi cell's volume
   scales as `1/g`, which is what makes the hit count `S ∝ p/g`.
 - **Probability integral transform (PIT).** Replacing a number by its percentile in a reference
-  distribution, yielding a score uniform on `[0,1]`. The counted-coverage bank scores a tile by the
-  percentile of its density among recent tiles ("denser than 75% of recent tiles" → `t = 0.75`), so
-  the score is bounded, centred, and immune to the density estimate's arbitrary scale.
-- **Kernel and bandwidth (`K_h`, `h`).** A smooth, radially symmetric, compactly supported weight
-  that falls off with distance; its bandwidth `h` is the radius enclosing the `j` nearest stored signatures.
-  The readout is a kernel-weighted sum over those stored signatures.
+  distribution, yielding a score uniform on `[0,1]`. An earlier version of the readout scored a tile
+  this way; it was dropped (§3.5) because a percentile keeps only the *ordering* and discards the
+  *magnitude* of the density. The current weight instead references the density's live scale directly
+  through `p_ref`.
+- **Kernel and readout radius (`K`, `R_rad`).** A smooth, radially symmetric, compactly supported
+  weight that falls off with distance and vanishes beyond the fixed readout radius `R_rad = radius_mult
+  · s`. The readout is a kernel-weighted sum over the stored signatures within `R_rad`.
 - **Effective rank.** The number of significant directions of a matrix (participation ratio of its
   singular values). Used for `R`: an `L_R`-trained `R` collapses to effective rank ≈ 44, whereas the
   synthetic frame of §3.7 has effective rank 202.
@@ -369,7 +371,7 @@ the spacings below) are in L1 units on the signatures `s = R·z`, the metric the
 | Local-density dynamic range | — | scale-dependent; ≈ 18× at radius `L` | operating regime (moderate) |
 | Mode structure | — | connected continuum, no dominant mode | removes the isolated-outlier hazard |
 | Tile-level burst factor | `b` | ≈ 1.2 (decays within one batch) | permits exponential forgetting |
-| Density correlation length | `L` | 3.34 | sets the readout bandwidth |
+| Density correlation length | `L` | 3.34 | resolution diagnostic (§3.5, under-resolution) |
 | One-off (artifact) rate | `ρ_out` | ≈ 10⁻³ (no floor) | sizes the transient reserve |
 
 Here `d*` is the intrinsic dimension — the number of effective directions the signatures occupy, far
@@ -410,101 +412,87 @@ readout pools (a window of order `L`; §3.7). This ratio is a property of the of
 assumed to transfer: on the online-trained run `s` is measured directly, so no downstream quantity
 depends on the relationship between `s_M` and the knee.
 
-**Readout: sum the rates, don't average them.** The tile density at a query is estimated as an
-*unnormalised* kernel sum over the `j` nearest stored signatures,
+**Readout: sum the rates over a fixed radius.** The tile density at a query is estimated as an
+*unnormalised* kernel sum over the stored signatures inside a **fixed radius** `R_rad = radius_mult · s`,
 
 ```
-p̂(x) = Σ_i λ̂_i · K_h(x − b_i)   ( sum over the j nearest stored signatures ) ,
+p̂(x) = Σ_i λ̂_i · K( ‖x − b_i‖ / R_rad )   ( sum over stored signatures with ‖x − b_i‖ ≤ R_rad ) ,
 ```
 
-where `K_h` is a smooth, radially symmetric, compactly supported weight whose bandwidth `h(x)` is the
-distance to the `j`-th nearest stored signature. **Summing rather than averaging is essential**, and the reason
-is the `p/g` structure of `λ̂`: a dense region holds more stored signatures, each carrying a *smaller* rate
-(because `λ̂ ∝ 1/g`), so **summing** the rates cancels the stored-signature density `g` and leaves the tile
-density `p`. **Averaging** (dividing by `Σ_i K_h`) would divide `g` straight back out — it would
-instead estimate the mean per-signature rate `∝ p^{1−γ}`, which vanishes at *proportional* placement
-(`γ → 1`). The gap is thus placement-dependent, and seed-on-miss produces a near-uniform cover
-(`γ ≈ 0`), where `p^{1−γ} = p` and the two nearly coincide: the offline run (§3.7) measures ρ = 0.74
-for the normalized readout versus 0.75 for the sum. We use the unnormalised sum anyway because it is
-placement-*independent* — it recovers density at *any* `γ`, hence stays valid if placement drifts from
-this mild regime. Centering the kernel on the query and using a symmetric profile cancels the leading
-(gradient) term of the bias exactly — stored signatures on either side of the query balance — leaving a
-curvature-order residual, whereas reading only the nearest stored signature incurs a first-order, spatially
-frozen bias of up to half a cell. The effective bandwidth is this pooling window — the radius
-enclosing the `j` stored signatures, ≈ `L` (§3.7) — and going finer resolves nothing, since the density field
-has no structure below `L`; in `d* ≈ 9.3` those `j` stored signatures already lie within about `1.5×` the local
-spacing, so pooling costs almost nothing in resolution.
+where `K` is the smooth, radially symmetric, compactly supported triweight, so a signature past `R_rad`
+contributes exactly zero — the radius test is implicit and no sorting is needed. **Summing rather than
+averaging is essential**, and the reason is the `p/g` structure of `λ̂`: a dense region holds more stored
+signatures, each carrying a *smaller* rate (because `λ̂ ∝ 1/g`), so **summing** the rates cancels the
+stored-signature density `g` and leaves the tile density `p`; **averaging** (dividing by `Σ_i K`) would
+divide `g` straight back out — it would instead estimate the mean per-signature rate `∝ p^{1−γ}`, which
+vanishes at *proportional* placement (`γ → 1`). That cancellation is valid only over a domain of **fixed
+volume** — and the radius is exactly what supplies one. The argument was always right; the domain was
+wrong. An earlier version of this readout summed over the `j` *nearest* stored signatures and set the
+kernel bandwidth to the `j`-th nearest distance, `h(x) = d_j(x)`. That makes the domain volume
+query-adaptive — it shrinks in dense regions and grows in sparse ones — and dividing every distance by
+`d_j` cancels the local scale *exactly*: the sum comes out **bit-for-bit invariant to how crowded the
+neighbourhood is** (verified directly on cached signatures; §3.7, "Measured basis"), which is precisely
+what a density readout must *not* be. On a near-uniform cover the `j` nearest signatures sit at almost
+one distance, so `d_i/d_j ≈ 1` for all of them and the triweight `(1 − u²)³` annihilates every term —
+its total kernel weight was measured at 0.158 out of a possible `j`. The fixed radius removes the
+query-adaptive normalisation and lets the crowding show. Its resolution is set by `R_rad` — a fixed
+multiple `radius_mult = 1.5` of the cover scale `s` (measured `spacing / s ≈ 1.02`, so `s` stands in for
+the stored-signature spacing), chosen at the value with the best measured density agreement (§3.7).
+Centering the kernel on the query and using a symmetric profile cancels the leading (gradient) term of
+the bias exactly — stored signatures on either side balance — leaving a curvature-order residual,
+whereas reading only the nearest stored signature incurs a first-order, spatially frozen bias of up to
+half a cell.
 
-**Bandwidth: self-tune `j` to `h ≈ L`.** `j` fixes the readout bandwidth, since `h(x)` is the distance
-to the `j`-th nearest stored signature, and the target is `h ≈ L` — below `L` there is no structure to
-resolve, above it real structure is smoothed away. A fixed `j` does not port: the value that gives
-`h ≈ L` on one instance gives `h ≈ 2.3 L` on another. `j` is therefore *measured*, on the same cadence
-as the radius sweep, by Algorithm 3. `L` is estimated by a **variogram with a nugget** — fitting
+**Resolution diagnostic (self-tuned `j`, `L`).** `j` no longer feeds the readout — the radius is fixed —
+but the machinery that measured it is retained as a **resolution diagnostic**: it reports whether the
+fixed radius is wide enough relative to the structure it must resolve. On the radius-sweep cadence,
+Algorithm 3 estimates the density correlation length `L` by a **variogram with a nugget** — fitting
 `γ(r) = c₀ + c₁(1 − exp(−r/L))` to the squared `λ̂` differences of established-signature pairs binned by
-separation `r`, over signatures mature enough to be low-noise — rather than by a raw correlation
-threshold: counting noise attenuates correlation at every lag (biasing `L` down) and queries sharing
-stored signatures correlate their noise (biasing it up), and the nugget `c₀` absorbs the former. `j` is
-then the median number of stored signatures within `L` of a query. Two guards bound it. A **variance
-target** sets the floor: since the relative standard error of `p̂` falls as ≈ `1/√j` and the
-per-signature rate variance is `λ̂ (1−η)/(1+η)`, `j_min` is the smallest `j` meeting a target relative
-SE on `log p̂` (default `0.05`), clamped to `j ≤ j_max` (default 256) — a variance target, not an
-arbitrary floor. And **under-resolution** is reported, not hidden: if the median stored-signature
-spacing exceeds `L` (equivalently, the variogram is already at its sill at the smallest lag), no
-`j ≥ 1` can reach `h = L` — the design is coarser than the structure, a property of the memory budget
-rather than a tuning failure. The bank then flags `underresolved`, surfaces `spacing/L`, and falls back
-to the variance-target `j` rather than collapsing to a nearest-signature readout (a first-order,
-spatially frozen bias, strictly worse than a moderate `j`). `j` is EMA-smoothed across sweeps and
-rounded to an integer.
+separation `r`, over signatures mature enough to be low-noise — the nugget `c₀` absorbing the counting
+noise that otherwise biases `L` down. It then reports `j` (the median number of stored signatures within
+`L` of a query, clamped by a variance target — smallest `j` for a target relative SE on `log p̂`,
+default `0.05`, `j ≤ j_max = 256`) and, crucially, **under-resolution**: if the median stored-signature
+spacing exceeds `L` (equivalently the variogram is already at its sill at the smallest lag), the design
+is coarser than the structure — a property of the memory budget, not a tuning failure — and the bank
+flags `underresolved` and surfaces `spacing/L`. These are diagnostics on the fixed-radius readout, not
+inputs to it.
 
 ```
-Algorithm 3  Self-tune the pooling count j   (on the radius-sweep cadence)
+Algorithm 3  Resolution diagnostic: L, j, under-resolution   (on the radius-sweep cadence; NOT the readout bandwidth)
   fit  γ(r) = c₀ + c₁(1 − exp(−r/L))  to binned pair semivariances of λ̂ over mature signatures
        → L         (nugget c₀ absorbs counting noise; subsample pairs, do not form all M²)
   j_count ← median over queries of  #{ i : ‖x − b_i‖₁ ≤ L }
   j_min   ← smallest j with relative SE(log p̂) ≤ rse_target,  from Var(λ̂) = λ̂ (1−η)/(1+η)
   if median-spacing > L  or  variogram flat at the smallest lag:        # under-resolved
-        underresolved ← 1 ;  j_target ← j_min                           #   fall back to variance target
-  else  underresolved ← 0 ;  j_target ← clamp(j_count, j_min, j_max)
-  j ← round( EMA( j, j_target ) )
+        underresolved ← 1 ;  j ← EMA(j, j_min)                          #   report the variance-target j
+  else  underresolved ← 0 ;  j ← EMA(j, clamp(j_count, j_min, j_max))
 ```
 
-**Score: the density's percentile, not its value.** The kernel sum `p̂` has no meaningful units — it
-could come out 4 or 800 depending on the kernel — so a tile is scored not by `p̂` but by its **rank**:
+**Score: the density itself, weighted by its reciprocal.** The kernel sum `p̂` is now used *as the
+density*, not converted to a rank. An earlier version scored a tile by the percentile of `log p̂` among
+recent tiles (the probability integral transform); it is dropped because it **discards the magnitude of
+the density** — a percentile is uniform on `[0,1]` by construction, so it keeps only the ordering and
+throws away *how much* denser one tile is than another, which is exactly the signal the fixed-radius sum
+was built to recover. Instead the per-tile weight is a smooth reciprocal of the absolute density,
 
 ```
-t(x) = F̂( log p̂(x) ) ,
+w(x) = 1 / ( p̂(x) + c )^a ,   c = c_frac · p_ref ,
 ```
 
-the fraction of *recent tiles* whose density was below this one's. A hard percentile — the
-probability integral transform (PIT), "denser than 75% of recent tiles" means `t = 0.75` — is uniform
-on `[0,1]` *by construction*: it spreads scores across the range whatever `p̂` is, so a homogeneous
-stream and a strongly structured one produce the same score distribution, and it fails silently. We
-therefore use a **noise-aware soft rank**: a pairwise exceedance probability that folds in each query's
-estimation variance,
-
-```
-t(x) = (1/W) Σ_k Φ( ( log p̂(x) − log p̂_k ) / sqrt( σ²(x) + σ²_k ) ) ,
-```
-
-over the same rolling window of `W ≈ 20,000` reference values `(log p̂_k, σ²_k)`. The variance is
-propagated from the counters by the delta method,
-
-```
-Var(p̂(x)) = Σ_{i ∈ jNN(x)} K_h(x − b_i)² · Var(λ̂_i) ,   Var(λ̂_i) = λ̂_i (1 − η)/(1 + η) ,
-σ²(x)     = Var(p̂(x)) / p̂(x)² ,
-```
-
-where the `(1 − η)/(1 + η)` factor is exact (the naive `S/E²` overstates the counter variance by
-≈ 2×). The soft rank has the two limits that make it safe: as `σ → 0` each term becomes a hard
-indicator and `t` reduces *exactly* to the PIT; as noise dominates, every term → `Φ(0) = 1/2`, so
-`t → 1/2` and the modulation goes neutral rather than manufacturing structure from noise. It is built
-from counts and a rank, so it carries no units. (`σ²_k` is stored alongside `log p̂_k` in the window;
-the cost is `O(W)` per query, reducible to a fixed set of quantile bins if it slows the step. The hard
-PIT and a two-moment probit on `log p̂` remain available as ablations.) The same variance identity fixes
-the estimator's floor: the effective sample size `n_eff = (1 + η)/(1 − η)` (≈ 721 at half-life 250) is
-set by the decay half-life alone, independent of stream length. Before the counters have filled, the
-nearest-neighbour readout of §3.3 serves as the cold-start estimator; after that it is kept only as a
-consistency probe.
+with `a` the tilt exponent and `p_ref` a slow EMA of the batch-median `p̂` (the *reference scale*). The
+floor `c` does two things. It keeps the weight **finite where `p̂ = 0`** (a tile with no stored signature
+inside `R_rad` gets `w = 1/c^a`, not a division by zero), so no clipping is needed. And it makes the
+weight **scale-invariant precisely when `c` tracks the scale of `p̂`**: multiply every `p̂` and `p_ref`
+by the same constant `k` and `w = 1/(k p̂ + k c)^a = k^{−a} w`, a common factor that the
+weight-normalised loss (§3.6) divides straight out. `p̂` has no natural units — it comes out 0.001 or 800
+depending on the kernel and the signature scale, and that scale *drifts* as `R` trains — so the
+reference cannot be a fixed constant; it must be measured live, which is why `p_ref` is an EMA of the
+running median rather than a hyperparameter. `p_ref` is initialised from the first matured batch's
+median (never zero) and checkpointed, so it survives preemption. The counter half-life still fixes the
+estimator's floor: the effective sample size `n_eff = (1 + η)/(1 − η)` (≈ 721 at half-life 250) is set
+by the decay half-life alone, independent of stream length. Before the counters have filled the module
+applies **no modulation** at all (the §3.3 nearest-neighbour readout has no `p̂` to weight by); it
+activates only once the counters mature.
 
 **Adding and dropping stored signatures.** The bank is split into an **established set** of capacity `M` and a
 small **reserve** buffer of `≈ reserve` slots on top (total stored `≈ M + reserve`); the established
@@ -548,7 +536,7 @@ Algorithm 2  Counted-coverage bank: update and scoring for one batch X
              (established capacity M; the reserve — a separate buffer of ≈ reserve slots —
               is active only once the established set is full)
 
-  if step < T_warm:  return t(x) = 0 for all x
+  if step < T_warm:  return p̂(x) = ⊥ for all x        # inactive: no modulation
 
   for every live stored signature i:                                     # decay, age, expire stale reserve entries
       S_i   ← η · S_i                                          #   S: decayed hits
@@ -560,14 +548,15 @@ Algorithm 2  Counted-coverage bank: update and scoring for one batch X
 
   # ---- score against the pre-update state ----
   if |established| < M:                                        # bank still building its cover
-      t(x) ← 0 for all x in X_global                           #   module inactive (as in §3.3)
+      p̂(x) ← ⊥ for all x in X_global                          #   module inactive: no modulation
   else:
       for each x in X_global:
           if median over established of E_i  <  0.5/(1−η):     # counters not yet mature
-              t(x) ← nearest-neighbour readout of §3.3 over the established set     # cold-start
+              p̂(x) ← ⊥                                        #   cold-start: no modulation (§3.3 has no p̂)
           else:
-              p̂(x) ← Σ_{i ∈ established, j nearest} (S_i / (E_i + ε)) · K_h(s(x) − b_i)   # unnormalized sum
-              t(x) ← F̂( log p̂(x) )                            # percentile among recent tiles (PIT)
+              R_rad ← radius_mult · s
+              p̂(x) ← Σ_{i ∈ established, ‖s(x) − b_i‖ ≤ R_rad} (S_i / (E_i + ε)) · K(‖s(x) − b_i‖ / R_rad)
+              p_ref ← 0.999 · p_ref + 0.001 · median_x p̂(x)   # reference scale for the weight (§3.6)
 
   # ---- update (runs every step, including fill) ----
   for each x in X_global:
@@ -586,33 +575,36 @@ Algorithm 2  Counted-coverage bank: update and scoring for one batch X
               if reserve is at capacity:  evict its oldest entry
               add a signature to the reserve at s(x):  b ← s(x), S ← 0, E ← 0, age ← 0
 
-  return { t(x) : x in this worker's rows }
+  return { p̂(x) : x in this worker's rows }        # ⊥ during fill / cold-start → the trainer applies no weight
 ```
 
 Here `η` is the per-step decay factor (set by the half-life), `S_i`/`E_i` the decayed hit count and
-lifetime of stored signature `i`, and `p̂` the estimated tile density at the query; the kernel sum runs over the
-`j` nearest stored signatures, and `F̂` is the recent-tile percentile of the previous paragraph.
+lifetime of stored signature `i`, and `p̂` the estimated tile density at the query; the kernel sum runs over
+the stored signatures within the fixed radius `R_rad = radius_mult · s`. The per-tile weight `w(x)` is
+formed downstream from `p̂` and `p_ref` (§3.6).
 
 A note on resolution. With `M = 8192` stored signatures the achieved spacing is ≈ 0.82 `L` (set by the hit
-radius `s`; §3.7), and the readout pools `j ≈ 64` stored signatures over a window of order `L`, so every readout
-is smoothed at scale `L`. Structure finer than `L` is invisible to any bounded summary of this size,
-whatever its readout; refining it would need exponentially more memory or a lower-dimensional
-signature. This bounds both bank variants equally and is a property of the regime, not of either
-policy.
+radius `s`; §3.7), and the readout sums over the stored signatures inside `R_rad = 1.5 s ≈ 1.5 ×` the
+spacing, so every readout is smoothed at scale `R_rad`. Structure finer than that is invisible to any
+bounded summary of this size, whatever its readout; refining it would need exponentially more memory or a
+lower-dimensional signature. This is a property of the regime, not of the policy.
 
-**Implementation defaults.** For a build-ready specification we fix the five choices left abstract
+**Implementation defaults.** For a build-ready specification we fix the choices left abstract
 above. *Hit radius:* self-tuned online rather than fixed (§3.5, "Placement"). The bank maintains a rolling
 buffer of the most recent ≈ 60,000 signatures and, every ≈ 500 steps, replays seed-on-miss over the
 buffer on a radius grid re-centered on the current median inter-signature distance — a geometric grid
 spanning ≈ 0.3–2× that scale, refined once across the fill-to-underfill transition — and sets `s` to the
 largest radius that still fills the bank to `M`, smoothed by an exponential moving average with a
 ≈ 5-sweep time constant. Because the radius is re-measured on the live signatures, it tracks the scale
-drift of the online-trained `R` that a fixed value cannot (§3.7, "Bank size `M`"). *Kernel:* a triweight profile `k(u) = (1 − u²)³` on `u ≤ 1` (smooth and compactly supported)
-with bandwidth `h(x)` = the L1 distance to the `j`-th nearest stored signature (`j = 64`). `j = 64` is the value
-in the 32–64 range at which the pooling radius reaches `L` — the 64th-nearest stored signature sits at L1 ≈ 3.5
-≈ `L` (§3.7), so the readout pools over exactly one correlation length, the scale below which the
-density field has no structure; the readout is otherwise insensitive to the profile (the offline study
-of §3.7 used a truncated Gaussian and gives the same recovery). *Half-life:* 250 steps
+drift of the online-trained `R` that a fixed value cannot (§3.7, "Bank size `M`"). *Kernel and readout
+radius:* a triweight profile `k(u) = (1 − u²)³` on `u ≤ 1` (smooth and compactly supported), summed over
+the stored signatures within `R_rad = radius_mult · s`, `radius_mult = 1.5`. `1.5` is the multiple at
+which the fixed-radius density agreed best with an offline `k`-NN reference (measured correlation 0.85)
+and the empty-neighbourhood fraction first reached zero in the sweep (§3.7, "Measured basis"); the
+measured `spacing / s ≈ 1.02` makes `s` a valid stand-in for the stored-signature spacing. `j` is no
+longer a readout parameter (it is a resolution diagnostic; §3.5). *Weight:* `w = 1/(p̂ + c)^a`,
+`c = c_frac · p_ref`, with `c_frac = 0.25` and the tilt `a` the one deliberately swept knob — `a = 0.5`
+and `a = 1.0` give measured gradient tilts of 2.77× and 7.68× (§3.7, "Measured basis"). *Half-life:* 250 steps
 (`η = 0.5^{1/250} ≈ 0.997`) — long relative to the batch autocorrelation, short relative to the drift
 horizon (§3.5); the offline study used 100 steps with no material change. This is nonetheless the
 method's least-justified constant — hand-picked where every other parameter is self-tuned, budgeted, or
@@ -621,45 +613,59 @@ counted readout activates once the bank is full *and* the median exposure has pa
 accumulation, `median E ≥ 0.5/(1−η)`. (The exposure ceiling `1/(1−η)` is approached from below but
 never reached — a literal `E ≥ 1/(1−η)` test would never fire — so the threshold is half the ceiling,
 which is the accumulated `E` at exactly one half-life; a *median* avoids waiting on the perpetually
-re-admitted `E = 1` newborns.) Until then the §3.3 readout is used. *PIT reference:* a rolling window
-of the most recent ≈ 20,000 `log p̂` values, ranked by binary search (this is what §3.7 validated);
-the two-moment probit on `log p̂` (running mean and variance, `t = Φ((log p̂ − m̂)/σ̂)`) is the cheaper
-fallback that needs no window.
+re-admitted `E = 1` newborns.) Until then no modulation is applied. *Reference scale:* `p_ref`, an EMA
+`p_ref ← 0.999 p_ref + 0.001 · median_x p̂(x)` of the batch-median density, computed on the gathered
+batch (so it is identical across workers by construction) and initialised from the first matured batch's
+median — never from zero, or `c = 0` and the weight would diverge on a tile with no signature in range.
+It is a registered buffer, so it checkpoints and survives mid-run preemption.
 
 ### 3.6 Modulating the objective
 
-Both banks produce a typicality score `t(x)`, which modulates the image-level DINO cross-entropy one
-of two ways. The iBOT objective is untouched; the total loss is
+The counted-coverage bank produces a per-tile density `p̂(x)`, which modulates the image-level DINO
+cross-entropy one of two ways. The iBOT objective is untouched; the total loss is
 `L = m(x) · CE_DINO + CE_iBOT + λ_sem · CE_iBOT^{sem}`, where the modulation `m(x)` is one of:
 
-**Weighted loss.** The DINO term is scaled per tile by `w(x) = 1 − β · t(x)`, `β ∈ [0,1]`, and applied
-as a **weight-normalised mean**, `Σ w(x)·CE(x) / Σ w(x)`. Because the weight sum divides out, the
-batch-level gradient magnitude is unchanged and the modulation acts entirely through the *relative*
-weights — a uniform weight of any value is identical to no weighting. At `β = 0.5` with a percentile
-score the raw weights span `[1 − β, 1] = [0.5, 1]`; normalised by the batch-mean weight (≈ 0.75), a
-typical tile carries ≈ 0.73× the batch-average weight against ≈ 1.27× for a rare one — a spread of
-≈ 1.7× between the two, not an absolute change of scale. The modulation therefore does not attenuate
-the objective overall; it redistributes emphasis *within* each batch, which is the intended behaviour,
-since it avoids silently rescaling the effective learning rate as a side-effect of dampening. (This
-cancellation is specific to the weighted-loss form: the adaptive-temperature variant below reshapes
-the target distribution itself and carries no such normalisation.)
-This is a direct importance weighting — it flattens the effective sampling distribution over
-morphology while leaving each tile's learning signal intact — and is bounded and simple to reason
-about.
+**Weighted loss.** The DINO term is scaled per tile by the reciprocal-density weight
+`w(x) = 1/(p̂(x) + c)^a` (§3.5), `c = c_frac · p_ref`, and applied as a **weight-normalised mean**,
+`Σ w(x)·CE(x) / Σ w(x)`. Because the weight sum divides out, the batch-level gradient magnitude is
+unchanged and the modulation acts entirely through the *relative* weights — a uniform weight of any
+value is identical to no weighting. That normalisation is also what makes the reciprocal-density weight
+well-posed despite `p̂` having no fixed units: scaling every `p̂` and `p_ref` by a common factor scales
+every weight by `k^{−a}`, which cancels in the ratio, so only the *spread* of `w` across the batch acts
+(§3.5, "Score"). The tilt `a` sets that spread — larger `a` puts more relative weight on the rarest
+tiles (measured rarest:commonest gradient-mass ratio 2.77× at `a = 0.5`, 7.68× at `a = 1.0`; §3.7,
+"Measured basis") — while the mean weight is absorbed by the normalisation, so the modulation
+redistributes emphasis *within* each batch rather than rescaling the objective, avoiding a silent change
+to the effective learning rate. This is a direct importance weighting — it flattens the effective
+sampling distribution over morphology while leaving each tile's learning signal intact — and is simple
+to reason about.
 
 **Adaptive temperature.** The per-tile student softmax temperature is scaled,
 `τ(x) = τ_base · (1 + α · t(x))`, so a typical tile receives a flatter target. This changes not only
 the gradient magnitude but the shape of the target, redistributing probability mass across output
 prototypes rather than only down-scaling the tile's contribution. It is a stronger intervention that
 can actively flatten over-represented modes in the assignment itself, at the cost of coupling the
-typicality estimate more tightly into the representation geometry.
+typicality estimate more tightly into the representation geometry. It requires a *bounded* score
+`t ∈ [0,1]`, so it is not driven by the fixed-radius density directly — the density would first have to
+be mapped to a bounded score — and it is out of scope for the fixed-radius configuration studied here.
 
-The counted-coverage bank (§3.5) with each of the two modulations thus defines two configurations. Their comparison
-is the subject of Section 4; the sensitivity of the leading configuration to its principal
-hyperparameters (`β` or `α`, the warmup `T_warm`, and, for the counted-coverage bank, the decay
+The counted-coverage bank (§3.5) with the weighted-loss modulation, at two tilt settings `a`, is the
+configuration carried forward; its comparison is the subject of Section 4, and the sensitivity of the
+leading configuration to its principal hyperparameters (`a`, the warmup `T_warm`, and the decay
 half-life and hit radius) is studied thereafter.
 
 ### 3.7 Empirical determination of the constants, and offline validation
+
+> **Historical note (readout).** The *readout-recovery* figures in this section — the Spearman
+> `ρ = 0.75`, Table 2, and the exposure/normalization controls — were produced with the earlier
+> **fixed-count percentile** readout (summing the `j` nearest signatures, scoring by the PIT) on an
+> **offline synthetic `R`**. That readout has been replaced by the fixed-radius absolute readout of
+> §3.5, and the synthetic-`R` artifacts are not reproducible from anything on disk, so `ρ = 0.75`
+> cannot be re-derived and is **not a current claim** about the shipped method. It is retained only as
+> the record of how the constants were established. The measured basis for the current readout is the
+> "Measured basis for the fixed-radius readout" subsection at the end of this section. The *structural*
+> constants of Table 1 (intrinsic dimension `d*`, correlation length `L`, dynamic range, burst factor,
+> one-off rate) are properties of the signature stream and are unaffected by the readout change.
 
 The counted-coverage design rests on two empirical claims: that the constants of Table 1 are
 properties of the model rather than of one sample, and that the bank, run end to end, actually
@@ -684,7 +690,8 @@ constant — both p99/p1 and the variance of log-density grow with sample size, 
 converged, operationally meaningful quantity is the skew at a *fixed* bandwidth equal to the bank's
 resolution: at radius ≈ `L` the log-density variance is 1.33 and the 90/10 density ratio is ≈ 18
 (Table 1), stable across sample size. The design does not depend on pinning the dynamic range, because
-the rank/PIT readout (§3.5) is invariant to any monotone rescaling of density.
+the fixed-radius weight (§3.5) references the density's live scale (`c = c_frac · p_ref`) and so is
+invariant to a global rescaling of density.
 
 The same study fixes the resolution scales (L1 units on `s`). The ideal-tiling estimate
 `s_M = (V/M)^{1/d*} ≈ 1.97` (≈ 0.59 `L`) is a lower bound; because seed-on-miss packs stored signatures at the
@@ -697,9 +704,11 @@ set by the pooling window, not by the stored-signature spacing.
 lifetime exposure) over the 384,000 signatures `s = R·z` in stream order, under L1, and compared its
 score, per tile, against the offline `k`-nearest-neighbour density on the full sample — the best
 available proxy for ground-truth redundancy. With the hit radius set at the fill knee (`s ≈ 2.75` in
-L1 units), the online score recovers the offline density with **Spearman ρ = 0.75**, on a bounded
-memory holding 8,192 of 384,000 tiles; this is close to the ceiling the resolution allows, since the
-score is smoothed at scale `L` and correlated against a finer reference. The per-signature rate `λ̂`
+L1 units), the online score *recovered* the offline density with **Spearman ρ = 0.75**, on a bounded
+memory holding 8,192 of 384,000 tiles (historical, under the fixed-count percentile readout — see the
+note at the head of this section; superseded by the fixed-radius measurements below); this was close to
+the ceiling the resolution allows, since the score is smoothed at scale `L` and correlated against a
+finer reference. The per-signature rate `λ̂`
 tracks the density at its own location with ρ = 0.67, confirming that the counting itself — not merely
 the kernel smoothing — carries the signal. The bank reaches steady state (8,192 stored signatures, modest
 turnover). This run exercises the core mechanism — direct seeding of the established set, Voronoi
@@ -712,13 +721,14 @@ decays away before the counters mature, so neither difference bears on the recov
 
 **Scope of these numbers.** The recovery figures in this section — `ρ = 0.75`, the exposure and
 normalization controls, and Table 2 — were produced with the configuration validated at the time: the
-hard PIT score, a fixed `j = 64`, one-hit graduation, and the reserve disabled. The self-tuned `j`
-(Algorithm 3), the noise-aware soft rank, and the two-hit graduation rule change the readout and the
-maintenance, and are **not** covered by this validation; re-running the §3.7 protocol under the
-current configuration is required before their recovery can be quoted. Retiring the distance-calibrated
-bank as a selectable variant likewise does not transfer this evidence to it — these numbers are the
-counted bank's, in the configuration stated, and nothing here should be read as the remaining
-configuration inheriting them.
+hard PIT score over a fixed count of `j = 64` nearest signatures, one-hit graduation, and the reserve
+disabled. That readout has since been replaced entirely: the current method sums the counters over a
+**fixed radius** and weights by the absolute density, with no percentile step and with `j` demoted to a
+resolution diagnostic (§3.5). So these figures are **not** the current method's — the direct evidence
+for the fixed-radius readout is the "Measured basis" subsection above, and re-running the §3.7 protocol
+end to end under the current configuration is required before any recovery figure can be quoted for it.
+Retiring the distance-calibrated bank likewise does not transfer this evidence to it; nothing here
+should be read as the shipped configuration inheriting these numbers.
 
 **Provenance of `R`.** The baseline run had typicality disabled, so `L_R` never ran and the checkpoint
 contains no `R`. We therefore constructed a synthetic `R` from the frozen baseline's `out_dim =
@@ -834,6 +844,35 @@ the parameters `s`, `L`, and the half-life derived from them — can be trusted.
 inexpensive (inference-only on cached signatures), and the offline prototype is itself the guard: if
 the constants have drifted under a configuration change, the density-recovery correlation falls, which
 flags the need to re-measure before committing a training run.
+
+**Measured basis for the fixed-radius readout.** The replacement of the fixed-count percentile readout
+by the fixed-radius absolute readout (§3.5) was decided by direct measurement on **59,249 cached tile
+signatures**, drawn across four checkpoints of the two rev6 arms — offline, inference-only on the
+cached signatures, with no training. Four findings drove it. *(i) The fixed-count readout is exactly
+invariant to local rescaling.* Multiplying every distance in a query's neighbourhood by any constant
+leaves `p̂` bit-identical, because dividing by the `j`-th nearest distance cancels the scale on the next
+line — so the output carries no information about how crowded the neighbourhood is, the opposite of what
+a density readout must do. *(ii) Its agreement with the offline `k`-NN reference density fell from 0.70
+to 0.29* between iteration 52k (`j = 36`) and 124k (`j = 7`), as the cover became near-uniform (measured
+nearest-neighbour-distance p90/p10 = 1.05): with the `j` nearest signatures at almost one distance,
+`d_i/d_j ≈ 1` and the triweight `(1 − u²)³` annihilates every term — the measured total kernel weight at
+`j = 7` was **0.158**, out of a possible 7. *(iii) The fixed-radius form, same kernel and same counters
+summed over `R_rad` instead of a fixed count, agreed with the reference at 0.85* and was ~4× cheaper (no
+argsort). Its radius multiple `radius_mult = 1.5` had the best measured agreement and the first zero
+empty-neighbourhood fraction in the sweep. *(iv) The realized gradient tilt is modest.* Binning tiles by
+reference density into deciles and computing each decile's share of the normalised DINO loss, the rarest
+decile received **11.15%** (`a = 0.5`, `β`-equivalent low-tilt at 124k) and **12.59%** (`a = 1.0`,
+high-tilt at 104k) against 10% for no modulation — rarest:commonest ratios of **1.25×** and **1.55×**.
+(The 2.77× / 7.68× figures quoted for `a` elsewhere are the ratio of the *weights* at the density
+extremes; these decile figures are the realized share of the *loss*, a milder quantity because most
+tiles sit away from the extremes.)
+
+Two things are explicitly **not** claimed. No AUROC or downstream effect has been demonstrated: every
+number here is gradient-mass arithmetic on cached signatures, and nothing has yet run inside training.
+And an earlier claim that the percentile readout "manufactures rarity in homogeneous batches" was
+**retracted after measurement** — the deployed readout ranks a tile against a global rolling reference,
+not within its batch, and on within-batch weight spread neither readout showed a consistent advantage;
+that argument is not relied on anywhere.
 
 ### 3.8 Limitations
 

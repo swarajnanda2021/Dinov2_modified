@@ -8,18 +8,21 @@ faithful without requiring the stored set to be a representative sample.
 Per-signature state: position b, decayed hit count S, decayed exposure E (steps alive), age.
 Split into an ESTABLISHED set (capacity M) and a separate RESERVE buffer. Ratio
 lambda_hat = S / (E + eps) is the decayed per-signature hit-RATE; the readout sums
-lambda_hat * K_h over the j nearest established signatures (unnormalized centered kernel sum)
-and maps log p_hat to a score.
+lambda_hat * K over the established signatures within a FIXED radius R_rad = radius_mult * s
+(unnormalized kernel sum, triweight clamped to zero beyond R_rad) and returns the absolute
+local density p_hat directly. A fixed radius -- not a fixed count -- is what makes p_hat carry
+the crowding: dividing by the j-th nearest distance (the old fixed-count bandwidth) cancels the
+local scale exactly, so a fixed-count sum is invariant to how crowded the neighbourhood is.
 
-Three things are measured online rather than fixed:
+Two things are measured online rather than fixed:
   * Hit radius s (section 3.5, Placement): a rolling ~60k-signature buffer is swept every
     ~500 steps -- seed-on-miss over a grid re-centered on the live scale -- to find the fill
-    knee; s tracks that edge, EMA-smoothed.
+    knee; s tracks that edge, EMA-smoothed. It also sets the readout radius (R_rad =
+    radius_mult * s): the measured signature spacing / s ~ 1, so s stands in for anchor spacing.
   * Pooling count j (Algorithm 3): on the same cadence, L (the density correlation length) is
     fitted by a variogram-with-nugget and j is set to the count of stored signatures within L,
-    clamped by a variance target; under-resolution (spacing > L) is flagged.
-  * Score: a noise-aware soft rank (pairwise exceedance folding per-query variance), which
-    reduces to the hard PIT as estimation noise vanishes and to 1/2 as it dominates.
+    clamped by a variance target; under-resolution (spacing > L) is flagged. j no longer feeds
+    the readout (the radius is fixed); it is retained as a resolution diagnostic only.
 
 Graduation requires `graduation_hits` corroborating hits (default 2), not one, so a candidate
 is not promoted over an established signature on a single observation.
@@ -55,30 +58,25 @@ _INV_SQRT2 = 1.0 / math.sqrt(2.0)
 
 class CountedCoverageBank(nn.Module):
     """The counted-coverage typicality bank.
-        score_and_update(s_global, current_iteration) -> {'ready': bool, 't': Tensor|None}
+        score_and_update(s_global, current_iteration) -> {'ready': bool, 'p_hat': Tensor|None}
         sync_fingerprint() -> Tensor ; health()/stats()/compact_line() for telemetry.
     """
 
     def __init__(self, M, K_prime, pool_j=64, halflife_steps=250,
-                 reserve_residency=300, reserve_size=550, readout='pit',
-                 pit_buffer=20000, eps=1e-8,
+                 reserve_residency=300, reserve_size=550, eps=1e-8,
                  s_buffer_size=60000, s_sweep_interval=500, s_grid_points=9,
                  grid_span=(0.3, 2.0), s_ema_alpha=0.2, s_min_buffer=60000,
                  s_headroom=0.0, strong_lambda=0.1, scale_sample=2048,
                  graduation_hits=2, pool_selftune=True, pool_rse_target=0.05,
-                 pool_max=256, pool_ema=0.2, soft_rank=True):
+                 pool_max=256, pool_ema=0.2, radius_mult=1.5):
         super().__init__()
-        assert readout in ('pit', 'probit')
         self.M = int(M)
         self.K_prime = int(K_prime)
         self.eta = 0.5 ** (1.0 / float(halflife_steps))      # per-step decay
         self.T_need = int(reserve_residency)
         self.reserve_cap = int(reserve_size)
-        self.readout = readout
-        self.pit_buffer = int(pit_buffer)
         self.eps = float(eps)
         self.mature_E = 0.5 / (1.0 - self.eta)
-        self.pb_rho = 0.5 ** (1.0 / max(1, self.pit_buffer))
         self.n_eff = (1.0 + self.eta) / (1.0 - self.eta)     # estimator variance floor (half-life only)
         # ---- self-tuning s hyperparameters ----
         self.s_buffer_size = int(s_buffer_size)
@@ -97,8 +95,8 @@ class CountedCoverageBank(nn.Module):
         self.pool_rse_target = float(pool_rse_target)
         self.pool_max = int(pool_max)
         self.pool_ema = float(pool_ema)
-        # ---- Part 3: soft rank ----
-        self.soft_rank = bool(soft_rank)
+        # ---- fixed-radius readout ----
+        self.radius_mult = float(radius_mult)                # R_rad = radius_mult * s
 
         # ---- established set (capacity M) ----
         self.register_buffer('est_b', torch.zeros(self.M, self.K_prime))
@@ -114,15 +112,12 @@ class CountedCoverageBank(nn.Module):
         self.register_buffer('res_age', torch.zeros(cap, dtype=torch.long))
         self.register_buffer('res_hits', torch.zeros(cap))       # raw (undecayed) hit count for graduation
         self.register_buffer('n_res', torch.tensor(0, dtype=torch.long))
-        # ---- reference ring: recent (log p_hat, sigma^2 of log p_hat) ----
-        self.register_buffer('pit_ring', torch.zeros(self.pit_buffer))
-        self.register_buffer('pit_sig2_ring', torch.zeros(self.pit_buffer))
-        self.register_buffer('pit_ptr', torch.tensor(0, dtype=torch.long))
-        self.register_buffer('pit_filled', torch.tensor(0, dtype=torch.long))
-        # ---- probit decayed moments of log p_hat (ablation fallback) ----
-        self.register_buffer('pb_w', torch.tensor(0.0))
-        self.register_buffer('pb_wm', torch.tensor(0.0))
-        self.register_buffer('pb_wm2', torch.tensor(0.0))
+        # ---- reference scale for the absolute-density weight (checkpointed) ----
+        # p_hat has no natural units, so the weight w = 1/(p_hat + c)^a needs one: c = c_frac *
+        # p_ref, with p_ref a slow EMA of the batch-median density. Initialised from the first
+        # matured batch's median (NEVER 0 -> c=0 -> weight diverges on empty-neighbourhood tiles).
+        self.register_buffer('p_ref', torch.tensor(0.0))
+        self.register_buffer('p_ref_init', torch.tensor(0, dtype=torch.long))
         # ---- self-tuning s state ----
         self.register_buffer('s', torch.tensor(0.0))                 # hit radius (unset until 1st sweep)
         self.register_buffer('s_delta', torch.tensor(0.0))           # change at last sweep
@@ -375,92 +370,37 @@ class CountedCoverageBank(nn.Module):
 
     @torch.no_grad()
     def _counted_readout(self, s_global):
-        """p_hat = sum over the j nearest established signatures of lambda_hat * K_h; score by
-        the soft rank (or the hard PIT if soft_rank is off), carrying per-query variance."""
+        """Fixed-radius kernel sum. p_hat(x) = sum_i lambda_hat_i * K(d_i / R_rad) over the
+        established signatures within R_rad = radius_mult * s. The triweight clamps to zero
+        beyond R_rad, so the radius test is implicit and no argsort is needed. Returns the
+        ABSOLUTE local density p_hat (not a rank): the fixed-volume domain makes the kernel sum
+        report crowding, which a fixed-count sum cannot (dividing by the j-th nearest distance
+        cancels the local scale). Also updates p_ref, the reference scale for the weight."""
         ne = self._ne()
         bank = self.est_b[:ne]
         D = torch.cdist(s_global, bank, p=1)                              # [B, ne]
-        k = min(int(self.j.item()), ne)
-        order = torch.argsort(D, dim=1, stable=True)[:, :k]               # lowest-index tie-break
-        vals = torch.gather(D, 1, order)                                  # [B, k] ascending
-        h = vals[:, -1:].clamp(min=self.eps)                             # bandwidth = j-th nearest dist
-        Kw = self._triweight(vals / h)                                    # [B, k]
-        lam = (self.est_S[:ne] / (self.est_E[:ne] + self.eps))[order]     # [B, k] hit-rate
-        p_hat = (lam * Kw).sum(dim=1)                                     # [B]
-        logp = torch.log(p_hat + self.eps)
-        # per-query variance of log p_hat (delta method). Note the (1-eta)/(1+eta) factor:
-        # the naive S/E^2 overstates the counter variance by ~2x.
-        var_lam = lam * ((1.0 - self.eta) / (1.0 + self.eta))            # Var(lambda_hat_i)
-        var_p = (Kw * Kw * var_lam).sum(dim=1)                           # Var(p_hat)
-        sig2 = var_p / (p_hat * p_hat + self.eps)                        # Var(log p_hat)
-        if self.soft_rank:
-            t = self._soft_rank_score(logp, sig2)
+        R_rad = (self.radius_mult * self.s).clamp(min=self.eps)          # fixed radius (guard s=0)
+        lam = self.est_S[:ne] / (self.est_E[:ne] + self.eps)              # [ne] hit-rate
+        Kw = self._triweight(D / R_rad)                                   # [B, ne], zero beyond R_rad
+        p_hat = (Kw * lam[None, :]).sum(dim=1)                            # [B]
+        # p_ref: slow EMA of the batch-median density (section 3.5). The bank already runs on the
+        # all-gathered batch, so this update is identical on every rank by construction -- no
+        # collective. Init from the first matured batch's median (never 0 -> c=0 -> weight blows
+        # up on empty-neighbourhood tiles).
+        med = torch.median(p_hat)
+        if int(self.p_ref_init.item()) == 0:
+            # never 0 -> c=0 -> weight diverges. If the batch median is itself 0 (the median tile
+            # has no neighbour -- only in a cold/mistuned bank; the deployed radius measures ~0
+            # empty-neighbourhood fraction, so the median is positive), fall back to the batch
+            # mean, then eps, so p_ref stays strictly positive.
+            init = med if float(med.item()) > 0.0 else p_hat.mean()
+            if float(init.item()) <= 0.0:
+                init = p_hat.new_tensor(self.eps)
+            self.p_ref.copy_(init)
+            self.p_ref_init.fill_(1)
         else:
-            t = self._pit_score(logp)
-        self._pit_push(logp, sig2)                                       # fold in AFTER scoring
-        self._probit_push(logp)
-        return t.clamp(0.0, 1.0)
-
-    # -------------------------------------------------- Part 3: soft rank
-    @torch.no_grad()
-    def _soft_rank_score(self, logp, sig2):
-        """t(x) = mean_k Phi( (log p_hat(x) - log p_hat_k) / sqrt(sig2(x) + sig2_k) ) over the
-        reference window. -> hard PIT as sig2 -> 0 ; -> 1/2 as noise dominates. Chunked over
-        the window for memory; deterministic."""
-        filled = int(self.pit_filled.item())
-        if filled > 0:
-            ref_lp = self.pit_ring[:filled]; ref_s2 = self.pit_sig2_ring[:filled]
-        else:
-            ref_lp = logp; ref_s2 = sig2                                 # first step: self-reference
-        W = ref_lp.numel()
-        acc = torch.zeros_like(logp)
-        CH = 4096
-        for i in range(0, W, CH):
-            rlp = ref_lp[i:i + CH]; rs2 = ref_s2[i:i + CH]
-            z = (logp[:, None] - rlp[None, :]) / torch.sqrt(sig2[:, None] + rs2[None, :] + self.eps)
-            acc = acc + (0.5 * (1.0 + torch.erf(z * _INV_SQRT2))).sum(dim=1)
-        return acc / max(1, W)
-
-    @torch.no_grad()
-    def _pit_score(self, logp):
-        filled = int(self.pit_filled.item())
-        ref = self.pit_ring[:filled] if filled > 0 else logp
-        ref_sorted, _ = torch.sort(ref)
-        rank = torch.searchsorted(ref_sorted, logp, right=True).float()
-        return rank / max(1, ref_sorted.numel())
-
-    @torch.no_grad()
-    def _pit_push(self, logp, sig2):
-        cap = self.pit_buffer
-        lp = logp[-cap:] if logp.numel() > cap else logp
-        s2 = sig2[-cap:] if sig2.numel() > cap else sig2
-        n = int(lp.numel()); ptr = int(self.pit_ptr.item()); end = ptr + n
-        if end <= cap:
-            self.pit_ring[ptr:end] = lp; self.pit_sig2_ring[ptr:end] = s2
-        else:
-            first = cap - ptr
-            self.pit_ring[ptr:] = lp[:first]; self.pit_ring[:end - cap] = lp[first:]
-            self.pit_sig2_ring[ptr:] = s2[:first]; self.pit_sig2_ring[:end - cap] = s2[first:]
-        self.pit_ptr.fill_(end % cap)
-        self.pit_filled.fill_(min(cap, int(self.pit_filled.item()) + n))
-
-    @torch.no_grad()
-    def _probit_score(self, logp):
-        w = float(self.pb_w.item())
-        if w <= 0.0:
-            m = logp.mean(); v = logp.var(unbiased=False)
-        else:
-            m = self.pb_wm / self.pb_w
-            v = (self.pb_wm2 / self.pb_w - m * m).clamp(min=0.0)
-        z = (logp - m) / v.clamp(min=self.eps).sqrt()
-        return 0.5 * (1.0 + torch.erf(z * _INV_SQRT2))
-
-    @torch.no_grad()
-    def _probit_push(self, logp):
-        decay = self.pb_rho ** logp.numel()
-        self.pb_w.mul_(decay).add_(float(logp.numel()))
-        self.pb_wm.mul_(decay).add_(logp.sum())
-        self.pb_wm2.mul_(decay).add_((logp * logp).sum())
+            self.p_ref.mul_(0.999).add_(0.001 * med)
+        return p_hat
 
     # ------------------------------------------------------------ mutation ops
     @torch.no_grad()
@@ -558,7 +498,7 @@ class CountedCoverageBank(nn.Module):
 
         if int(self.s_ready.item()) == 0:
             if int(self.sig_filled.item()) < self.s_min_buffer:
-                return {'ready': False, 't': None}
+                return {'ready': False, 'p_hat': None}
             edge = self._sweep_edge()
             self.s.fill_(edge * (1.0 - self.s_headroom))
             self.s_delta.fill_(0.0)
@@ -578,17 +518,23 @@ class CountedCoverageBank(nn.Module):
         ready = (self._ne() == self.M)
         if not ready:
             self._update(s_global)
-            return {'ready': False, 't': None}
-        t = self._counted_readout(s_global) if self._matured() else self._coldstart_readout(s_global)
+            return {'ready': False, 'p_hat': None}
+        if not self._matured():
+            # cold start: counters immature, no p_hat -> apply NO modulation (explicit; the
+            # trainer passes sample_weights=None). _coldstart_readout (distance, section 3.3) is
+            # retained but no longer feeds a weight, since it produces no density.
+            self._update(s_global)
+            return {'ready': True, 'p_hat': None}
+        p_hat = self._counted_readout(s_global)
         self._update(s_global)
-        return {'ready': True, 't': t}
+        return {'ready': True, 'p_hat': p_hat}
 
     def load_state_dict(self, state_dict, strict=False):
         """Tolerate buffer-size changes across config edits on resume (e.g. reserve_size 300->550,
-        or a changed pit_buffer / s_buffer_size): copy the overlapping prefix of each mismatched
-        buffer and leave the remainder at its init value, so a checkpoint saved under a different
-        size still restores the established set, counters, s, and j. New buffers absent from an
-        older checkpoint (res_hits, pit_sig2_ring, j / j_smooth / L_est / ...) keep their init
+        or a changed s_buffer_size): copy the overlapping prefix of each mismatched buffer and
+        leave the remainder at its init value, so a checkpoint saved under a different size still
+        restores the established set, counters, s, and j. New buffers absent from an older
+        checkpoint (res_hits, p_ref / p_ref_init, j / j_smooth / L_est / ...) keep their init
         values. Without this, torch's load_state_dict raises on the reserve shape mismatch even
         with strict=False (strict only tolerates missing/unexpected keys, not size changes)."""
         own = self.state_dict()
@@ -613,9 +559,7 @@ class CountedCoverageBank(nn.Module):
             self.n_est.float().reshape(1),
             self.res_b.reshape(-1), self.res_S, self.res_E, self.res_age.float(),
             self.res_hits, self.n_res.float().reshape(1),
-            self.pit_ring, self.pit_sig2_ring,
-            self.pit_ptr.float().reshape(1), self.pit_filled.float().reshape(1),
-            self.pb_w.reshape(1), self.pb_wm.reshape(1), self.pb_wm2.reshape(1),
+            self.p_ref.reshape(1), self.p_ref_init.float().reshape(1),
             self.graduations.float().reshape(1),
             self.s.reshape(1), self.s_delta.reshape(1),
             self.s_ready.float().reshape(1), self.last_sweep_step.float().reshape(1),
@@ -632,6 +576,7 @@ class CountedCoverageBank(nn.Module):
             'graduations': int(self.graduations.item()),
             's': float(self.s.item()), 'j': int(self.j.item()),
             'L': float(self.L_est.item()), 'underresolved': int(self.underresolved.item()),
+            'p_ref': float(self.p_ref.item()),
         }
 
     @torch.no_grad()
@@ -654,6 +599,7 @@ class CountedCoverageBank(nn.Module):
             's': float(self.s.item()), 's_delta': float(self.s_delta.item()),
             'j': int(self.j.item()), 'h_over_L': float(self.h_over_L.item()),
             'L': float(self.L_est.item()), 'underresolved': int(self.underresolved.item()),
+            'p_ref': float(self.p_ref.item()),
             'n_est': ne, 'n_reserve': self._nr(), 'reserve_cap': self.reserve_cap,
             'admits': int(self._step_admits), 'kappa': int(self._step_kappa),
             'hit_frac': 1.0 - self._step_admits / kappa,
@@ -667,13 +613,15 @@ class CountedCoverageBank(nn.Module):
         }
 
     @torch.no_grad()
-    def compact_line(self, grad_per_step, t_mean, t_std, beta):
+    def compact_line(self, grad_per_step, p_median, p_ref, w_mean, ess):
         """Render the one-line 'typ | ...' status from health() + trainer-derived rates
-        (grad_per_step, t_mean, t_std smoothed by the trainer; beta from config)."""
+        (grad_per_step; p_median/p_ref/w_mean/ess from the fixed-radius readout and the realized
+        weights). ESS (effective fraction of the batch, sum(w)^2 / [sum(w^2)*B]) is the health
+        signal -- t_std was uninformative because a rank statistic is uniform on [0,1] whatever
+        the estimator is doing, so it sat at sqrt(1/12) and could not move. ESS can move."""
         h = self.health()
         turnover = self.M / grad_per_step if grad_per_step > 1e-9 else float('inf')
         turn_ratio = turnover / h['n_eff'] if h['n_eff'] > 0 else 0.0
-        w_mean = 1.0 - beta * t_mean
         flags = []
         if turnover < 2.0 * h['n_eff']:
             flags.append('!churn')
@@ -683,8 +631,8 @@ class CountedCoverageBank(nn.Module):
             flags.append('!underres')
         if h['n_est'] < self.M:
             flags.append('!fill')
-        if (not self.soft_rank) and abs(t_std - 0.2887) > 0.05:
-            flags.append('!pit')
+        if 0.0 < ess < 0.5:
+            flags.append('!ess')                             # >half the effective batch collapsed
         status = ' '.join(flags) if flags else 'OK'
         turn_str = ("inf" if turnover == float('inf')
                     else (f"{turnover / 1000:.1f}k" if turnover >= 1000 else f"{turnover:.0f}"))
@@ -694,7 +642,7 @@ class CountedCoverageBank(nn.Module):
             f"hit={h['hit_frac'] * 100:.1f}% grad={grad_per_step:.1f}/st turn={turn_str}({turn_ratio:.1f}x) | "
             f"lam={h['lam_q10']:.3f}/{h['lam_median']:.3f}/{h['lam_q90']:.3f} ({h['lam_spread']:.1f}x) "
             f"evict={h['evict_over_q10']:.2f}q10 | "
-            f"t={t_mean:.3f}±{t_std:.3f} w={w_mean:.3f} | "
+            f"p={p_median:.3g}/ref{p_ref:.3g} w={w_mean:.2f} ess={ess * 100:.0f}% | "
             f"res_exit=grad{h['step_grad']:.0f}/exp{h['step_expired']:.0f}/flush{h['step_flushed']:.0f} "
             f"age={h['exit_age_mean']:.1f} | {status}"
         )
