@@ -1627,6 +1627,10 @@ def train_dinov2(args):
                     typ_lam_q10=h['lam_q10'], typ_lam_median=h['lam_median'], typ_lam_q90=h['lam_q90'],
                     typ_lam_spread=h['lam_spread'], typ_evict_over_q10=h['evict_over_q10'],
                     typ_underresolved=h['underresolved'], typ_graduations=h['graduations'],
+                    # migrated from the retired 'typ | ...' pipe line so no information is lost:
+                    typ_s_delta=h['s_delta'], typ_reserve_cap=h['reserve_cap'],
+                    typ_exit_grad=h['step_grad'], typ_exit_expired=h['step_expired'],
+                    typ_exit_flushed=h['step_flushed'], typ_exit_age=h['exit_age_mean'],
                 )
                 # Fixed-radius readout: p_median/p_ref are the density and its reference scale
                 # (rank-invariant, from the gathered batch); w_mean/ESS describe the realized
@@ -1656,17 +1660,22 @@ def train_dinov2(args):
                 # thin_seen: candidates scouted to fill this step (~chi*N). thin_accept = N/seen
                 # (~1/chi; drift is the miscalibration alarm). thin_bias: mean|beta_hat| (crude).
                 # thin_prof_err: L1 between the committed p_hat histogram and the target a*mu.
-                if balance_mode == 'thinned' and thin_seen_val:
-                    metric_logger.update(
-                        thin_seen=float(thin_seen_val),
-                        thin_accept=float(args.batch_size_per_gpu) / float(thin_seen_val))
-                    if thin_bias_val is not None:
-                        metric_logger.update(thin_bias=float(thin_bias_val))
-                    if (thin_committed_phat is not None and thin_pool_phat is not None
-                            and thin_pool_phat.numel() > 1):
-                        metric_logger.update(thin_prof_err=_thin_profile_err(
-                            thin_committed_phat, thin_pool_phat,
-                            float(typicality_bank.p_ref.item())))
+                if balance_mode == 'thinned':
+                    # thin_active: 0 while the gate is closed / during the w_max window, 1 once
+                    # acceptance is live (frozen w_max). Distinguishes "thinning engaged but doing
+                    # nothing" (gate closed / calibrating) from "thinning not yet started".
+                    metric_logger.update(thin_active=float(thin_active))
+                    if thin_seen_val:
+                        metric_logger.update(
+                            thin_seen=float(thin_seen_val),
+                            thin_accept=float(args.batch_size_per_gpu) / float(thin_seen_val))
+                        if thin_bias_val is not None:
+                            metric_logger.update(thin_bias=float(thin_bias_val))
+                        if (thin_committed_phat is not None and thin_pool_phat is not None
+                                and thin_pool_phat.numel() > 1):
+                            metric_logger.update(thin_prof_err=_thin_profile_err(
+                                thin_committed_phat, thin_pool_phat,
+                                float(typicality_bank.p_ref.item())))
 
         metric_logger.update(lr=optimizer_student.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer_student.param_groups[0]["weight_decay"])
@@ -1694,10 +1703,14 @@ def train_dinov2(args):
                 _gps = (_gnow - typ_last_grad) / _di            # graduations/step over the interval
                 typ_last_grad = _gnow
                 typ_last_grad_iter = current_iteration
-                metric_logger.update(typ_grad_per_step=_gps,
-                                     typ_turnover=(typicality_bank.M / _gps if _gps > 1e-9 else 0.0))
-                # reuse the scalar meters computed above (same values in the line and the metrics)
-                print(typicality_bank.compact_line(_gps, typ_pmed, typ_pref, typ_wmean, typ_ess))
+                _turn = typicality_bank.M / _gps if _gps > 1e-9 else 0.0
+                _neff = float(typicality_bank.n_eff)
+                metric_logger.update(typ_grad_per_step=_gps, typ_turnover=_turn,
+                                     typ_turn_ratio=(_turn / _neff if _neff > 0 else 0.0))
+                # The custom pipe-delimited 'typ | ...' status line is retired: it duplicated the
+                # canonical metric line, which now carries every one of its fields (s_delta,
+                # reserve_cap, turn_ratio, the reserve-exit breakdown grad/exp/flush, exit age; the
+                # churn/evict/fill/ess flags are thresholds on those canonical fields). No print here.
 
         # ========== Write to log file ==========
         if utils.is_main_process() and current_iteration % 100 == 0:
