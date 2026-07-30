@@ -1205,7 +1205,12 @@ def train_dinov2(args):
                             args.typicality_a, args.typicality_c_frac,
                         )
 
-            # DINO CLS loss
+            # DINO CLS loss. In thinned mode the rebalancing is realized by admission (the batch is
+            # already density-thinned), so the loss is UNWEIGHTED: the typicality block above is
+            # skipped and typicality_weights stays None -> sample_weights=None. (weighted mode keeps
+            # its per-tile weights; off has none.)
+            if balance_mode == 'thinned':
+                assert typicality_weights is None, "thinned mode must not weight the committed loss"
             dino_class_loss_val = dino_class_loss(
                 student_cls_outputs,
                 teacher_cls_outputs,
