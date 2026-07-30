@@ -914,6 +914,73 @@ chosen, and no measurement establishes that it is the best point within it. Fina
 memory measured in tiles, and the natural clock for this quantity is tiles seen rather than steps, so a
 change of batch size should rescale `H` accordingly.
 
+### 3.9 Rebalancing by thinning instead of weighting
+
+**The same rebalancing, realized on the stream instead of the loss.** The weighted-loss modulation of
+§3.6 scales each tile's DINO gradient by `w(x) = 1/(p̂(x) + c)^a`, flattening the effective sampling
+distribution over morphology while every tile still enters the batch. *Thinning* reaches the same target
+from the other side: it leaves the loss unweighted and instead admits each candidate tile to the batch
+with a probability proportional to that weight. Common tiles are dropped more often, rare tiles almost
+always kept, and the morphology mix the encoder trains on is rebalanced by *which tiles are present*
+rather than by *how hard each is pushed*.
+
+**Matched mass.** Thinning and weighting are constructed to deliver the same expected per-region
+gradient mass. With acceptance probability
+
+```
+a(p̂) = w(p̂) / w_max ,   w(p̂) = (p̂ + c)^{-a} ,   c = c_frac · p_ref
+```
+
+(`a = 0.5`, `c_frac = 0.25`, matching the `lo` weighted arm; `w_max` the running max of `w` over a short
+warmup, then frozen, so the rarest tile is admitted with probability ≈ 1) the thinned measure `a · μ`
+over morphology equals the weighted measure `w · μ` up to the constant `1/w_max`. The two arms therefore
+share their expected gradient and differ only in *effective sample size / coverage*: weighting keeps
+every tile but down-weights the common ones (full coverage, unequal leverage); thinning spends the batch
+on fewer, rarer tiles (reduced coverage, equal leverage). Expected consumption per committed batch is
+`χ = 1/E[a] = w_max / E[w]`; the candidate pool is over-drawn by `--thin_oversample_factor` (set above
+`χ`) so `N` survivors can be admitted, and more batches are pulled if a step falls short.
+
+**The load-bearing rule: the bank sees the true stream.** The bank measures how rare each morphology is
+in the *incoming* stream. Thinning flattens that stream, so the bank must be updated on the un-thinned
+candidate pool, never on the thinned committed batch. Were it updated on the committed batch, the rare
+tiles that thinning concentrates would stop looking rare, `p̂` would rise, `w → 1`, and admission would
+decay to uniform sampling — the intervention erasing its own signal. In thinned mode the bank is
+therefore updated exactly once per step, on the scout signatures of the whole pool (below), and the
+committed forward is bank-read-only.
+
+**The scout: a third, unaugmented global crop.** In the ordinary loop `p̂` is a post-forward quantity —
+it exists only after the fused `student(all crops)` pass — so there is no density by which to admit tiles
+before committing them. Thinning adds a *scout* crop: a third global view whose transform is `Resize +
+Normalize` and nothing else (no random-resized-crop, flip, rotation, colour jitter, grayscale, or blur).
+Because the DINO objective learns representations invariant to those augmentations, a tile's density is a
+property of its content and is read correctly from the clean view; the augmented-crop-1 reading the bank
+used previously was incidental to how it was wired. The scout is forwarded on its own no-grad pass — one
+extra embed, not an extra training forward — and its bottleneck yields the signatures that update the
+bank and set `p̂`. It feeds the bank only: it never enters the student/teacher crop sets or the
+DINO/iBOT losses, is excluded from the student-view count, and, being deterministic, leaves the augmented
+crops' random state untouched, so the `weighted` and `off` arms remain byte-identical to the code before
+this section.
+
+**Two-scale bias probe (measure-only).** The counted readout is smoothed at the fixed radius `R_rad`, so
+`log p̂` carries a resolution-dependent bias. A second, coarse covering bank at ≈ `2s` spacing — a
+`CountedCoverageBank` with `M' = 2^{-d*} M`; since `d* ≈ 9.3` this is ≈ `M/630`, floored to `64` because
+the class's self-tuning (reserve, sweep, variogram) assumes `M` in the thousands — gives a coarser
+estimate `u_2s = log p̂_2s` beside the fine `u_s = log p̂_s`. Their difference `β̂ = u_2s − u_s` is a
+pointwise Richardson estimate of the bias, and `u* = 2 u_s − u_2s` the debiased density. Because `M'`
+sits far below the bank's working regime the coarse readout is crude, so `β̂` is reported as an
+*indicator*, not a calibrated correction: `u*` is implemented but inactive by default
+(`--thin_richardson_correct`), and admission uses the plain `p̂`.
+
+**Diagnostics.** Four scalars appear on the canonical log line in thinned mode: `thin_seen`, the
+candidates scouted to fill the step (≈ `χ·N`); `thin_accept = N / thin_seen` (≈ `1/χ`, whose drift is
+the miscalibration alarm); `thin_bias`, the mean `|β̂|`; and `thin_prof_err`, a binned-histogram L1
+between the committed batch's `p̂` distribution and the target profile `a · μ`.
+
+**Flag.** `--balance_mode` selects `weighted` (the §3.6 arm, byte-unchanged and the comparison
+baseline), `thinned` (this section), or `off` (no rebalancing). `p_ref`, `w_max`, and the realized `χ`
+are re-measured on the unaugmented scout basis during warmup rather than carried from the augmented
+weighted arm, whose `p̂` distribution differs.
+
 ---
 
 ### References
