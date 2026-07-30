@@ -758,6 +758,52 @@ def train_dinov2(args):
     dataset_passes = dataset_position // loader_len
     max_passes = 5
 
+    # ---- stream-thinning state / helpers (section 3.9; thinned mode only) ----
+    thin_w_max = 0.0             # running max of the acceptance weight w; frozen after warmup
+    thin_wmax_frozen = False
+    thin_wmax_seen = 0           # steps with a live p_hat contributing to the running max
+    THIN_WMAX_WARMUP = 500       # steps of running-max after activation, then w_max is frozen
+
+    def _draw_one():
+        """Draw one loader batch, handling StopIteration -> pass increment (same bookkeeping as
+        the weighted/off path). Returns (batch, stop). Only used by the thinned over-draw."""
+        nonlocal data_iterator, dataset_position, dataset_passes
+        try:
+            b = next(data_iterator); dataset_position += 1
+        except StopIteration:
+            dataset_passes += 1
+            if dataset_passes >= max_passes:
+                return None, True
+            data_iterator = iter(train_loader)
+            b = next(data_iterator)
+            dataset_position = dataset_passes * loader_len
+            print(f"Starting pass {dataset_passes + 1} at iteration {current_iteration}")
+        return b, False
+
+    def _scout_and_bank(scout_crop, cur_iter):
+        """Thinned mode: forward the unaugmented scout crop no-grad, update the PRIMARY and the
+        coarse Richardson banks on the all-gathered scout signatures (the only bank updates), and
+        return (p_hat_local, p_hat_gathered, mean|beta_hat|). p_hat is debiased to u*=2u_s-u_2s
+        only when --thin_richardson_correct (default off)."""
+        with torch.no_grad():
+            so = student([scout_crop.cuda(non_blocking=True)], token_masks=[None], mode='dino',
+                         return_bottleneck=True)
+            sg = _all_gather_signatures(
+                repr_protos.compute_signatures(so['bottleneck'].detach()).detach())
+            bo = typicality_bank.score_and_update(sg, cur_iter)
+            if bo['ready'] and cur_iter % 2000 == 0:
+                _assert_bank_synced(typicality_bank.sync_fingerprint(), tag=f"@it{cur_iter}(scout)")
+            co = richardson_bank.score_and_update(sg, cur_iter) if richardson_bank is not None else {}
+            pg = bo.get('p_hat')
+            bias = None
+            if pg is not None and co.get('p_hat') is not None:
+                us = torch.log(pg + 1e-8); u2 = torch.log(co['p_hat'] + 1e-8)
+                bias = float((u2 - us).abs().mean().item())
+                if args.thin_richardson_correct:
+                    pg = torch.exp(2.0 * us - u2)
+            nrows = scout_crop.shape[0]
+            return (_local_rows(pg, nrows) if pg is not None else None), pg, bias
+
     if utils.is_main_process():
         print(f"Starting training at iteration {current_iteration}")
 
@@ -765,53 +811,92 @@ def train_dinov2(args):
     print("Starting training!")
 
     while current_iteration < args.total_iterations:
-        # ========== Get batch ==========
-        try:
-            batch_data = next(data_iterator)
-            dataset_position += 1
-        except StopIteration:
-            dataset_passes += 1
-            if dataset_passes >= max_passes:
+        # ========== Get batch (weighted/off: one batch; thinned: over-drawn pool -> N) ==========
+        thin_seen_val = None; thin_bias_val = None
+        thin_committed_phat = None; thin_pool_phat = None
+        if balance_mode != 'thinned' or current_iteration < args.typicality_warmup_iters:
+            # weighted / off, and thinned-before-activation: draw exactly one batch. This branch is
+            # byte-identical to the pre-change loop for weighted/off (no scout crop is emitted, and
+            # the single next()/pass bookkeeping is unchanged).
+            try:
+                batch_data = next(data_iterator)
+                dataset_position += 1
+            except StopIteration:
+                dataset_passes += 1
+                if dataset_passes >= max_passes:
+                    print(f"Reached maximum passes ({max_passes}). Stopping.")
+                    break
+
+                data_iterator = iter(train_loader)
+                batch_data = next(data_iterator)
+                dataset_position = dataset_passes * loader_len
+                print(f"Starting pass {dataset_passes + 1} at iteration {current_iteration}")
+        else:
+            # ===== Stream thinning (section 3.9): over-draw a candidate pool, forward the scout
+            # crop no-grad and update the banks on the un-thinned TRUE stream (the ONLY bank
+            # update), then admit each candidate with prob a(p_hat) = w/w_max until N survivors
+            # (pull more if short). The committed batch is bank-read-only and unweighted below. =====
+            N = args.batch_size_per_gpu
+            kept = None; n_kept = 0; thin_seen_val = 0
+            _phat_committed = []; _phat_pool = []
+            _stop = False; first = True
+            while n_kept < N:
+                n_draws = max(1, math.ceil(args.thin_oversample_factor)) if first else 1
+                first = False
+                pool_batches = []
+                for _ in range(n_draws):
+                    b, _stop = _draw_one()
+                    if _stop:
+                        break
+                    pool_batches.append(b)
+                if not pool_batches:
+                    break
+                # concatenate the drawn batches per crop position (dim 0) -> candidate pool
+                pool = [torch.cat([pb[i] for pb in pool_batches], dim=0)
+                        for i in range(len(pool_batches[0]))]
+                p_local, p_gathered, bias = _scout_and_bank(pool[-1], current_iteration)
+                if bias is not None:
+                    thin_bias_val = bias
+                pool_n = pool[-1].shape[0]
+                thin_seen_val += pool_n
+                if p_local is None:
+                    # counters not matured yet: admit uniformly (no density to thin by)
+                    keep = torch.arange(pool_n)
+                else:
+                    _phat_pool.append(p_local)
+                    w_local = TypicalityScorer.absolute_weights(
+                        p_local, typicality_bank.p_ref, 0.5, 0.25)
+                    # w_max: running max of the GATHERED weight (rank-identical) over the warmup
+                    # window, then frozen -> the rarest tile is admitted with prob ~1. Recalibrated
+                    # here on the UNAUGMENTED scout basis (NOT carried from the augmented-bank run).
+                    if p_gathered is not None and not thin_wmax_frozen:
+                        w_g = TypicalityScorer.absolute_weights(
+                            p_gathered, typicality_bank.p_ref, 0.5, 0.25)
+                        thin_w_max = max(thin_w_max, float(w_g.max().item()))
+                        thin_wmax_seen += 1
+                        if thin_wmax_seen >= THIN_WMAX_WARMUP:
+                            thin_wmax_frozen = True
+                    wmax = thin_w_max if thin_w_max > 0.0 else float(w_local.max().item())
+                    a = (w_local / max(wmax, 1e-8)).clamp(0.0, 1.0)
+                    keep = torch.nonzero(torch.rand_like(a) < a, as_tuple=False).flatten()
+                keep_cpu = keep.detach().to('cpu')
+                if kept is None:
+                    kept = [[] for _ in range(len(pool) - 1)]     # committed positions (drop scout)
+                for pos in range(len(pool) - 1):
+                    kept[pos].append(pool[pos][keep_cpu])
+                if p_local is not None:
+                    _phat_committed.append(p_local[keep])
+                n_kept += int(keep_cpu.numel())
+            if _stop and n_kept < N:
                 print(f"Reached maximum passes ({max_passes}). Stopping.")
                 break
-
-            data_iterator = iter(train_loader)
-            batch_data = next(data_iterator)
-            dataset_position = dataset_passes * loader_len
-            print(f"Starting pass {dataset_passes + 1} at iteration {current_iteration}")
-
-        # ===== Stream thinning (section 3.9): scout forward + bank update on the TRUE stream =====
-        # Thinned mode's ONLY bank update happens here, on the unaugmented scout crop
-        # (batch_data[-1]) via a single no-grad embed -- no extra training forward. The committed
-        # forward below is bank-read-only and its DINO loss is UNWEIGHTED. (Over-draw + density
-        # acceptance are added in the acceptance step; here the whole drawn batch is committed.)
-        scout_p_hat = None
-        thin_bias_val = None
-        if balance_mode == 'thinned' and current_iteration >= args.typicality_warmup_iters:
-            scout_crop = batch_data[-1].cuda(non_blocking=True)
-            _nrows = batch_data[-1].shape[0]
-            with torch.no_grad():
-                scout_out = student([scout_crop], token_masks=[None], mode='dino',
-                                    return_bottleneck=True)
-                s_scout = repr_protos.compute_signatures(scout_out['bottleneck'].detach())
-                s_scout_g = _all_gather_signatures(s_scout.detach())
-                _bank_out = typicality_bank.score_and_update(s_scout_g, current_iteration)
-                if _bank_out['ready'] and current_iteration % 2000 == 0:
-                    _assert_bank_synced(typicality_bank.sync_fingerprint(),
-                                        tag=f"@it{current_iteration}(scout)")
-                if _bank_out.get('p_hat') is not None:
-                    scout_p_hat = _local_rows(_bank_out['p_hat'], _nrows)
-                # Richardson two-scale probe: update the coarse bank on the SAME scout signatures
-                # and form beta_hat = log p_2s - log p_s (crude, measure-only). The debiased density
-                # u* = 2 u_s - u_2s is implemented but INACTIVE unless --thin_richardson_correct.
-                if richardson_bank is not None:
-                    _co = richardson_bank.score_and_update(s_scout_g, current_iteration)
-                    if _co.get('p_hat') is not None and scout_p_hat is not None:
-                        _u_s = torch.log(scout_p_hat + 1e-8)
-                        _u_2s = torch.log(_local_rows(_co['p_hat'], _nrows) + 1e-8)
-                        thin_bias_val = (_u_2s - _u_s).abs().mean().item()
-                        if args.thin_richardson_correct:
-                            scout_p_hat = torch.exp(2.0 * _u_s - _u_2s)
+            if n_kept < N:
+                print(f"[thinned] under-filled batch (kept {n_kept} < N={N}) at iter {current_iteration}")
+            batch_data = [torch.cat(kept[pos], dim=0)[:N] for pos in range(len(kept))]
+            if _phat_committed:
+                thin_committed_phat = torch.cat(_phat_committed, dim=0)[:N]
+            if _phat_pool:
+                thin_pool_phat = torch.cat(_phat_pool, dim=0)
 
         # === 1. Extract crops from batch ===
         idx = 0
