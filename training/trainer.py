@@ -780,10 +780,15 @@ def train_dinov2(args):
     max_passes = 5
 
     # ---- stream-thinning state / helpers (section 3.9; thinned mode only) ----
-    thin_w_max = 0.0             # running max of the acceptance weight w; frozen after warmup
-    thin_wmax_frozen = False
-    thin_wmax_seen = 0           # steps with a live p_hat contributing to the running max
-    THIN_WMAX_WARMUP = 500       # steps of running-max after activation, then w_max is frozen
+    # ---- stream-thinning gate + w_max calibration state (section 3.9; thinned mode only) ----
+    thin_gate_open = False        # latches True once the bank is FILLED for K consecutive steps
+    thin_ready_streak = 0         # consecutive steps with bank_ready true (resets on any miss)
+    thin_w_max = 0.0              # running max of the acceptance weight w over the measurement window
+    thin_wmax_frozen = False      # True after the W-step window closes -> acceptance fully live
+    thin_window_seen = 0          # steps counted in the w_max measurement window
+    thin_active = 0               # 0 = gate closed / w_max still calibrating; 1 = acceptance live
+    THIN_GATE_K = 5              # consecutive bank_ready steps required to open the gate
+    THIN_WMAX_WINDOW = 200       # w_max measurement-window length W (running max, then frozen)
 
     def _draw_one():
         """Draw one loader batch, handling StopIteration -> pass increment (same bookkeeping as
@@ -852,11 +857,45 @@ def train_dinov2(args):
                 batch_data = next(data_iterator)
                 dataset_position = dataset_passes * loader_len
                 print(f"Starting pass {dataset_passes + 1} at iteration {current_iteration}")
+        elif not thin_gate_open:
+            # ===== Stream thinning, GATE CLOSED (bank still filling after activation) =====
+            # Acceptance must NOT engage until the bank is FILLED and p_hat is meaningful -- before
+            # that, a(p_hat)=w/w_max with c=c_frac*p_ref=0 degenerates to uniform (the null run).
+            # So while the gate is closed we train as a PLAIN BASELINE (single batch of N, NO
+            # over-draw, NO acceptance, unweighted) -- exactly what the weighted arm does pre-warmup
+            # -- but the scout STILL runs so the bank keeps filling on the true stream. The gate
+            # opens once bank_ready (p_ref>0 AND n_est==M AND reserve full) holds for K steps.
+            N = args.batch_size_per_gpu
+            b, _stop = _draw_one()
+            if _stop:
+                print(f"Reached maximum passes ({max_passes}). Stopping.")
+                break
+            batch_data = b
+            _pl, _pg, bias = _scout_and_bank(batch_data[-1], current_iteration)  # fills the bank
+            thin_bias_val = bias
+            thin_seen_val = N                              # no over-draw; committed = drawn = N
+            # bank_ready is read AFTER the scout update above -> p_ref is the just-updated value.
+            _pref = float(typicality_bank.p_ref.item())
+            bank_ready = (_pref > 0.0
+                          and typicality_bank._ne() == typicality_bank.M
+                          and typicality_bank._nr() == typicality_bank.reserve_cap)
+            thin_ready_streak = thin_ready_streak + 1 if bank_ready else 0
+            if thin_ready_streak >= THIN_GATE_K:
+                thin_gate_open = True
+                thin_window_seen = 0
+                if utils.is_main_process():
+                    print(f"[thinned] gate OPEN at iter {current_iteration}: bank filled "
+                          f"(p_ref={_pref:.4g}, n_est={typicality_bank._ne()}/{typicality_bank.M}, "
+                          f"reserve={typicality_bank._nr()}/{typicality_bank.reserve_cap}); entering "
+                          f"{THIN_WMAX_WINDOW}-step w_max window before acceptance goes live")
         else:
-            # ===== Stream thinning (section 3.9): over-draw a candidate pool, forward the scout
-            # crop no-grad and update the banks on the un-thinned TRUE stream (the ONLY bank
-            # update), then admit each candidate with prob a(p_hat) = w/w_max until N survivors
-            # (pull more if short). The committed batch is bank-read-only and unweighted below. =====
+            # ===== Stream thinning, GATE OPEN: over-draw a candidate pool, forward the scout crop
+            # no-grad and update the banks on the un-thinned TRUE stream (the ONLY bank update), then
+            # admit each candidate with prob a(p_hat) = w/w_max until N survivors (pull more if short).
+            # For the first W steps w_max is a RUNNING max (calibration window; acceptance already
+            # live off the running max -- the simpler of the two window modes; thin_active stays 0),
+            # then it FREEZES and acceptance is fully live (thin_active flips to 1). The committed
+            # batch is bank-read-only and unweighted below. =====
             N = args.batch_size_per_gpu
             kept = None; n_kept = 0; thin_seen_val = 0
             _phat_committed = []; _phat_pool = []
@@ -881,22 +920,20 @@ def train_dinov2(args):
                 pool_n = pool[-1].shape[0]
                 thin_seen_val += pool_n
                 if p_local is None:
-                    # counters not matured yet: admit uniformly (no density to thin by)
+                    # defensive: the gate requires a matured bank (p_ref>0) so p_hat is not None
+                    # here in practice; if it ever is, admit uniformly rather than crash.
                     keep = torch.arange(pool_n)
                 else:
                     _phat_pool.append(p_local)
                     w_local = TypicalityScorer.absolute_weights(
                         p_local, typicality_bank.p_ref, 0.5, 0.25)
-                    # w_max: running max of the GATHERED weight (rank-identical) over the warmup
+                    # w_max: running max of the GATHERED weight (rank-identical) over the W-step
                     # window, then frozen -> the rarest tile is admitted with prob ~1. Recalibrated
                     # here on the UNAUGMENTED scout basis (NOT carried from the augmented-bank run).
                     if p_gathered is not None and not thin_wmax_frozen:
                         w_g = TypicalityScorer.absolute_weights(
                             p_gathered, typicality_bank.p_ref, 0.5, 0.25)
                         thin_w_max = max(thin_w_max, float(w_g.max().item()))
-                        thin_wmax_seen += 1
-                        if thin_wmax_seen >= THIN_WMAX_WARMUP:
-                            thin_wmax_frozen = True
                     wmax = thin_w_max if thin_w_max > 0.0 else float(w_local.max().item())
                     a = (w_local / max(wmax, 1e-8)).clamp(0.0, 1.0)
                     keep = torch.nonzero(torch.rand_like(a) < a, as_tuple=False).flatten()
@@ -918,6 +955,16 @@ def train_dinov2(args):
                 thin_committed_phat = torch.cat(_phat_committed, dim=0)[:N]
             if _phat_pool:
                 thin_pool_phat = torch.cat(_phat_pool, dim=0)
+            # advance / close the w_max calibration window (one increment per committed step)
+            if not thin_wmax_frozen:
+                thin_window_seen += 1
+                if thin_window_seen >= THIN_WMAX_WINDOW:
+                    thin_wmax_frozen = True
+                    if utils.is_main_process():
+                        print(f"[thinned] w_max FROZEN at {thin_w_max:.4g} (iter {current_iteration}); "
+                              f"acceptance LIVE (thin_active -> 1)")
+        # thin_active: 1 only once the gate is open AND the w_max window has frozen (fully live).
+        thin_active = 1 if (balance_mode == 'thinned' and thin_gate_open and thin_wmax_frozen) else 0
 
         # === 1. Extract crops from batch ===
         idx = 0
