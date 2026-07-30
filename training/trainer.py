@@ -182,6 +182,16 @@ def train_dinov2(args):
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
 
+    # Stream-rebalancing mode (section 3.9). Thinned mode reuses the whole typicality stack
+    # (bank, representative prototypes, R optimizer, checkpointing); it only relocates the bank
+    # update to a scout pass and drops the loss weighting. So it requires the stack to be built.
+    balance_mode = getattr(args, 'balance_mode', 'weighted')
+    if balance_mode == 'thinned':
+        assert args.use_typicality_dampening, (
+            "--balance_mode thinned requires --use_typicality_dampening True "
+            "(thinned mode reuses the counted-coverage bank for the scout density)")
+    print(f"Balance mode: {balance_mode}")
+
     # Augmentation configuration
     augmentation_free_mode = (args.global_views == 0)
 
@@ -737,6 +747,26 @@ def train_dinov2(args):
             dataset_position = dataset_passes * loader_len
             print(f"Starting pass {dataset_passes + 1} at iteration {current_iteration}")
 
+        # ===== Stream thinning (section 3.9): scout forward + bank update on the TRUE stream =====
+        # Thinned mode's ONLY bank update happens here, on the unaugmented scout crop
+        # (batch_data[-1]) via a single no-grad embed -- no extra training forward. The committed
+        # forward below is bank-read-only and its DINO loss is UNWEIGHTED. (Over-draw + density
+        # acceptance are added in the acceptance step; here the whole drawn batch is committed.)
+        scout_p_hat = None
+        if balance_mode == 'thinned' and current_iteration >= args.typicality_warmup_iters:
+            scout_crop = batch_data[-1].cuda(non_blocking=True)
+            with torch.no_grad():
+                scout_out = student([scout_crop], token_masks=[None], mode='dino',
+                                    return_bottleneck=True)
+                s_scout = repr_protos.compute_signatures(scout_out['bottleneck'].detach())
+                s_scout_g = _all_gather_signatures(s_scout.detach())
+                _bank_out = typicality_bank.score_and_update(s_scout_g, current_iteration)
+                if _bank_out['ready'] and current_iteration % 2000 == 0:
+                    _assert_bank_synced(typicality_bank.sync_fingerprint(),
+                                        tag=f"@it{current_iteration}(scout)")
+                if _bank_out.get('p_hat') is not None:
+                    scout_p_hat = _local_rows(_bank_out['p_hat'], batch_data[-1].shape[0])
+
         # === 1. Extract crops from batch ===
         idx = 0
 
@@ -1011,7 +1041,11 @@ def train_dinov2(args):
             out = {'ready': False}
             p_hat = None
 
-            if args.use_typicality_dampening and repr_protos is not None and current_iteration >= args.typicality_warmup_iters:
+            # In thinned mode the bank was already updated on the scout pool above and the loss is
+            # unweighted, so this in-place update + weighting is skipped entirely (relocation).
+            if (args.use_typicality_dampening and repr_protos is not None
+                    and balance_mode != 'thinned'
+                    and current_iteration >= args.typicality_warmup_iters):
                 with torch.no_grad():
                     # Extract bottleneck from global crop 1: first B entries
                     z_global1 = student_output['bottleneck'][:batch_size].detach()
