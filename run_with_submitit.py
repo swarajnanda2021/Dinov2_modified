@@ -231,6 +231,16 @@ def main():
     args.typicality_a = 1.0            # tilt exponent (rarer tiles up-weighted more as a grows; lo=0.5, hi=1.0)
     args.typicality_c_frac = 0.25      # weight floor c = c_frac * p_ref
     args.typicality_radius_mult = 1.5  # readout radius R_rad = radius_mult * s
+    # ---- stream rebalancing mode: weighted loss (rev7) vs stream thinning / scouted (rev8) ----
+    # THIS is the knob that goes from the rev7 weighted arm to the rev8 scouted (thinned) arm.
+    #   'weighted' -> scale the DINO loss per tile by w = 1/(p_hat+c)^a (rev7, byte-unchanged).
+    #   'thinned'  -> leave the loss UNWEIGHTED and ADMIT tiles by density a(p_hat)=w/w_max on an
+    #                 over-drawn scout pool (rev8). 'off' -> no rebalancing.
+    # a / c_frac / radius_mult above are shared by both modes (acceptance reuses the same w). The
+    # launcher sets this per arm (bc_weightedloss_* -> 'weighted'; bc_thinned_* -> 'thinned').
+    args.balance_mode = 'weighted'          # 'weighted' | 'thinned' | 'off'
+    args.thin_oversample_factor = 3.0       # thinned only: candidate pool = ceil(factor)*N; set above the measured chi
+    args.thin_richardson_correct = False    # thinned only: use debiased u* = 2u_s - u_2s (default off; probe is measure-only)
     args.typicality_warmup_iters = 50000   # fill bank only after representation has settled (late-fill)
     args.typicality_repr_lr = 1e-3
     # The remaining counted-bank knobs (reserve* / graduation_hits, the s-tuning s_* knobs, and the
