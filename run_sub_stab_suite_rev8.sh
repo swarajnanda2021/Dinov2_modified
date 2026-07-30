@@ -22,9 +22,13 @@
 #         bc_thinned_lo        thinned       0.5   0.25      1.5          6.0        NEW: matched to weightedloss_lo
 #         bc_thinned_hi        thinned       1.0   0.25      1.5         12.0        NEW: matched to weightedloss_hi
 #
-#       THINNED arms also scale the bank 4x (typicality_bank_size 8192->32768, reserve 550->2200): the
-#       scout feeds the bank the whole ~4x over-draw pool each step, so 4x slots keep the bank's turnover
-#       and density spread (lam_spread) in the same range the weighted (1x-fed) bank ran healthy at.
+#       THINNED arms now GPU-AUGMENT (kornia) only the committed survivors. The loader emits ONLY the
+#       raw Resize(224) uint8 tile per sample (scout_pool_mode) -- NO CPU augmentation. The bank scouts
+#       the normalized raw, density admits N survivors, and the 2 global + 8 local crops are generated
+#       ON-GPU for those N only. The 5/6 of the over-drawn pool discarded by thinning is thus never
+#       augmented, killing the ~6x CPU-augmentation cost (over-draw now = decode + one scout forward).
+#       The bank stays at the BASE M=8192 / reserve=550 (the earlier 4x-M experiment diluted hits and
+#       collapsed lam_spread to 0). REQUIRES `kornia` in the env (see PREREQUISITE).
 #
 #       Read each thinned arm AGAINST its weighted twin: same target distribution, the only
 #       difference is thinning trades coverage for a rare-tile-concentrated batch (lower effective
@@ -54,9 +58,11 @@
 #         lr 2e-3 -> 2e-4  (Virchow2 ViT-B / DINOv2 vitl14)
 #         drop_path 0.1 -> 0.4  (Virchow2 ViT-B)
 #
-# PREREQUISITE: the stream-thinning code (--balance_mode, the scout crop, _scout_and_bank, the
-#       Richardson bank) must be on origin/pathology-fm-recipe. The bc_thinned_* guard below FATALs
-#       on a clone that predates it. Push the thinning commits before launching a thinned arm.
+# PREREQUISITE: the stream-thinning code (--balance_mode, scout_pool_mode, _scout_and_bank, the
+#       Richardson bank, data/gpu_augment.py) must be on origin/pathology-fm-recipe, AND the conda env
+#       must have `kornia` (thinned arms GPU-augment the survivors). The bc_thinned_* guard below FATALs
+#       on a clone/env that predates either. Push the thinning commits, and:  pip install kornia
+#       (weighted / off arms do NOT need kornia -- GPUCropAugment is imported only in thinned mode).
 #
 # Each run = the FIXED ViT-B baseline recipe + exactly ONE research ingredient
 #            (or 'baseline' = vanilla DINOv2, no ingredient).
@@ -173,19 +179,28 @@ case "$RUN" in
             exit 1
         fi
     done
-    if ! grep -q "emit_scout" data/transforms.py; then
-        echo "  FATAL: data/transforms.py has no emit_scout -- scout crop ABSENT. Aborting."
+    if ! grep -q "scout_pool_mode" data/transforms.py; then
+        echo "  FATAL: data/transforms.py has no scout_pool_mode -- raw-carry scout ABSENT (pre-GPU-aug clone). Aborting."
+        exit 1
+    fi
+    if [ ! -f data/gpu_augment.py ] || ! grep -q "GPUCropAugment" data/gpu_augment.py; then
+        echo "  FATAL: data/gpu_augment.py / GPUCropAugment missing -- GPU augmentation ABSENT. Aborting."
         exit 1
     fi
     if ! grep -q "def _scout_and_bank" training/trainer.py; then
         echo "  FATAL: training/trainer.py has no _scout_and_bank -- thinning loop ABSENT. Aborting."
         exit 1
     fi
-    if ! grep -q "balance_mode == 'thinned'" training/trainer.py; then
-        echo "  FATAL: training/trainer.py has no thinned branch. Aborting."
+    if ! grep -q "gpu_augment(survivor_raw" training/trainer.py; then
+        echo "  FATAL: training/trainer.py does not GPU-augment survivors -- raw-carry path ABSENT. Aborting."
         exit 1
     fi
-    echo "    Stream-thinning code verified (balance_mode + scout crop + _scout_and_bank present)."
+    if ! python -c "import kornia" 2>/dev/null; then
+        echo "  FATAL: 'kornia' is not importable in this env -- thinned GPU augmentation needs it."
+        echo "         Install it first:   pip install kornia"
+        exit 1
+    fi
+    echo "    Stream-thinning + GPU-augment code verified (scout_pool_mode + GPUCropAugment + kornia present)."
     ;;
 esac
 
@@ -289,13 +304,11 @@ case "$RUN" in
     ensure_arg typicality_a                 0.5                 # matched to bc_weightedloss_lo
     ensure_arg typicality_c_frac            0.25
     ensure_arg typicality_radius_mult       1.5
-    ensure_arg thin_oversample_factor       6.0                 # pool 6x N; chi~3.9 measured -> 6x clears N=256 with margin (was 4.0 -> under-filled)
+    ensure_arg thin_oversample_factor       6.0                 # pool 6x N; chi~3.9 measured -> 6x clears N=256. Over-draw is now CHEAP (raw uint8, no CPU aug).
     ensure_arg thin_richardson_correct      False               # two-scale bias probe is measure-only
-    # -- bank scaled 4x: thinned feeds the bank the whole ~4x scout pool each step, so 4x M + 4x reserve
-    #    keeps turnover / lam_spread in the same range the weighted (1x-fed) bank ran healthy at. --
-    ensure_arg typicality_bank_size         32768               # 4x M (8192 -> 32768)
-    ensure_arg typicality_reserve_size      2200                # 4x reserve (550 -> 2200); relieves capacity flushing
-    # typicality_modulation is unused in thinned mode (loss unweighted) -- left at its default.
+    # NB: bank M / reserve stay at the BASE 8192 / 550 (the 4x-M experiment diluted hits -> hit_frac
+    #     cratered and lam_spread collapsed to 0; the base bank ran healthy). typicality_modulation
+    #     is unused in thinned mode (loss unweighted) -- left at its default.
     ;;
   bc_thinned_hi)
     ensure_arg use_typicality_dampening     True
@@ -303,10 +316,9 @@ case "$RUN" in
     ensure_arg typicality_a                 1.0                 # matched to bc_weightedloss_hi
     ensure_arg typicality_c_frac            0.25
     ensure_arg typicality_radius_mult       1.5
-    ensure_arg thin_oversample_factor       12.0                # a=1.0 -> larger chi -> larger pool (was 10.0). EXPENSIVE.
+    ensure_arg thin_oversample_factor       12.0                # a=1.0 -> larger chi -> larger pool (over-draw is cheap now: raw uint8, no CPU aug)
     ensure_arg thin_richardson_correct      False
-    ensure_arg typicality_bank_size         32768               # 4x M (see bc_thinned_lo)
-    ensure_arg typicality_reserve_size      2200                # 4x reserve
+    # bank M / reserve at base 8192 / 550 (see bc_thinned_lo).
     ;;
 
   pathology_recipe)

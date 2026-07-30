@@ -72,6 +72,7 @@ class TMEDinoTransforms(object):
         use_pathology_recipe=False,
         ect_probability=0.4,
         emit_scout=False,
+        scout_pool_mode=False,
     ):
         self.n_local_crops = n_local_crops
         self.global_size = global_size
@@ -83,6 +84,14 @@ class TMEDinoTransforms(object):
         self.use_pathology_recipe = use_pathology_recipe
         self.ect_probability = ect_probability
         self.emit_scout = emit_scout
+        # scout_pool_mode (stream thinning, GPU-augment path): emit ONLY the raw Resize(global_size)
+        # uint8 tile -- NO augmentation. The trainer normalizes it for the scout/bank and GPU-augments
+        # (kornia) only the thinned survivors, so the 5/6 of the pool that gets discarded is never
+        # augmented. This supersedes emit_scout for thinned mode. weighted/off leave it False and get
+        # the exact CPU crop pipeline below (byte-identical).
+        self.scout_pool_mode = scout_pool_mode
+        self.raw_resize = transforms.Resize((global_size, global_size), interpolation=Image.BICUBIC)
+        self.pil_to_uint8 = transforms.PILToTensor()   # uint8 [3,H,W] in 0-255, no /255, no normalize
 
         # Basic transforms
         self.to_tensor = transforms.ToTensor()
@@ -239,7 +248,14 @@ class TMEDinoTransforms(object):
 
         Returns:
             List of augmented crops: [global1, global2, local1, ..., localN]
+            OR, in scout_pool_mode, [raw_uint8]: a single Resize(global_size) uint8 tile (no aug).
         """
+        if self.scout_pool_mode:
+            # Thinned GPU-augment path: return ONLY the raw resized uint8 tile. The trainer derives
+            # the scout (normalize) for the bank and GPU-augments the survivors. Cheap: no crop
+            # generation, no photometric ops -- the 5/6 discarded by thinning cost nothing here.
+            return [self.pil_to_uint8(self.raw_resize(x))]
+
         crops = []
 
         if self.use_pathology_recipe:

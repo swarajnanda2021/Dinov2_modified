@@ -65,6 +65,7 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         ect_probability: float = 0.4,
         zip_interleave: int = 16,
         emit_scout: bool = False,
+        scout_pool_mode: bool = False,
     ):
         super().__init__()
         self.base_dir = base_dir
@@ -100,6 +101,7 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
             use_pathology_recipe=use_pathology_recipe,
             ect_probability=ect_probability,
             emit_scout=emit_scout,
+            scout_pool_mode=scout_pool_mode,
         )
 
         # Setup corruption logging
@@ -506,6 +508,7 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
         use_pathology_recipe: bool = False,
         ect_probability: float = 0.4,
         emit_scout: bool = False,
+        scout_pool_mode: bool = False,
     ):
         super().__init__()
 
@@ -547,6 +550,7 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
                 use_pathology_recipe=use_pathology_recipe,
                 ect_probability=ect_probability,
                 emit_scout=emit_scout,
+                scout_pool_mode=scout_pool_mode,
             )
 
             self.datasets.append(dataset)
