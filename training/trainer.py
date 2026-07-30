@@ -433,6 +433,7 @@ def train_dinov2(args):
     # ============ Create Typicality Dampening (Optional) ============
     repr_protos = None
     typicality_bank = None
+    richardson_bank = None
     if args.use_typicality_dampening:
         repr_protos = RepresentativePrototypes(
             K_prime=args.typicality_K_prime,
@@ -466,6 +467,36 @@ def train_dinov2(args):
         print(f"  K' = {args.typicality_K_prime}, Bank M = {args.typicality_bank_size}")
         print(f"  Modulation: {args.typicality_modulation}")
         print(f"  Warmup: {args.typicality_warmup_iters} iterations")
+
+        # Richardson two-scale bias probe (section 3.9), thinned mode only. A second, COARSE
+        # covering bank at ~2s spacing. M' = M * 2^-D (D~9.3) ~ 13 is below the class's working
+        # regime (reserve/sweep/variogram assume M in the thousands), so floor M' to 64; the coarse
+        # bank self-tunes its own (larger) s and yields p_hat_2s. beta_hat = log p_2s - log p_s is a
+        # CRUDE, measure-only bias indicator (not calibrated). Built with the same knobs but M=M'.
+        if balance_mode == 'thinned':
+            M_coarse = max(64, int(args.typicality_bank_size / (2.0 ** 9.3)))
+            richardson_bank = CountedCoverageBank(
+                M=M_coarse,
+                K_prime=args.typicality_K_prime,
+                pool_j=args.typicality_pool_j,
+                halflife_steps=args.typicality_halflife_steps,
+                reserve_residency=args.typicality_reserve_residency,
+                reserve_size=args.typicality_reserve_size,
+                s_buffer_size=args.typicality_s_buffer_size,
+                s_sweep_interval=args.typicality_s_sweep_interval,
+                s_grid_points=args.typicality_s_grid_points,
+                grid_span=tuple(args.typicality_s_grid_span),
+                s_ema_alpha=args.typicality_s_ema_alpha,
+                s_min_buffer=args.typicality_s_min_buffer,
+                s_headroom=args.typicality_s_headroom,
+                graduation_hits=args.typicality_graduation_hits,
+                pool_selftune=args.typicality_pool_selftune,
+                pool_rse_target=args.typicality_pool_rse_target,
+                pool_max=args.typicality_pool_max,
+                pool_ema=args.typicality_pool_ema,
+                radius_mult=args.typicality_radius_mult,
+            ).cuda()
+            print(f"  Richardson coarse bank: M' = {M_coarse} (crude two-scale bias probe, measure-only)")
     else:
         print("Typicality dampening disabled (--use_typicality_dampening=False)")
 
@@ -664,6 +695,8 @@ def train_dinov2(args):
         checkpoint_kwargs['repr_protos'] = repr_protos
         checkpoint_kwargs['R_optimizer'] = R_optimizer
         checkpoint_kwargs['typicality_bank'] = typicality_bank
+        if richardson_bank is not None:
+            checkpoint_kwargs['richardson_bank'] = richardson_bank
 
     utils.restart_from_checkpoint(
         os.path.join(args.output_dir, "checkpoint.pth"),
@@ -753,8 +786,10 @@ def train_dinov2(args):
         # forward below is bank-read-only and its DINO loss is UNWEIGHTED. (Over-draw + density
         # acceptance are added in the acceptance step; here the whole drawn batch is committed.)
         scout_p_hat = None
+        thin_bias_val = None
         if balance_mode == 'thinned' and current_iteration >= args.typicality_warmup_iters:
             scout_crop = batch_data[-1].cuda(non_blocking=True)
+            _nrows = batch_data[-1].shape[0]
             with torch.no_grad():
                 scout_out = student([scout_crop], token_masks=[None], mode='dino',
                                     return_bottleneck=True)
@@ -765,7 +800,18 @@ def train_dinov2(args):
                     _assert_bank_synced(typicality_bank.sync_fingerprint(),
                                         tag=f"@it{current_iteration}(scout)")
                 if _bank_out.get('p_hat') is not None:
-                    scout_p_hat = _local_rows(_bank_out['p_hat'], batch_data[-1].shape[0])
+                    scout_p_hat = _local_rows(_bank_out['p_hat'], _nrows)
+                # Richardson two-scale probe: update the coarse bank on the SAME scout signatures
+                # and form beta_hat = log p_2s - log p_s (crude, measure-only). The debiased density
+                # u* = 2 u_s - u_2s is implemented but INACTIVE unless --thin_richardson_correct.
+                if richardson_bank is not None:
+                    _co = richardson_bank.score_and_update(s_scout_g, current_iteration)
+                    if _co.get('p_hat') is not None and scout_p_hat is not None:
+                        _u_s = torch.log(scout_p_hat + 1e-8)
+                        _u_2s = torch.log(_local_rows(_co['p_hat'], _nrows) + 1e-8)
+                        thin_bias_val = (_u_2s - _u_s).abs().mean().item()
+                        if args.thin_richardson_correct:
+                            scout_p_hat = torch.exp(2.0 * _u_s - _u_2s)
 
         # === 1. Extract crops from batch ===
         idx = 0
@@ -1548,6 +1594,8 @@ def train_dinov2(args):
                         print(f"  [counted bank] n_est={_st['n_est']}/{args.typicality_bank_size} "
                               f"reserve={_st['n_reserve']} graduations={_st['graduations']} "
                               f"s={_st['s']:.4f}")
+                if richardson_bank is not None:
+                    save_dict['richardson_bank'] = richardson_bank.state_dict()
 
             if fp16_scaler is not None:
                 save_dict['fp16_scaler'] = fp16_scaler.state_dict()
