@@ -208,6 +208,22 @@ def get_args_parser():
                         help='Counted bank: upper clamp on the self-tuned j.')
     parser.add_argument('--typicality_pool_ema', default=0.2, type=float,
                         help='Counted bank: EMA weight for j across sweeps.')
+    # ---- stream rebalancing: weighted loss vs stream thinning (section 3.9) ----
+    parser.add_argument('--balance_mode', default='weighted', type=str,
+                        choices=['weighted', 'thinned', 'off'],
+                        help='Density-based stream rebalancing. weighted: the existing '
+                             'weighted-loss arm (w = 1/(p_hat+c)^a), byte-unchanged. thinned: '
+                             'density-dependent admission (a scout crop measures p_hat before '
+                             'commit; the batch is thinned to N survivors and the loss is '
+                             'UNWEIGHTED). off: plain baseline (typicality off).')
+    parser.add_argument('--thin_richardson_correct', default=False, type=utils.bool_flag,
+                        help='Thinned mode: use the Richardson-debiased density u* = 2*u_s - u_2s '
+                             'in the acceptance function. Default False -- the two-scale probe is '
+                             'measure-only (acceptance uses the plain fine-bank p_hat).')
+    parser.add_argument('--thin_oversample_factor', default=3.0, type=float,
+                        help='Thinned mode: candidate pool = ceil(factor) consecutive loader '
+                             'batches concatenated (~factor*N tiles) so N survivors can be drawn '
+                             'after thinning; must sit comfortably above the realized chi.')
 
     # ========== Adversarial mask-as-student-view augmentation parameters ==========
     # Note: --num_masks, --mask_model_arch, --mask_checkpoint are already declared
