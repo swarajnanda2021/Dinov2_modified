@@ -309,6 +309,9 @@ def train_dinov2(args):
         global_size=224,
         use_pathology_recipe=getattr(args, 'use_pathology_recipe', False),
         ect_probability=getattr(args, 'ect_probability', 0.4),
+        # Thinned mode emits an extra trailing unaugmented scout crop per tile (bank density
+        # probe). weighted/off emit nothing extra -> byte-identical crop stream (section 3.9).
+        emit_scout=(getattr(args, 'balance_mode', 'weighted') == 'thinned'),
     )
 
     train_loader = torch.utils.data.DataLoader(

@@ -71,6 +71,7 @@ class TMEDinoTransforms(object):
         std=(0.229, 0.224, 0.225),
         use_pathology_recipe=False,
         ect_probability=0.4,
+        emit_scout=False,
     ):
         self.n_local_crops = n_local_crops
         self.global_size = global_size
@@ -81,10 +82,23 @@ class TMEDinoTransforms(object):
         self.std = std
         self.use_pathology_recipe = use_pathology_recipe
         self.ect_probability = ect_probability
+        self.emit_scout = emit_scout
 
         # Basic transforms
         self.to_tensor = transforms.ToTensor()
         self.normalize = transforms.Compose([
+            self.to_tensor,
+            transforms.Normalize(mean=mean, std=std),
+        ])
+
+        # Scout crop (stream thinning, section 3.9): an UNAUGMENTED normalized global view --
+        # Resize(global_size) + ToTensor + Normalize, no RandomResizedCrop / flip / rotate /
+        # ColorJitter / grayscale / blur. It is appended LAST in __call__ only when emit_scout is
+        # set (thinned mode), and consumes NO RNG, so g1/g2/locals draw the identical random
+        # augmentation they would without it -- weighted/off runs (emit_scout=False) are byte-
+        # identical. The scout feeds the density bank only; it never enters the DINO/iBOT forwards.
+        self.scout = transforms.Compose([
+            transforms.Resize((global_size, global_size), interpolation=Image.BICUBIC),
             self.to_tensor,
             transforms.Normalize(mean=mean, std=std),
         ])
@@ -251,5 +265,11 @@ class TMEDinoTransforms(object):
             crops.append(self.global_2(x))
             for _ in range(self.n_local_crops):
                 crops.append(self.local(x))
+
+        # Thinned mode only: append the unaugmented scout crop LAST (trailing index), after all
+        # augmented crops have drawn their RNG. Deterministic (Resize+Normalize), so it does not
+        # perturb the augmented crops' random state.
+        if self.emit_scout:
+            crops.append(self.scout(x))
 
         return crops

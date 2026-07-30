@@ -64,6 +64,7 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         use_pathology_recipe: bool = False,
         ect_probability: float = 0.4,
         zip_interleave: int = 16,
+        emit_scout: bool = False,
     ):
         super().__init__()
         self.base_dir = base_dir
@@ -98,8 +99,9 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
             std=std,
             use_pathology_recipe=use_pathology_recipe,
             ect_probability=ect_probability,
+            emit_scout=emit_scout,
         )
-        
+
         # Setup corruption logging
         self.corruption_log_file = "runtime_corrupted_files.json"
         self.corruption_lock_file = f"{self.corruption_log_file}.lock"
@@ -503,6 +505,7 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
         std: tuple = (0.1617, 0.1714, 0.1389),
         use_pathology_recipe: bool = False,
         ect_probability: float = 0.4,
+        emit_scout: bool = False,
     ):
         super().__init__()
 
@@ -543,8 +546,9 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
                 std=std,
                 use_pathology_recipe=use_pathology_recipe,
                 ect_probability=ect_probability,
+                emit_scout=emit_scout,
             )
-            
+
             self.datasets.append(dataset)
             self.dataset_names.append(name)
             self.dataset_sizes.append(dataset.index_metadata['total_images'])
