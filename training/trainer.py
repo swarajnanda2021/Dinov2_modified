@@ -770,6 +770,11 @@ def train_dinov2(args):
 
     metric_logger = utils.IterationMetricLogger(total_iterations=args.total_iterations)
     metric_logger.start_time = time.time()
+    # ETA state: seconds/iter over a RECENT window (EMA), robust to (a) resume -- eta_ref_iter is the
+    # RESUMED iteration, not 0, so the estimate is not diluted by pre-restart progress -- and (b) the
+    # fast->slow step-time change when thinning's over-draw + scout engage. The previous cumulative
+    # elapsed/total-progress estimate was wrong on both counts.
+    eta_sec_per_it, eta_ref_time, eta_ref_iter = None, metric_logger.start_time, current_iteration
     typ_last_grad = 0                        # for the per-interval graduations/step diff (compact log)
     typ_last_grad_iter = int(getattr(args, 'typicality_warmup_iters', 0))
 
@@ -1684,10 +1689,18 @@ def train_dinov2(args):
         metric_logger.update(wd=optimizer_student.param_groups[0]["weight_decay"])
 
         if utils.is_main_process() and current_iteration % 10 == 0:
-            elapsed = time.time() - metric_logger.start_time
+            # recent-window rate (survives resume + the thinning fast->slow phase change): sec/iter
+            # measured over the last log window, EMA-smoothed, applied to the iterations REMAINING.
+            _now = time.time()
+            _d_it = current_iteration - eta_ref_iter
+            if _d_it > 0:
+                _inst = (_now - eta_ref_time) / _d_it
+                eta_sec_per_it = _inst if eta_sec_per_it is None else 0.8 * eta_sec_per_it + 0.2 * _inst
+                eta_ref_time, eta_ref_iter = _now, current_iteration
             progress = current_iteration / args.total_iterations
-            eta_seconds = elapsed / max(progress, 1e-8) * (1 - progress)
-            eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+            eta_seconds = (eta_sec_per_it or 0.0) * (args.total_iterations - current_iteration)
+            eta_string = (str(datetime.timedelta(seconds=int(eta_seconds)))
+                          if eta_sec_per_it else "estimating...")
 
             if torch.cuda.is_available():
                 memory = torch.cuda.max_memory_allocated() / (1024 * 1024)

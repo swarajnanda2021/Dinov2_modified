@@ -16,22 +16,27 @@
 #
 #       The rev7->rev8 bc matrix is now {weighted, thinned} x {lo, hi} at matched (a, c_frac):
 #
-#         run key              balance_mode  a    c_frac  radius_mult   notes
-#         bc_weightedloss_lo   weighted      0.5   0.25      1.5        rev7 arm, byte-unchanged
-#         bc_weightedloss_hi   weighted      1.0   0.25      1.5        rev7 arm, byte-unchanged
-#         bc_thinned_lo        thinned       0.5   0.25      1.5        NEW: matched to weightedloss_lo
-#         bc_thinned_hi        thinned       1.0   0.25      1.5        NEW: matched to weightedloss_hi
+#         run key              balance_mode  a    c_frac  radius_mult  oversample   notes
+#         bc_weightedloss_lo   weighted      0.5   0.25      1.5          --         rev7 arm, byte-unchanged
+#         bc_weightedloss_hi   weighted      1.0   0.25      1.5          --         rev7 arm, byte-unchanged
+#         bc_thinned_lo        thinned       0.5   0.25      1.5          6.0        NEW: matched to weightedloss_lo
+#         bc_thinned_hi        thinned       1.0   0.25      1.5         12.0        NEW: matched to weightedloss_hi
+#
+#       THINNED arms also scale the bank 4x (typicality_bank_size 8192->32768, reserve 550->2200): the
+#       scout feeds the bank the whole ~4x over-draw pool each step, so 4x slots keep the bank's turnover
+#       and density spread (lam_spread) in the same range the weighted (1x-fed) bank ran healthy at.
 #
 #       Read each thinned arm AGAINST its weighted twin: same target distribution, the only
 #       difference is thinning trades coverage for a rare-tile-concentrated batch (lower effective
 #       sample size) while weighting keeps every tile at unequal leverage. bc_thinned_lo is the
 #       primary controlled comparison (the thinning acceptance was matched to the lo settings).
 #
-#       WARNING (cost): thinned mode OVER-DRAWS ceil(--thin_oversample_factor) loader batches per step
-#       and runs one no-grad scout embed over the whole pool. It therefore consumes ~factor x the data
-#       and adds a scout forward each step. bc_thinned_hi (a=1.0) has a larger chi and so a larger pool
-#       -- it is the expensive arm. Watch thin_accept (= N/thin_seen ~ 1/chi): if the step keeps pulling
-#       more (or under-fills), RAISE --thin_oversample_factor for that arm.
+#       WARNING (cost): thinned mode OVER-DRAWS ceil(--thin_oversample_factor) loader batches per step,
+#       runs one no-grad scout embed over the whole pool, AND (with the 4x bank) does a 4x-larger density
+#       readout each step -- so it consumes ~factor x the data plus the scout + readout overhead.
+#       bc_thinned_hi (a=1.0) has a larger chi and a larger pool -- the expensive arm. Watch thin_accept
+#       (realized accepted/pool ~ 1/chi) and accepted (= thin_accept x thin_seen): if accepted grazes
+#       N=256 (under-fills), RAISE --thin_oversample_factor. chi ~3.9 was measured for lo -> factor 6; hi -> 12.
 #
 #       Carried over from REV7 (the fixed-radius absolute readout): the bank sums lambda_hat * K(d/R_rad)
 #       over the established signatures within R_rad = radius_mult * s and returns the absolute local
@@ -284,8 +289,12 @@ case "$RUN" in
     ensure_arg typicality_a                 0.5                 # matched to bc_weightedloss_lo
     ensure_arg typicality_c_frac            0.25
     ensure_arg typicality_radius_mult       1.5
-    ensure_arg thin_oversample_factor       4.0                 # pool ~4x N; must exceed the measured chi
+    ensure_arg thin_oversample_factor       6.0                 # pool 6x N; chi~3.9 measured -> 6x clears N=256 with margin (was 4.0 -> under-filled)
     ensure_arg thin_richardson_correct      False               # two-scale bias probe is measure-only
+    # -- bank scaled 4x: thinned feeds the bank the whole ~4x scout pool each step, so 4x M + 4x reserve
+    #    keeps turnover / lam_spread in the same range the weighted (1x-fed) bank ran healthy at. --
+    ensure_arg typicality_bank_size         32768               # 4x M (8192 -> 32768)
+    ensure_arg typicality_reserve_size      2200                # 4x reserve (550 -> 2200); relieves capacity flushing
     # typicality_modulation is unused in thinned mode (loss unweighted) -- left at its default.
     ;;
   bc_thinned_hi)
@@ -294,8 +303,10 @@ case "$RUN" in
     ensure_arg typicality_a                 1.0                 # matched to bc_weightedloss_hi
     ensure_arg typicality_c_frac            0.25
     ensure_arg typicality_radius_mult       1.5
-    ensure_arg thin_oversample_factor       10.0                # a=1.0 -> larger chi -> larger pool (EXPENSIVE)
+    ensure_arg thin_oversample_factor       12.0                # a=1.0 -> larger chi -> larger pool (was 10.0). EXPENSIVE.
     ensure_arg thin_richardson_correct      False
+    ensure_arg typicality_bank_size         32768               # 4x M (see bc_thinned_lo)
+    ensure_arg typicality_reserve_size      2200                # 4x reserve
     ;;
 
   pathology_recipe)
@@ -306,22 +317,21 @@ case "$RUN" in
     ;;
 esac
 
-# ---- Fixed-radius counted-bank knob readout (shared by every bc_* arm) ----
+# ---- Counted-bank knob readout (shared by every bc_* arm): resolved from run_with_submitit.py ----
 case "$RUN" in
   bc_weightedloss_lo|bc_weightedloss_hi|bc_thinned_lo|bc_thinned_hi)
-    echo "  Counted-coverage bank ON (fixed-radius absolute readout). Knobs resolve from config.py"
-    echo "  defaults except a / c_frac / radius_mult, set explicitly per arm above:"
-    for k in typicality_a typicality_c_frac typicality_radius_mult \
-             typicality_pool_j typicality_halflife_steps typicality_reserve_residency \
-             typicality_reserve_size typicality_graduation_hits \
+    echo "  Counted-coverage bank ON (fixed-radius absolute readout). ALL knobs are surfaced (grouped)"
+    echo "  in run_with_submitit.py; a / c_frac / radius_mult are set per arm above, and THINNED arms"
+    echo "  scale typicality_bank_size / typicality_reserve_size 4x. Resolved values:"
+    for k in typicality_bank_size typicality_reserve_size typicality_K_prime \
+             typicality_halflife_steps typicality_reserve_residency typicality_graduation_hits \
+             typicality_pool_j typicality_a typicality_c_frac typicality_radius_mult \
              typicality_s_buffer_size typicality_s_sweep_interval typicality_s_grid_points \
-             typicality_s_ema_alpha typicality_s_min_buffer typicality_s_headroom \
+             typicality_s_grid_span typicality_s_ema_alpha typicality_s_min_buffer typicality_s_headroom \
              typicality_pool_selftune typicality_pool_rse_target typicality_pool_max typicality_pool_ema; do
-        d=$(grep -F -- "'--$k'" configs/config.py | grep -oE "default=[^,]+" | head -1)
-        printf "    %-34s %s\n" "$k" "${d:-MISSING}"
+        v=$(grep -nE "^[[:space:]]*args\.${k}[[:space:]]*=" run_with_submitit.py | head -1)
+        printf "    %-34s %s\n" "$k" "${v:-MISSING}"
     done
-    gs=$(grep -F -- "'--typicality_s_grid_span'" configs/config.py | grep -oE "default=\[[^]]+\]" | head -1)
-    printf "    %-34s %s\n" "typicality_s_grid_span" "${gs:-MISSING}"
     ;;
 esac
 case "$RUN" in
@@ -353,6 +363,7 @@ for kv in \
     args.use_typicality_dampening args.num_masks args.semantic_masks_per_iteration \
     args.semantic_ibot_weight args.num_prototypes args.typicality_modulation \
     args.typicality_a args.typicality_c_frac args.typicality_radius_mult \
+    args.typicality_bank_size args.typicality_reserve_size \
     args.balance_mode args.thin_oversample_factor args.thin_richardson_correct \
     args.mask_checkpoint args.mask_model_arch ; do
         hit=$(grep -nE "^[[:space:]]*${kv//./\\.}[[:space:]]*=" run_with_submitit.py | head -1)
@@ -416,8 +427,8 @@ case "$RUN" in
     echo "    grep -h 'Balance mode' $exp_dir/logs/*.out            # EXPECT: Balance mode: thinned"
     echo "    # metric stream (log.txt), a few steps after the bank matures:"
     echo "    #   thin_seen   -> ~chi*N candidates scouted per step,"
-    echo "    #   thin_accept -> ~1/chi (N/thin_seen); if it stays << 1/$OF the pool is under-drawn ->"
-    echo "    #                  RAISE --thin_oversample_factor for this arm,"
+    echo "    #   thin_accept -> realized accepted/pool ~ 1/chi;  accepted = thin_accept*thin_seen must"
+    echo "    #                  stay > N=256. If it grazes/dips below (under-fills), RAISE --thin_oversample_factor,"
     echo "    #   thin_bias   -> mean|beta_hat| from the coarse probe (crude indicator only),"
     echo "    #   thin_prof_err -> L1 between the committed p_hat histogram and the target a*mu (small = good)."
     echo "    plot:  python3 plot_typicality.py $exp_dir -g health  (bank health carries over unchanged)"

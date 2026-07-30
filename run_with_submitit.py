@@ -219,33 +219,57 @@ def main():
     args.clustering_teacher_temp = 0.07
     args.clustering_student_temp = 0.1
 
-    # Typicality dampening (counted-coverage bank; fixed-radius readout)
-    args.use_typicality_dampening = False
-    args.typicality_K_prime = 256
-    args.typicality_bank_size = 8192
-    args.typicality_modulation = 'weighted_loss'   # rev7: the only modulation wired to the counted bank
-    # ---- fixed-radius readout / weighted-loss weight  w = 1 / (p_hat + c)^a,  c = c_frac * p_ref ----
-    # These three REPLACE the old beta. The launcher overrides ONLY `a` per arm
-    # (bc_weightedloss_lo -> 0.5, bc_weightedloss_hi -> 1.0); c_frac and radius_mult are shared,
-    # so this block is the single source of truth for them.
-    args.typicality_a = 1.0            # tilt exponent (rarer tiles up-weighted more as a grows; lo=0.5, hi=1.0)
-    args.typicality_c_frac = 0.25      # weight floor c = c_frac * p_ref
-    args.typicality_radius_mult = 1.5  # readout radius R_rad = radius_mult * s
-    # ---- stream rebalancing mode: weighted loss (rev7) vs stream thinning / scouted (rev8) ----
-    # THIS is the knob that goes from the rev7 weighted arm to the rev8 scouted (thinned) arm.
-    #   'weighted' -> scale the DINO loss per tile by w = 1/(p_hat+c)^a (rev7, byte-unchanged).
-    #   'thinned'  -> leave the loss UNWEIGHTED and ADMIT tiles by density a(p_hat)=w/w_max on an
-    #                 over-drawn scout pool (rev8). 'off' -> no rebalancing.
-    # a / c_frac / radius_mult above are shared by both modes (acceptance reuses the same w). The
-    # launcher sets this per arm (bc_weightedloss_* -> 'weighted'; bc_thinned_* -> 'thinned').
-    args.balance_mode = 'weighted'          # 'weighted' | 'thinned' | 'off'
-    args.thin_oversample_factor = 3.0       # thinned only: candidate pool = ceil(factor)*N; set above the measured chi
-    args.thin_richardson_correct = False    # thinned only: use debiased u* = 2u_s - u_2s (default off; probe is measure-only)
-    args.typicality_warmup_iters = 50000   # fill bank only after representation has settled (late-fill)
-    args.typicality_repr_lr = 1e-3
-    # The remaining counted-bank knobs (reserve* / graduation_hits, the s-tuning s_* knobs, and the
-    # self-tune-j knobs) default from config. The hit radius s and the pooling count j (a diagnostic
-    # now) self-tune online.
+    # ============ Typicality dampening (counted-coverage bank; fixed-radius readout) ============
+    # A running bank estimates each tile's local density p_hat; the stream is then rebalanced either by
+    # WEIGHTING the loss (rev7) or by THINNING the batch (rev8). EVERY knob is surfaced here, grouped, so
+    # this file is the single source of truth. Values are the weighted/baseline defaults (weighted arms
+    # stay byte-identical); the launcher overrides per arm and scales the bank 4x for thinned arms.
+    # Weight/acceptance:  w = 1/(p_hat + c)^a,  c = c_frac * p_ref,  readout radius R_rad = radius_mult * s.
+    args.use_typicality_dampening = False   # master switch; launcher flips ON for every bc_* arm.
+
+    # ---- bank capacity & counters (structural dials) ----
+    args.typicality_bank_size         = 8192   # M: established signatures the bank holds. THINNED arms scale
+                                               #    this 4x in the launcher -- the scout feeds the bank the whole
+                                               #    ~4x over-draw pool each step, so it needs ~4x the slots to
+                                               #    keep turnover / lam_spread in the weighted-healthy range.
+    args.typicality_reserve_size      = 550    # probation buffer on top of M (thinned arms scale 4x too).
+    args.typicality_K_prime           = 256    # signature dimensionality K'.
+    args.typicality_halflife_steps    = 250    # counter decay half-life H (eta = 0.5**(1/H)); fixes n_eff.
+    args.typicality_reserve_residency = 300    # T_need: steps a reserve entry may sit before it expires.
+    args.typicality_graduation_hits   = 2      # hits a reserve entry needs before graduating into the bank.
+    args.typicality_pool_j            = 64     # INITIAL kernel-sum neighbor count j (self-tuned online).
+
+    # ---- fixed-radius readout / weight ----
+    args.typicality_modulation   = 'weighted_loss'  # only modulation wired to the counted bank.
+    args.typicality_a            = 1.0    # tilt exponent; rarer tiles up-weighted more as a grows (lo=0.5, hi=1.0).
+    args.typicality_c_frac       = 0.25   # weight floor c = c_frac * p_ref (keeps w finite at p_hat=0).
+    args.typicality_radius_mult  = 1.5    # readout radius R_rad = radius_mult * s.
+
+    # ---- rebalancing MODE: weighted loss (rev7) vs stream thinning / scouted (rev8) ----
+    #   'weighted' -> scale the DINO loss per tile by w (rev7, byte-unchanged).
+    #   'thinned'  -> UNWEIGHTED loss; admit tiles by density a(p_hat)=w/w_max over an over-drawn scout pool.
+    #   'off'      -> no rebalancing. Launcher sets per arm (bc_weightedloss_*->weighted; bc_thinned_*->thinned).
+    args.balance_mode            = 'weighted'
+    args.thin_oversample_factor  = 3.0    # thinned only: candidate pool = ceil(factor)*N; MUST exceed the
+                                          #    measured chi or the step under-fills (launcher: 6 lo / 12 hi).
+    args.thin_richardson_correct = False  # thinned only: debias p_hat via u*=2u_s-u_2s (off; probe is measure-only).
+
+    # ---- activation / representation head ----
+    args.typicality_warmup_iters = 50000  # bank inert until here (late-fill; bc arms warm-start from a 50k ckpt).
+    args.typicality_repr_lr      = 1e-3   # LR for the projection head that maps features -> signatures.
+
+    # ---- self-tuning hit radius s & pool count j (advanced; self-tuned online, defaults are fine) ----
+    args.typicality_s_buffer_size    = 60000      # rolling signature ring-buffer feeding the s edge-sweep.
+    args.typicality_s_sweep_interval = 500        # steps between s edge-sweeps.
+    args.typicality_s_grid_points    = 9          # radius grid points per sweep (before one bisection).
+    args.typicality_s_grid_span      = [0.3, 2.0] # sweep span as (lo, hi) multiples of the live s.
+    args.typicality_s_ema_alpha      = 0.2        # EMA weight for s <- (1-a)*s + a*edge.
+    args.typicality_s_min_buffer     = 60000      # signatures buffered before the first sweep fixes s.
+    args.typicality_s_headroom       = 0.0        # optional fraction to sit under the swept edge.
+    args.typicality_pool_selftune    = True       # self-tune j from the variogram L estimate (False pins j).
+    args.typicality_pool_rse_target  = 0.05       # target relative SE on log p_hat that sets the j floor.
+    args.typicality_pool_max         = 256        # upper clamp on the self-tuned j.
+    args.typicality_pool_ema         = 0.2        # EMA weight for j across sweeps.
 
     # Adversarial-mask-as-student-view augmentation (re-uses mask_checkpoint above)
     args.use_adversarial_mask_augmentation = False
