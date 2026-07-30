@@ -35,10 +35,10 @@
 #       sample size) while weighting keeps every tile at unequal leverage. bc_thinned_lo is the
 #       primary controlled comparison (the thinning acceptance was matched to the lo settings).
 #
-#       WARNING (cost): thinned mode OVER-DRAWS ceil(--thin_oversample_factor) loader batches per step,
-#       runs one no-grad scout embed over the whole pool, AND (with the 4x bank) does a 4x-larger density
-#       readout each step -- so it consumes ~factor x the data plus the scout + readout overhead.
-#       bc_thinned_hi (a=1.0) has a larger chi and a larger pool -- the expensive arm. Watch thin_accept
+#       COST: thinned mode OVER-DRAWS ceil(--thin_oversample_factor) loader batches per step and runs one
+#       no-grad scout embed over the whole pool -- but the over-draw is now CHEAP (raw uint8, no CPU aug;
+#       only the N survivors are GPU-augmented), so the per-step cost is ~decode + one scout forward, not
+#       ~factor x the full augmentation. bc_thinned_hi (a=1.0) has a larger chi / pool. Watch thin_accept
 #       (realized accepted/pool ~ 1/chi) and accepted (= thin_accept x thin_seen): if accepted grazes
 #       N=256 (under-fills), RAISE --thin_oversample_factor. chi ~3.9 was measured for lo -> factor 6; hi -> 12.
 #
@@ -333,8 +333,8 @@ esac
 case "$RUN" in
   bc_weightedloss_lo|bc_weightedloss_hi|bc_thinned_lo|bc_thinned_hi)
     echo "  Counted-coverage bank ON (fixed-radius absolute readout). ALL knobs are surfaced (grouped)"
-    echo "  in run_with_submitit.py; a / c_frac / radius_mult are set per arm above, and THINNED arms"
-    echo "  scale typicality_bank_size / typicality_reserve_size 4x. Resolved values:"
+    echo "  in run_with_submitit.py; a / c_frac / radius_mult are set per arm above. Bank M / reserve"
+    echo "  stay at the base 8192 / 550 (the 4x-M experiment collapsed lam_spread). Resolved values:"
     for k in typicality_bank_size typicality_reserve_size typicality_K_prime \
              typicality_halflife_steps typicality_reserve_residency typicality_graduation_hits \
              typicality_pool_j typicality_a typicality_c_frac typicality_radius_mult \
