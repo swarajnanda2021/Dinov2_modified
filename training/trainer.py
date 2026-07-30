@@ -838,7 +838,7 @@ def train_dinov2(args):
 
     while current_iteration < args.total_iterations:
         # ========== Get batch (weighted/off: one batch; thinned: over-drawn pool -> N) ==========
-        thin_seen_val = None; thin_bias_val = None
+        thin_seen_val = None; thin_bias_val = None; thin_accept_val = None
         thin_committed_phat = None; thin_pool_phat = None
         if balance_mode != 'thinned' or current_iteration < args.typicality_warmup_iters:
             # weighted / off, and thinned-before-activation: draw exactly one batch. This branch is
@@ -874,6 +874,7 @@ def train_dinov2(args):
             _pl, _pg, bias = _scout_and_bank(batch_data[-1], current_iteration)  # fills the bank
             thin_bias_val = bias
             thin_seen_val = N                              # no over-draw; committed = drawn = N
+            thin_accept_val = 1.0                          # plain baseline: everything committed
             # bank_ready is read AFTER the scout update above -> p_ref is the just-updated value.
             _pref = float(typicality_bank.p_ref.item())
             bank_ready = (_pref > 0.0
@@ -889,72 +890,71 @@ def train_dinov2(args):
                           f"reserve={typicality_bank._nr()}/{typicality_bank.reserve_cap}); entering "
                           f"{THIN_WMAX_WINDOW}-step w_max window before acceptance goes live")
         else:
-            # ===== Stream thinning, GATE OPEN: over-draw a candidate pool, forward the scout crop
-            # no-grad and update the banks on the un-thinned TRUE stream (the ONLY bank update), then
-            # admit each candidate with prob a(p_hat) = w/w_max until N survivors (pull more if short).
-            # For the first W steps w_max is a RUNNING max (calibration window; acceptance already
-            # live off the running max -- the simpler of the two window modes; thin_active stays 0),
-            # then it FREEZES and acceptance is fully live (thin_active flips to 1). The committed
-            # batch is bank-read-only and unweighted below. =====
+            # ===== Stream thinning, GATE OPEN =====
+            # ONE over-drawn pool per step (ceil(factor)*N >= N), scouted with a SINGLE all_gather,
+            # then admitted by density a(p_hat)=w/w_max and fixed to EXACTLY N. There is deliberately
+            # NO "pull more if short" loop: that issued a RANK-DEPENDENT number of all_gather
+            # collectives (each rank's random acceptance count changed how many extra pool draws it
+            # made), which desynced NCCL across ranks and hung ALLGATHER. A single fixed pool keeps
+            # the collective count AND shape identical on every rank; a rare under-fill is topped up
+            # from the SAME pool (highest-a rejects) with no extra draw / collective. For the first W
+            # steps w_max is a RUNNING max (calibration window, thin_active=0), then it FREEZES and
+            # acceptance is fully live (thin_active -> 1). Committed batch is bank-read-only, unweighted.
             N = args.batch_size_per_gpu
-            kept = None; n_kept = 0; thin_seen_val = 0
-            _phat_committed = []; _phat_pool = []
-            _stop = False; first = True
-            while n_kept < N:
-                n_draws = max(1, math.ceil(args.thin_oversample_factor)) if first else 1
-                first = False
-                pool_batches = []
-                for _ in range(n_draws):
-                    b, _stop = _draw_one()
-                    if _stop:
-                        break
-                    pool_batches.append(b)
-                if not pool_batches:
+            n_draws = max(1, math.ceil(args.thin_oversample_factor))
+            pool_batches = []; _stop = False
+            for _ in range(n_draws):
+                b, _stop = _draw_one()
+                if _stop:
                     break
-                # concatenate the drawn batches per crop position (dim 0) -> candidate pool
-                pool = [torch.cat([pb[i] for pb in pool_batches], dim=0)
-                        for i in range(len(pool_batches[0]))]
-                p_local, p_gathered, bias = _scout_and_bank(pool[-1], current_iteration)
-                if bias is not None:
-                    thin_bias_val = bias
-                pool_n = pool[-1].shape[0]
-                thin_seen_val += pool_n
-                if p_local is None:
-                    # defensive: the gate requires a matured bank (p_ref>0) so p_hat is not None
-                    # here in practice; if it ever is, admit uniformly rather than crash.
-                    keep = torch.arange(pool_n)
-                else:
-                    _phat_pool.append(p_local)
-                    w_local = TypicalityScorer.absolute_weights(
-                        p_local, typicality_bank.p_ref, 0.5, 0.25)
-                    # w_max: running max of the GATHERED weight (rank-identical) over the W-step
-                    # window, then frozen -> the rarest tile is admitted with prob ~1. Recalibrated
-                    # here on the UNAUGMENTED scout basis (NOT carried from the augmented-bank run).
-                    if p_gathered is not None and not thin_wmax_frozen:
-                        w_g = TypicalityScorer.absolute_weights(
-                            p_gathered, typicality_bank.p_ref, 0.5, 0.25)
-                        thin_w_max = max(thin_w_max, float(w_g.max().item()))
-                    wmax = thin_w_max if thin_w_max > 0.0 else float(w_local.max().item())
-                    a = (w_local / max(wmax, 1e-8)).clamp(0.0, 1.0)
-                    keep = torch.nonzero(torch.rand_like(a) < a, as_tuple=False).flatten()
-                keep_cpu = keep.detach().to('cpu')
-                if kept is None:
-                    kept = [[] for _ in range(len(pool) - 1)]     # committed positions (drop scout)
-                for pos in range(len(pool) - 1):
-                    kept[pos].append(pool[pos][keep_cpu])
-                if p_local is not None:
-                    _phat_committed.append(p_local[keep])
-                n_kept += int(keep_cpu.numel())
-            if _stop and n_kept < N:
+                pool_batches.append(b)
+            if _stop:
                 print(f"Reached maximum passes ({max_passes}). Stopping.")
                 break
-            if n_kept < N:
-                print(f"[thinned] under-filled batch (kept {n_kept} < N={N}) at iter {current_iteration}")
-            batch_data = [torch.cat(kept[pos], dim=0)[:N] for pos in range(len(kept))]
-            if _phat_committed:
-                thin_committed_phat = torch.cat(_phat_committed, dim=0)[:N]
-            if _phat_pool:
-                thin_pool_phat = torch.cat(_phat_pool, dim=0)
+            pool = [torch.cat([pb[i] for pb in pool_batches], dim=0)
+                    for i in range(len(pool_batches[0]))]
+            p_local, p_gathered, bias = _scout_and_bank(pool[-1], current_iteration)   # the ONLY all_gather
+            thin_bias_val = bias
+            pool_n = pool[-1].shape[0]
+            thin_seen_val = pool_n
+            if p_local is None:
+                # defensive: the gate requires a matured bank (p_ref>0), so this should not happen
+                # post-gate; if it ever does, take the first N rather than crash.
+                keep_idx = torch.arange(min(N, pool_n))
+                thin_accept_val = 1.0
+            else:
+                thin_pool_phat = p_local
+                w_local = TypicalityScorer.absolute_weights(
+                    p_local, typicality_bank.p_ref, 0.5, 0.25)
+                # w_max: running max of the GATHERED weight (rank-identical) over the W-step window,
+                # then frozen -> the rarest tile is admitted with prob ~1. Recalibrated here on the
+                # UNAUGMENTED scout basis (NOT carried from the augmented-bank run).
+                if p_gathered is not None and not thin_wmax_frozen:
+                    w_g = TypicalityScorer.absolute_weights(
+                        p_gathered, typicality_bank.p_ref, 0.5, 0.25)
+                    thin_w_max = max(thin_w_max, float(w_g.max().item()))
+                wmax = thin_w_max if thin_w_max > 0.0 else float(w_local.max().item())
+                a = (w_local / max(wmax, 1e-8)).clamp(0.0, 1.0)
+                accepted = torch.nonzero(torch.rand_like(a) < a, as_tuple=False).flatten()
+                thin_accept_val = accepted.numel() / max(1, pool_n)   # realized acceptance ~ 1/chi
+                if accepted.numel() >= N:
+                    keep_idx = accepted[:N]
+                else:
+                    # rare under-fill (pool too small for chi): top up to N with the highest-a
+                    # rejects -- deterministic, no extra draw/collective. If thin_accept sits at/below
+                    # 1/factor often, raise --thin_oversample_factor for this arm.
+                    rej = torch.ones(pool_n, dtype=torch.bool, device=a.device)
+                    rej[accepted] = False
+                    rej_idx = torch.nonzero(rej, as_tuple=False).flatten()
+                    order = torch.argsort(a[rej_idx], descending=True)
+                    keep_idx = torch.cat([accepted, rej_idx[order[:N - accepted.numel()]]])
+                    if utils.is_main_process():
+                        print(f"[thinned] under-filled (accepted {accepted.numel()} < N={N}) at iter "
+                              f"{current_iteration}; topped up from pool -- consider raising "
+                              f"--thin_oversample_factor")
+                thin_committed_phat = p_local[keep_idx]
+            keep_cpu = keep_idx.detach().to('cpu')
+            batch_data = [pool[pos][keep_cpu] for pos in range(len(pool) - 1)]   # drop scout
             # advance / close the w_max calibration window (one increment per committed step)
             if not thin_wmax_frozen:
                 thin_window_seen += 1
@@ -1666,9 +1666,12 @@ def train_dinov2(args):
                     # nothing" (gate closed / calibrating) from "thinning not yet started".
                     metric_logger.update(thin_active=float(thin_active))
                     if thin_seen_val:
-                        metric_logger.update(
-                            thin_seen=float(thin_seen_val),
-                            thin_accept=float(args.batch_size_per_gpu) / float(thin_seen_val))
+                        # thin_accept is the REALIZED acceptance rate (accepted/pool ~ 1/chi), the
+                        # calibration signal -- NOT N/pool (which is the fixed 1/factor). thin_seen
+                        # is the pool size scouted this step.
+                        metric_logger.update(thin_seen=float(thin_seen_val))
+                        if thin_accept_val is not None:
+                            metric_logger.update(thin_accept=float(thin_accept_val))
                         if thin_bias_val is not None:
                             metric_logger.update(thin_bias=float(thin_bias_val))
                         if (thin_committed_phat is not None and thin_pool_phat is not None
