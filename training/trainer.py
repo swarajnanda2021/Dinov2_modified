@@ -122,6 +122,27 @@ def _assert_bank_synced(bank, tag=""):
               f"(fp_min={lo.tolist()}, fp_max={hi.tolist()})")
 
 
+def _thin_profile_err(committed_phat, pool_phat, p_ref, nbins=20):
+    """Cheap binned-histogram L1 between the achieved committed-batch p_hat distribution and the
+    target thinned profile a*mu (section 3.9). mu is the candidate-pool p_hat histogram; the target
+    weights each bin by a(p) = w/w_max with w = (p + 0.25*p_ref)^-0.5. Bins over log10(p_hat).
+    Both histograms are normalised to sum 1; returns the L1 distance (0 = perfect match)."""
+    eps = 1e-8
+    lp_pool = torch.log10(pool_phat + eps)
+    lo = float(lp_pool.min().item()); hi = float(lp_pool.max().item())
+    if not (hi > lo):
+        return 0.0
+    mu = torch.histc(lp_pool, bins=nbins, min=lo, max=hi)
+    com = torch.histc(torch.log10(committed_phat + eps), bins=nbins, min=lo, max=hi)
+    centers = torch.linspace(lo, hi, nbins, device=pool_phat.device) + 0.5 * (hi - lo) / nbins
+    w_c = 1.0 / (10.0 ** centers + 0.25 * p_ref).clamp(min=eps).pow(0.5)
+    a_c = w_c / w_c.max().clamp(min=eps)
+    target = a_c * mu
+    com_n = com / com.sum().clamp(min=eps)
+    tgt_n = target / target.sum().clamp(min=eps)
+    return float((com_n - tgt_n).abs().sum().item())
+
+
 def train_dinov2(args):
     """
     Main training function for DINOv2 with iBOT and prototype clustering.
@@ -1583,6 +1604,22 @@ def train_dinov2(args):
                     # half-life alone (independent of stream length).
                     print(f"[typicality] activated: n_eff = (1+eta)/(1-eta) = {h['n_eff']:.1f} "
                           f"(variance floor set by the half-life)")
+
+                # Stream-thinning diagnostics (section 3.9), canonical line, thinned mode only.
+                # thin_seen: candidates scouted to fill this step (~chi*N). thin_accept = N/seen
+                # (~1/chi; drift is the miscalibration alarm). thin_bias: mean|beta_hat| (crude).
+                # thin_prof_err: L1 between the committed p_hat histogram and the target a*mu.
+                if balance_mode == 'thinned' and thin_seen_val:
+                    metric_logger.update(
+                        thin_seen=float(thin_seen_val),
+                        thin_accept=float(args.batch_size_per_gpu) / float(thin_seen_val))
+                    if thin_bias_val is not None:
+                        metric_logger.update(thin_bias=float(thin_bias_val))
+                    if (thin_committed_phat is not None and thin_pool_phat is not None
+                            and thin_pool_phat.numel() > 1):
+                        metric_logger.update(thin_prof_err=_thin_profile_err(
+                            thin_committed_phat, thin_pool_phat,
+                            float(typicality_bank.p_ref.item())))
 
         metric_logger.update(lr=optimizer_student.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer_student.param_groups[0]["weight_decay"])
