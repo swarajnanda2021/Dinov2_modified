@@ -527,20 +527,18 @@ def setup_ddp_model(model, args, find_unused=False):
     Returns:
         DDP-wrapped model
     """
-    # Enable gradient checkpointing BEFORE DDP wrapping
+    # Enable gradient checkpointing BEFORE wrapping
     if hasattr(args, 'grad_checkpointing') and args.grad_checkpointing:
         if hasattr(model, 'set_grad_checkpointing'):
             model.set_grad_checkpointing(True)
-            print(f"Enabled gradient checkpointing before DDP wrapping")
+            print(f"Enabled gradient checkpointing before wrapping")
 
-    ddp_model = nn.parallel.DistributedDataParallel(
-        model,
-        device_ids=[args.gpu],
-        find_unused_parameters=find_unused,
-        broadcast_buffers=True
-    )
-
-    return ddp_model
+    # Hand-rolled data parallelism instead of DDP: DDP wraps the autograd graph and
+    # breaks the torch.compile + gradient-checkpointing nesting (CheckpointError,
+    # pytorch#144035). HandRolledDP does a manual, bit-equivalent grad all-reduce
+    # after backward() (find_unused is handled by its presence-mask -> None logic).
+    from training.hand_rolled_dp import HandRolledDP
+    return HandRolledDP(model)
 
 
 def load_pretrained_cellvit_model(checkpoint_path, device='cuda'):

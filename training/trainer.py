@@ -550,16 +550,19 @@ def train_dinov2(args):
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
-    student = setup_ddp_model(student, args, find_unused=True)
-    teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
+    from training.hand_rolled_dp import HandRolledDP
+    # Hand-rolled data parallel (see hand_rolled_dp.py): replaces DDP so torch.compile
+    # + gradient checkpointing works. student grads are synced via student.sync_grads()
+    # after backward(); teacher carries no grad (EMA), prototype_bank has its own step.
+    student = setup_ddp_model(student, args, find_unused=True)   # -> HandRolledDP
+    teacher = HandRolledDP(teacher, broadcast=False)             # loaded from student below
 
     if args.use_prototype_clustering:
-        prototype_bank = nn.parallel.DistributedDataParallel(prototype_bank, device_ids=[args.gpu])
+        prototype_bank = HandRolledDP(prototype_bank)
 
     teacher_without_ddp = teacher.module
 
-    student._set_static_graph()
-    print("Set static graph for student model")
+    print("Hand-rolled data parallel active (student sync_grads after backward)")
 
     teacher_without_ddp.backbone.load_state_dict(student.module.backbone.state_dict())
     teacher_without_ddp.classhead.load_state_dict(student.module.classhead.state_dict())
@@ -1390,27 +1393,35 @@ def train_dinov2(args):
             # the prototype block. Saves ~3 GB peak at 3 channels, ViT-B/14.
             if args.use_semantic_ibot and semantic_token_masks is not None:
                 ibot_accum = 0.0
+                n_ch = len(semantic_token_masks)
 
                 # Pre-pick which channel to retain for the prototype path.
-                # Only retain if semantic prototypes are actually enabled;
-                # otherwise no channel needs to be kept past iBOT loss.
                 if args.use_semantic_prototypes:
-                    retain_idx = random.randint(0, len(semantic_token_masks) - 1)
+                    retain_idx = random.randint(0, n_ch - 1)
                 else:
                     retain_idx = -1  # no retention
+
+                # BATCHED semantic backbone: one forward over ALL channels at once,
+                # replacing n_ch sequential full-backbone forwards. teacher_global_crops[0]
+                # is the same input for every channel, so tile it n_ch times and stack the
+                # per-channel masks; row (c*B + b) is sample b masked by channel c. The ViT
+                # backbone is per-sample (LayerNorm + attention, no BatchNorm), so this is
+                # bit-identical to n_ch separate forwards. Trade-off: all n_ch graphs stay
+                # alive (the previous per-channel graph-release is dropped) -- funded by the
+                # compile + checkpoint memory savings on this branch.
+                sem_input = teacher_global_crops[0].repeat(n_ch, 1, 1, 1)          # [n_ch*B, C, H, W]
+                sem_mask_all = torch.cat(list(semantic_token_masks), dim=0)        # [n_ch*B, num_tokens]
+                sem_backbone_out = student.module.backbone(
+                    sem_input, token_masks=sem_mask_all, return_dict=True
+                )
+                sem_patch_raw_all = sem_backbone_out['patchtokens_postnorm']       # [n_ch*B, N, D]
 
                 for ch_idx, (sem_mask, sem_weight) in enumerate(
                     zip(semantic_token_masks, semantic_masks_weights)
                 ):
-                    # Backbone forward with semantic mask tokens
-                    sem_backbone_out = student.module.backbone(
-                        teacher_global_crops[0], token_masks=sem_mask, return_dict=True
-                    )
-                    sem_patch_raw = sem_backbone_out['patchtokens_postnorm']  # [B, N, D]
+                    sem_patch_raw = sem_patch_raw_all[ch_idx * B:(ch_idx + 1) * B]  # [B, N, D] view
 
-                    # Store for prototype section ONLY if this is the
-                    # pre-selected retain channel; otherwise this graph
-                    # will be released at end of iteration.
+                    # Store for prototype section ONLY if this is the retain channel.
                     if ch_idx == retain_idx:
                         semantic_backbone_outputs.append((sem_patch_raw, sem_mask, sem_weight))
 
@@ -1434,14 +1445,9 @@ def train_dinov2(args):
                         ibot_accum += loss_ibot
                         del sem_s_proj, sem_t_proj, sem_s_gathered, sem_t_gathered
 
-                    # Release the backbone graph for non-retained channels.
-                    # For the retained channel, sem_patch_raw is still
-                    # alive via semantic_backbone_outputs; deleting the
-                    # local name here just drops one reference, the list
-                    # entry keeps the graph alive until the prototype block.
-                    del sem_backbone_out, sem_patch_raw
-
-                n_ch = len(semantic_token_masks)
+                # sem_patch_raw_all is kept alive (via the retained view in
+                # semantic_backbone_outputs) until the prototype block; drop the dict wrapper.
+                del sem_backbone_out
                 semantic_ibot_loss_val = ibot_accum / n_ch
 
             # ---------- Block iBOT: Global crop 2 ----------
@@ -1481,7 +1487,10 @@ def train_dinov2(args):
 
             with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_fp16 or bf16_mode):
                 # ---------- Block mask prototype: Global crop 1 ----------
-                clust_loss_g1, proto_loss_g1, koleo_proto_g1 = patch_prototype_loss(
+                # Also returns Q_g1 (teacher assignments) so the semantic call below,
+                # which feeds the IDENTICAL teacher input, can reuse it instead of
+                # recomputing the full teacher path (bank matmul + Sinkhorn = 4 collectives).
+                clust_loss_g1, proto_loss_g1, koleo_proto_g1, Q_g1 = patch_prototype_loss(
                     teacher_patch_tokens_g1,
                     student_patch_tokens_g1,
                     block_masks_1,
@@ -1492,18 +1501,22 @@ def train_dinov2(args):
                 )
 
                 # ---------- Semantic prototype on global crop 1 ----------
+                # Reuse Q_g1 (bit-identical to recomputing it from teacher_patch_tokens_g1)
+                # and run ONLY the student prediction. The teacher arrangement + koleo are
+                # NOT re-added to prototype_loss: they are identical to g1's and were
+                # previously double-counted (g1 weighted 1.5x / koleo 2x). Only the distinct
+                # semantic student term feeds student_loss (via semantic_clustering_weight).
                 if args.use_semantic_prototypes and len(semantic_backbone_outputs) > 0:
                     # Randomly select one semantic channel for prototype loss (for economical reasons)
                     sem_idx = random.randint(0, len(semantic_backbone_outputs) - 1)
                     sem_patch_raw, sem_mask, sem_weight = semantic_backbone_outputs[sem_idx]
 
-                    semantic_clustering_loss, semantic_teacher_proto_loss, semantic_koleo_proto_loss = patch_prototype_loss(
-                        teacher_patch_tokens_g1,
+                    semantic_clustering_loss, _ = patch_prototype_loss.student_prediction(
                         sem_patch_raw,
                         sem_mask,
+                        Q_g1,
                         prototype_bank,
                         current_iteration,
-                        current_teacher_temp,
                         masks_weight=sem_weight
                     )
 
@@ -1512,7 +1525,7 @@ def train_dinov2(args):
                 semantic_backbone_outputs = []
 
                 # ---------- Block mask prototype: Global crop 2 ----------
-                clust_loss_g2, proto_loss_g2, koleo_proto_g2 = patch_prototype_loss(
+                clust_loss_g2, proto_loss_g2, koleo_proto_g2, Q_g2 = patch_prototype_loss(
                     teacher_patch_tokens_g2,
                     student_patch_tokens_g2,
                     block_masks_2,
@@ -1526,9 +1539,10 @@ def train_dinov2(args):
                 teacher_proto_loss = (proto_loss_g1 + proto_loss_g2) / 2.0
                 koleo_proto_loss = (koleo_proto_g1 + koleo_proto_g2) / 2.0
 
+            # Double-count removed: the semantic call's teacher arrangement + koleo (which
+            # equal g1's) are no longer added here. The bank now sees each teacher crop's
+            # arrangement once, averaged over g1/g2, plus koleo once averaged over g1/g2.
             prototype_loss = teacher_proto_loss + koleo_proto_loss
-            if args.use_semantic_prototypes:
-                prototype_loss = prototype_loss + semantic_teacher_proto_loss + semantic_koleo_proto_loss
         else:
             del semantic_backbone_outputs
 
@@ -1552,10 +1566,12 @@ def train_dinov2(args):
             if args.use_prototype_clustering and optimizer_prototypes is not None:
                 optimizer_prototypes.zero_grad()
                 prototype_loss.backward()
+                prototype_bank.sync_grads()          # hand-rolled DP: reduce bank grads
                 optimizer_prototypes.step()
 
             optimizer_student.zero_grad()
             student_loss.backward()
+            student.sync_grads()                     # hand-rolled DP: reduce BEFORE clip/step
 
             if args.clip_grad:
                 utils.clip_gradients(student, args.clip_grad)
@@ -1568,11 +1584,13 @@ def train_dinov2(args):
             if args.use_prototype_clustering and optimizer_prototypes is not None:
                 optimizer_prototypes.zero_grad()
                 prototype_loss.backward()
+                prototype_bank.sync_grads()          # hand-rolled DP: reduce bank grads
                 optimizer_prototypes.step()
 
             optimizer_student.zero_grad()
             fp16_scaler.scale(student_loss).backward()
             fp16_scaler.unscale_(optimizer_student)
+            student.sync_grads()                     # reduce unscaled grads BEFORE clip/step
 
             if args.clip_grad:
                 utils.clip_gradients(student, args.clip_grad)
