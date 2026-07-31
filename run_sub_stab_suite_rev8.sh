@@ -249,11 +249,13 @@ ensure_arg use_prototype_clustering          False
 ensure_arg use_typicality_dampening          False
 ensure_arg balance_mode                      '"weighted"'   # REV8: default rebalancing mode (thinned arms flip it)
 
-# ---- SPEED (rev8): applies to EVERY arm incl. baseline. compile_blocks is generally useful; the
-#      thinned arms also flip scout_amp_bf16 below. compile fuses kernels -> fp results differ at
-#      ~1e-3 (NOT bit-identical), ~80 s one-time warm-up, ~-24% fwd+bwd. Deliberate: we are buying
-#      back the ~3x wall-time the thinning technique added, and the baseline gets the win for free.
-ensure_arg compile_blocks                    True
+# ---- SPEED (rev8): thinned arms flip scout_amp_bf16 below; the bank/augmenter/head-skip wins are
+#      wired unconditionally. compile_blocks is OFF: per-block torch.compile is INCOMPATIBLE with the
+#      mandatory gradient checkpointing -- the checkpoint recompute saves a different tensor count than
+#      the compiled forward (CheckpointError: 37 vs 36 saved), even under use_reentrant=False. It
+#      crashed job 4528364 on the first backward. Grad-checkpointing cannot be removed (OOM: 83>80 GB),
+#      so compile stays off until the checkpointed region can be compiled as a unit. -827 ms forgone.
+ensure_arg compile_blocks                    False
 
 echo "  Toggling ingredient: $RUN"
 case "$RUN" in
