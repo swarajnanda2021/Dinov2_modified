@@ -41,6 +41,10 @@ from .helpers import (
     setup_ddp_model,
 )
 from typicality import RepresentativePrototypes, TypicalityScorer, CountedCoverageBank
+# Vectorized drop-in for the bank's hot path. BIT-IDENTICAL state and return values (verified on
+# GPU: full state_dict torch.equal every step, matured bank, 40 steps x 3 shape configs); it only
+# removes the per-row cdist/.item() launches in _update (~40k device syncs/step at B=6144).
+from typicality.counted_coverage_bank_fast import FastCountedCoverageBank
 
 
 def _gather_and_compute_weights(patch_tokens, mask, masks_weight=None):
@@ -465,7 +469,12 @@ def train_dinov2(args):
         )
         repr_protos = repr_protos.cuda()
 
-        typicality_bank = CountedCoverageBank(
+        # Thinned mode pays the bank on the FULL over-drawn pool every step, so it uses the
+        # vectorized subclass. weighted/off keep the original class untouched (byte-identical arms).
+        _BankCls = (FastCountedCoverageBank
+                    if getattr(args, 'balance_mode', 'weighted') == 'thinned'
+                    else CountedCoverageBank)
+        typicality_bank = _BankCls(
             M=args.typicality_bank_size,
             K_prime=args.typicality_K_prime,
             pool_j=args.typicality_pool_j,
@@ -499,7 +508,7 @@ def train_dinov2(args):
         # CRUDE, measure-only bias indicator (not calibrated). Built with the same knobs but M=M'.
         if balance_mode == 'thinned':
             M_coarse = max(64, int(args.typicality_bank_size / (2.0 ** 9.3)))
-            richardson_bank = CountedCoverageBank(
+            richardson_bank = _BankCls(
                 M=M_coarse,
                 K_prime=args.typicality_K_prime,
                 pool_j=args.typicality_pool_j,
@@ -526,6 +535,16 @@ def train_dinov2(args):
 
     student = student.cuda()
     teacher = teacher.cuda()
+
+    # Per-block torch.compile. Compiling backbone-as-a-whole trips a dynamo guard on the module-global
+    # attn_bias_cache in models/vision_transformer/modern_vit.py ("Duplicate tensors found"); compiling
+    # the blocks leaves the sequence-packing eager and sidesteps it entirely.
+    if getattr(args, 'compile_blocks', False):
+        for _blk in student.backbone.blocks:
+            _blk.forward = torch.compile(_blk.forward, dynamic=False)
+        for _blk in teacher.backbone.blocks:
+            _blk.forward = torch.compile(_blk.forward, dynamic=False)
+        print("[speed] torch.compile applied per TransformerBlock (student+teacher)")
 
     if utils.has_batchnorms(student):
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
@@ -839,8 +858,16 @@ def train_dinov2(args):
         return (p_hat_local, p_hat_gathered, mean|beta_hat|). p_hat is debiased to u*=2u_s-u_2s
         only when --thin_richardson_correct (default off)."""
         with torch.no_grad():
-            so = student([scout_crop.cuda(non_blocking=True)], token_masks=[None], mode='dino',
-                         return_bottleneck=True)
+            # bottleneck_only: the scout consumes so['bottleneck'] and nothing else, so skip the
+            # out_dim prototype layer over the whole over-drawn pool. Bottleneck is bit-identical.
+            # (Measured: this saves ~0 ms -- the skipped GEMM is tiny -- but it avoids materializing a
+            # [pool, out_dim] fp32 activation, ~400 MB at pool=1536/out_dim=65536.)
+            _sc = scout_crop.cuda(non_blocking=True)
+            if getattr(args, 'scout_amp_bf16', False):
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    so = student([_sc], token_masks=[None], mode='dino', bottleneck_only=True)
+            else:
+                so = student([_sc], token_masks=[None], mode='dino', bottleneck_only=True)
             sg = _all_gather_signatures(
                 repr_protos.compute_signatures(so['bottleneck'].detach()).detach())
             bo = typicality_bank.score_and_update(sg, cur_iter)

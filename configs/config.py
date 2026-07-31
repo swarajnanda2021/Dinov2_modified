@@ -279,6 +279,17 @@ def get_args_parser():
                              '(on top of layer-wise decay). DINOv2 ssl_default_config uses '
                              '0.2; set 1.0 to disable. Rationale: MoCo v3 patch-projection '
                              'stability.')
+    # ---- speed (opt-in; both default OFF so nothing changes unless asked) ----
+    parser.add_argument('--compile_blocks', default=False, type=utils.bool_flag,
+                        help="torch.compile each TransformerBlock (NOT the whole backbone: the "
+                             "xformers attn_bias_cache global makes a full-backbone compile fail a "
+                             "dynamo guard). Measured -23.5%% on the fwd+bwd phase; ~80 s warm-up. "
+                             "Changes fp results at the 1e-3 level (kernel fusion) -- not bit-identical.")
+    parser.add_argument('--scout_amp_bf16', default=False, type=utils.bool_flag,
+                        help="Run the thinned SCOUT forward under bf16 autocast. _scout_and_bank sits "
+                             "OUTSIDE the trainer's autocast block, so the scout currently runs fp32: "
+                             "1164 ms vs 784 ms measured at pool=1536. SCIENCE-TOUCHING -- it perturbs "
+                             "p_hat and therefore which tiles are admitted. A/B before enabling.")
     parser.add_argument('--grad_checkpointing', default=False, type=utils.bool_flag,
                     help='Enable gradient checkpointing to reduce memory at cost of ~40% speed')
 

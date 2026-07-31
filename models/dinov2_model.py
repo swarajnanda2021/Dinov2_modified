@@ -42,7 +42,8 @@ class CombinedModelDINO(nn.Module):
         else:
             print(f"⚠ Warning: Backbone does not support gradient checkpointing")
 
-    def forward(self, crops, token_masks=None, mode='dino', return_bottleneck=False):
+    def forward(self, crops, token_masks=None, mode='dino', return_bottleneck=False,
+                bottleneck_only=False):
         """
         Unified forward supporting both DINO and iBOT modes.
 
@@ -58,10 +59,16 @@ class CombinedModelDINO(nn.Module):
             return_bottleneck: If True (multi-crop / DINO path only), also return
                 the pre-prototype bottleneck representation from the classhead.
                 Used by the typicality dampening feature.
+            bottleneck_only: If True (multi-crop / DINO path only), return ONLY the classhead
+                bottleneck and SKIP the out_dim prototype layer entirely. The returned bottleneck
+                is bit-identical to the one from return_bottleneck=True. Used by the thinned
+                scout forward, which consumes nothing but the bottleneck.
 
         Returns:
             Dictionary with keys depending on mode:
             - DINO: {'cls_outputs': tensor, 'features_list': list of dicts[, 'bottleneck': tensor]}
+            - DINO + bottleneck_only: {'bottleneck': tensor, 'features_list': list of dicts}
+              (no 'cls_outputs' key -- the prototype projection is never computed)
             - iBOT: {'patch_outputs': tensor, 'features': dict, 'cls_output': tensor}
         """
 
@@ -91,6 +98,12 @@ class CombinedModelDINO(nn.Module):
             cls_tokens_cat = torch.cat(all_cls_tokens, dim=0)
 
             # Apply DINO head
+            if bottleneck_only:
+                # Scout path: mlp + normalize only, no out_dim prototype matmul.
+                return {
+                    'bottleneck': self.classhead.forward_bottleneck(cls_tokens_cat),
+                    'features_list': outputs_list,
+                }
             if return_bottleneck:
                 cls_outputs, bottleneck = self.classhead(cls_tokens_cat, return_bottleneck=True)
             else:
