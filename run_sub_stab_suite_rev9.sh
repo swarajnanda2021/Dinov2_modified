@@ -93,7 +93,7 @@ set -e
 
 RUN="${1:-}"
 GITHUB_REPO="https://github.com/swarajnanda2021/Dinov2_modified.git"
-BRANCH="pathology-fm-recipe"
+BRANCH="pathology-fm-recipe-tuned"   # rev9 lives here (hand-rolled DP + compile + loss tuning)
 BASE_DIR="/data1/vanderbc/test_dinov2_swaraj"
 
 case "$RUN" in
