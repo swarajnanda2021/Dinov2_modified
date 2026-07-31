@@ -809,16 +809,14 @@ def train_dinov2(args):
     dataset_passes = dataset_position // loader_len
     max_passes = 5
 
-    # ---- stream-thinning state / helpers (section 3.9; thinned mode only) ----
-    # ---- stream-thinning gate + w_max calibration state (section 3.9; thinned mode only) ----
+    # ---- stream-thinning gate state (section 3.9; thinned mode only) ----
+    # w_max is now the ANALYTIC bound (c_frac*p_ref)^(-a) computed each step (see the acceptance
+    # block below), so there is no measurement window / freeze: acceptance is live the moment the
+    # gate opens. The old frozen running-max went stale as p_ref grew and starved acceptance.
     thin_gate_open = False        # latches True once the bank is FILLED for K consecutive steps
     thin_ready_streak = 0         # consecutive steps with bank_ready true (resets on any miss)
-    thin_w_max = 0.0              # running max of the acceptance weight w over the measurement window
-    thin_wmax_frozen = False      # True after the W-step window closes -> acceptance fully live
-    thin_window_seen = 0          # steps counted in the w_max measurement window
-    thin_active = 0               # 0 = gate closed / w_max still calibrating; 1 = acceptance live
+    thin_active = 0               # 0 = gate closed; 1 = acceptance live (immediate once gate opens)
     THIN_GATE_K = 5              # consecutive bank_ready steps required to open the gate
-    THIN_WMAX_WINDOW = 200       # w_max measurement-window length W (running max, then frozen)
 
     # ---- thinned GPU augmentation (kornia): the loader emits raw uint8 tiles (scout_pool_mode); the
     # scout is the NORMALIZED raw (fed to the bank), and ONLY the committed survivors are augmented,
@@ -945,18 +943,17 @@ def train_dinov2(args):
                     thin_ready_streak = thin_ready_streak + 1 if bank_ready else 0
                     if thin_ready_streak >= THIN_GATE_K:
                         thin_gate_open = True
-                        thin_window_seen = 0
                         if utils.is_main_process():
                             print(f"[thinned] gate OPEN at iter {current_iteration}: bank filled "
                                   f"(p_ref={_pref:.4g}, n_est={typicality_bank._ne()}/{typicality_bank.M}, "
-                                  f"reserve={typicality_bank._nr()}/{typicality_bank.reserve_cap}); entering "
-                                  f"{THIN_WMAX_WINDOW}-step w_max window before acceptance goes live")
+                                  f"reserve={typicality_bank._nr()}/{typicality_bank.reserve_cap}); "
+                                  f"acceptance LIVE (analytic w_max = (c_frac*p_ref)^-a)")
                 survivor_raw = pool_raw                           # commit all N (no thinning)
             else:
                 # ===== GATE OPEN: ONE over-drawn raw pool -> scout (single all_gather) -> admit by
                 # density a(p_hat)=w/w_max -> fixed to EXACTLY N. No "pull more" loop (that desynced
                 # NCCL); a rare under-fill is topped up from the SAME pool by highest-a rejects. w_max
-                # is a running max for W steps (thin_active=0) then freezes (thin_active -> 1). =====
+                # is the ANALYTIC bound (c_frac*p_ref)^(-a), recomputed each step (see below). =====
                 n_draws = max(1, math.ceil(args.thin_oversample_factor))
                 pool_batches = []; _stop = False
                 for _ in range(n_draws):
@@ -978,13 +975,25 @@ def train_dinov2(args):
                     thin_accept_val = 1.0
                 else:
                     thin_pool_phat = p_local
+                    # Acceptance tilt. NOTE: a_tilt/c_frac_tilt are HARDCODED here (mirroring the
+                    # original call) -- they are NOT args.typicality_a/_c_frac. So the hi thinned arm
+                    # currently accepts at a=0.5 like lo. Flagged separately; not changed here.
+                    a_tilt, c_frac_tilt = 0.5, 0.25
                     w_local = TypicalityScorer.absolute_weights(
-                        p_local, typicality_bank.p_ref, 0.5, 0.25)
-                    if p_gathered is not None and not thin_wmax_frozen:
-                        w_g = TypicalityScorer.absolute_weights(
-                            p_gathered, typicality_bank.p_ref, 0.5, 0.25)
-                        thin_w_max = max(thin_w_max, float(w_g.max().item()))
-                    wmax = thin_w_max if thin_w_max > 0.0 else float(w_local.max().item())
+                        p_local, typicality_bank.p_ref, a_tilt, c_frac_tilt)
+                    # Analytic w_max = sup_{p>=0} w = (c_frac*p_ref)^(-a): the exact upper bound of w,
+                    # attained as p_hat->0 (absolute_weights docstring: "1/c^a, no clipping required").
+                    # Recomputed EACH STEP so it tracks p_ref. Provably >= max(w) => a=w/w_max never
+                    # clamps => the admitted distribution is w_max-INVARIANT (w_max cancels in the
+                    # top-N selection); only the acceptance RATE changes. This replaces the frozen
+                    # 200-step running max, which stayed pinned to the gate-open p_ref scale while
+                    # p_ref grew ~10x, inflating the normalizer ~3.3x and starving accept to ~0.15
+                    # (85% under-fill + top-up, which breaks the Bernoulli matched-mass guarantee).
+                    # Because w depends only on p_hat/p_ref, accept is scale-invariant (~0.49) at every
+                    # p_ref, so there is no early-or-late under-fill.
+                    _pref_now = typicality_bank.p_ref
+                    _pref_now = float(_pref_now.item()) if torch.is_tensor(_pref_now) else float(_pref_now)
+                    wmax = (c_frac_tilt * max(_pref_now, 1e-8)) ** (-a_tilt)
                     a = (w_local / max(wmax, 1e-8)).clamp(0.0, 1.0)
                     accepted = torch.nonzero(torch.rand_like(a) < a, as_tuple=False).flatten()
                     thin_accept_val = accepted.numel() / max(1, pool_n)   # realized acceptance ~ 1/chi
@@ -1004,18 +1013,10 @@ def train_dinov2(args):
                                   f"--thin_oversample_factor")
                     thin_committed_phat = p_local[keep_idx]
                 survivor_raw = pool_raw[keep_idx.detach().to(pool_raw.device)]   # [N,3,224,224] uint8
-                # advance / close the w_max calibration window (one increment per committed step)
-                if not thin_wmax_frozen:
-                    thin_window_seen += 1
-                    if thin_window_seen >= THIN_WMAX_WINDOW:
-                        thin_wmax_frozen = True
-                        if utils.is_main_process():
-                            print(f"[thinned] w_max FROZEN at {thin_w_max:.4g} (iter {current_iteration}); "
-                                  f"acceptance LIVE (thin_active -> 1)")
             # GPU-augment the committed survivors: raw uint8 -> [g1, g2, l1..lL] normalized, on GPU.
             batch_data = gpu_augment(survivor_raw.to('cuda', non_blocking=True))
-        # thin_active: 1 only once the gate is open AND the w_max window has frozen (fully live).
-        thin_active = 1 if (balance_mode == 'thinned' and thin_gate_open and thin_wmax_frozen) else 0
+        # thin_active: 1 as soon as the gate is open (analytic w_max -> no calibration window).
+        thin_active = 1 if (balance_mode == 'thinned' and thin_gate_open) else 0
 
         # === 1. Extract crops from batch ===
         idx = 0
