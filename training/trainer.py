@@ -825,7 +825,10 @@ def train_dinov2(args):
     _raw_mean = torch.tensor([0.6816, 0.5640, 0.7232]).view(1, 3, 1, 1)  # PATHOLOGY norm (NOT ImageNet);
     _raw_std = torch.tensor([0.1617, 0.1714, 0.1389]).view(1, 3, 1, 1)   #   matches the dataloader default.
     if balance_mode == 'thinned':
-        from data.gpu_augment import GPUCropAugment
+        # grid_sample augmenter: ~-386 ms/step vs the kornia path, distribution-matched with exact
+        # torchvision HSV hue. Different RNG stream than kornia (the thinned arm was never pixel-
+        # comparable to weighted anyway); adopted deliberately for the speed.
+        from data.gpu_augment_fast import FastCropAugment as GPUCropAugment
         gpu_augment = GPUCropAugment(global_size=224, local_size=args.local_crop_size,
                                      n_local_crops=args.n_standard_local_crops).cuda()
         _raw_mean = _raw_mean.cuda(); _raw_std = _raw_std.cuda()

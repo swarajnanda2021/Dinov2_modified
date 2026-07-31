@@ -249,6 +249,12 @@ ensure_arg use_prototype_clustering          False
 ensure_arg use_typicality_dampening          False
 ensure_arg balance_mode                      '"weighted"'   # REV8: default rebalancing mode (thinned arms flip it)
 
+# ---- SPEED (rev8): applies to EVERY arm incl. baseline. compile_blocks is generally useful; the
+#      thinned arms also flip scout_amp_bf16 below. compile fuses kernels -> fp results differ at
+#      ~1e-3 (NOT bit-identical), ~80 s one-time warm-up, ~-24% fwd+bwd. Deliberate: we are buying
+#      back the ~3x wall-time the thinning technique added, and the baseline gets the win for free.
+ensure_arg compile_blocks                    True
+
 echo "  Toggling ingredient: $RUN"
 case "$RUN" in
   baseline)
@@ -306,6 +312,7 @@ case "$RUN" in
     ensure_arg typicality_radius_mult       1.5
     ensure_arg thin_oversample_factor       6.0                 # pool 6x N; chi~3.9 measured -> 6x clears N=256. Over-draw is now CHEAP (raw uint8, no CPU aug).
     ensure_arg thin_richardson_correct      False               # two-scale bias probe is measure-only
+    ensure_arg scout_amp_bf16               True                # bf16 scout fwd: ~-470 ms. Rounds p_hat -> shifts admissions (accepted for speed).
     # NB: bank M / reserve stay at the BASE 8192 / 550 (the 4x-M experiment diluted hits -> hit_frac
     #     cratered and lam_spread collapsed to 0; the base bank ran healthy). typicality_modulation
     #     is unused in thinned mode (loss unweighted) -- left at its default.
@@ -318,6 +325,7 @@ case "$RUN" in
     ensure_arg typicality_radius_mult       1.5
     ensure_arg thin_oversample_factor       12.0                # a=1.0 -> larger chi -> larger pool (over-draw is cheap now: raw uint8, no CPU aug)
     ensure_arg thin_richardson_correct      False
+    ensure_arg scout_amp_bf16               True                # bf16 scout fwd: ~-470 ms. Rounds p_hat -> shifts admissions (accepted for speed).
     # bank M / reserve at base 8192 / 550 (see bc_thinned_lo).
     ;;
 
