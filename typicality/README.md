@@ -187,9 +187,10 @@ signatures *drifts* as `R` trains, so no fixed radius can be right for the whole
 points, the knee between under- and over-filling. It is **measured live**: every ~500 steps the
 bank replays seed-on-miss over a rolling buffer of the ~60,000 most recent signatures, across a
 grid of radii re-centred on the current scale, and tracks the knee with a light EMA. On the
-trained run the knee sits near `s ≈ 13` at activation and drifts *down* to about 11 by 70k steps
-as `R`'s scale contracts; a radius frozen at an early value would soon fall inside every point's
-neighbourhood, nothing would count as a hit, and the bank would go inert.
+running arms the knee sits near `s ≈ 17.7` when the gate opens, and the `a = 0.5` arm drifts *down*
+about 9% to `s ≈ 16.1` by iteration 93k as the signature scale contracts (the `a = 1.0` arm holds
+near 17.7 over its shorter run so far); a radius frozen at an early value would soon fall inside
+every point's neighbourhood, nothing would count as a hit, and the bank would go inert.
 
 **The resolution check.** A variogram fit estimates the density **correlation length** `L`, the
 distance over which density changes appreciably. If the stored points are spaced *wider* than `L`,
@@ -234,6 +235,51 @@ batch autocorrelation, so recurring morphology builds standing evidence, yet sho
 representation's drift, so the estimate tracks the current encoder. It fixes the estimator's floor:
 `n_eff = (1+η)/(1−η) ≈ 721` steps of effective evidence, independent of run length.
 
+## The algorithm: the counted-coverage bank in one step
+
+One training step on the all-gathered batch `X`. `p̂` is read against the pre-update state; the
+update then runs on every tile. Each block is tagged with the section that explains it.
+
+```
+[ warmup · §03 ]
+if step < T_warm: return p̂ = ⊥ for all x          # inactive: signatures not yet stable
+
+[ decay & age · §06 §09 ]
+for each live signature i:
+    S_i   ← η · S_i                                # decayed hit count
+    E_i   ← η · E_i + 1                            # decayed lifetime (the clock)
+    age_i ← age_i + 1
+    if i in reserve and age_i > T_need: evict i    # ungraduated one-off expires
+
+[ all-gather · §13 ]
+gather signatures of X across workers → X_global
+
+[ readout · §07 §08 ]
+if |established| = M and counters mature:
+    R_rad ← radius_mult · s
+    p̂(x) ← Σ_{ ‖s(x)−b_i‖ ≤ R_rad }  (S_i / E_i) · K( ‖s(x)−b_i‖ / R_rad )
+else: p̂(x) ← ⊥                                    # fill / cold-start: no weight
+
+[ reference scale · §10 ]
+p_ref ← 0.999 · p_ref + 0.001 · median_x p̂(x)
+
+[ hit · seed · graduate · evict · §09 ]
+for each x in X_global:
+    i* ← nearest signature to s(x)
+    if ‖s(x) − b_{i*}‖ ≤ s:                        # a hit
+        S_{i*} ← S_{i*} + 1
+        if i* in reserve and its hits ≥ 2:         # graduate (two corroborating hits)
+            if |established| = M: evict argmin_i λ̂_i
+            move i* → established
+    else:                                          # novel tile
+        if |established| < M: seed into established     # fill the cover
+        else: seed into reserve (flush oldest if full)
+```
+
+The per-tile weight `w = 1/(p̂+c)^a` is formed downstream from `p̂` and `p_ref` (§10); the weighted
+road (§10) scales the loss by it, the thinned road (§11) admits by it. In thinned mode the update
+runs on the *un-thinned* scout pool (§12), and the committed forward is read-only.
+
 ## 10 · The weight, and road one: weight the loss
 
 Rarity is density read upside-down:
@@ -258,8 +304,10 @@ of any value is identical to no weighting, and the common factor `k^(−a)` canc
 flattens the effective sampling distribution while leaving each tile's learning signal intact.
 
 The cost is **effective sample size**, `ESS = (Σw)² / (B·Σw²)`. When a few rare tiles hoard the
-weight, the gradient is effectively computed from those few; a batch of 256 can pull like 40. You
-keep full coverage of the data at a reduced statistical batch size.
+weight, the gradient is effectively computed from those few. You keep full coverage of the data at
+a reduced statistical batch size. *Measured* on the two completed weighted runs: `ESS = 0.89` at
+`a = 0.5` and `0.67` at `a = 1.0` (mean weight 1.65 and 3.12); at the harder tilt a batch of 256
+pulls like about 171. This is the tax the thinned road (§11) avoids.
 
 ## 11 · Road two: thinning, the same target realized on the stream
 
@@ -280,7 +328,9 @@ a(p̂) = w(p̂) / w_max ,     w_max = ( c_frac · p_ref )^{-a}
 **The payoff.** Survivors are trained **unweighted**, so effective sample size is a full 1: the
 rebalancing lives in *who is in the room*, and every tile pulls at full strength. Expected draws
 per committed batch is `χ = 1/E[a]`; the pool is over-drawn by a factor above `χ` so `N` survivors
-can be admitted.
+can be admitted. *Measured* in the two running thinned arms: `ESS` and mean weight sit at exactly
+`1.000` on every logged step, and the accept rate settles at about `0.49` in both (`χ ≈ 2.04`), the
+same value at `a = 0.5` with a 3× pool and at `a = 1.0` with a 6× pool.
 
 **The ceiling must track the scale.** Because `w_max` cancels when the batch is finally selected,
 its value sets only *how many* tiles survive, never *which*, provided it stays above every real
@@ -340,6 +390,12 @@ is what lets an unsupervised, self-tuning estimator stay correct across a long r
 climbs tenfold. And when the invariance is broken anywhere, at a frozen ceiling, a fixed radius, or
 a percentile that discards magnitude, the module does not crash. It simply stops rebalancing.
 
+*Seen in the runs:* after the gate opens, `p_ref` climbs about 5× in the `a = 0.5` arm
+(0.20 → 0.95) and about 10× in the `a = 1.0` arm (0.22 → 2.20), while the acceptance rate settles at
+~0.49 in both, unmoved by the tilt or the scale. That steadiness is the scale-invariance doing its
+job; the earlier analytic-ceiling fix was exactly the repair for a version where it had been lost
+and admissions were starving.
+
 > **The benefit has to survive the scale, or it was never real.**
 
 ## 15 · The dashboard: reading the bank's health
@@ -358,7 +414,24 @@ fail silently. Each signal guards one.
 | `ess`, `w_mean` | weighted: effective batch and mean weight | ESS near intended | a few tiles owning the gradient (both pin to 1 when thinned) |
 
 `lam_spread` is the master signal, a *ratio*, so it reads shape not scale, and it is the one to
-watch above the others: when it collapses toward 1, the whole rebalancing quietly flatlines.
+watch above the others: when it collapses toward 1, the whole rebalancing flatlines.
+
+*Live snapshot* (thinned `a = 0.5`, iter 93k): `lam_spread 3.1`, `hit_frac 0.90`, `turn_ratio 2.6`,
+`underresolved 0`, `thin_accept 0.49`, `thin_prof_err 0.14`, all in range. The `a = 1.0` arm reads
+`turn_ratio 1.0` instead: its 6× pool feeds the bank faster, so entries graduate and turn over more
+often in step units. That is a feed-rate effect on the units, not instability, and the density
+signals stay healthy.
+
+## Where it stands: what the numbers say so far
+
+The mechanism behaves as designed in the live runs: acceptance is scale-invariant, effective sample
+size is exactly 1 under thinning against 0.67 to 0.89 under weighting, and the bank's health signals
+sit in range. The downstream picture is honest and still forming. On twelve slide-level MIL
+biomarker tasks, the two completed *weighted* arms land within ±3.5% of the untuned baseline, inside
+the split-to-split spread on essentially every task and with no consistent direction: neutral, not
+yet a win. The *thinned* arms are still training (93k and 70k of 125k steps) and have no downstream
+evaluation yet. What is shown here is that the estimator does the thing it claims to do; whether
+that reshaped diet improves the encoder is the open question the runs exist to answer.
 
 ## 16 · Making it run: the engineering underneath
 
