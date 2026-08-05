@@ -126,11 +126,13 @@ def _assert_bank_synced(bank, tag=""):
               f"(fp_min={lo.tolist()}, fp_max={hi.tolist()})")
 
 
-def _thin_profile_err(committed_phat, pool_phat, p_ref, nbins=20):
+def _thin_profile_err(committed_phat, pool_phat, p_ref, a=0.5, c_frac=0.25, nbins=20):
     """Cheap binned-histogram L1 between the achieved committed-batch p_hat distribution and the
     target thinned profile a*mu (section 3.9). mu is the candidate-pool p_hat histogram; the target
-    weights each bin by a(p) = w/w_max with w = (p + 0.25*p_ref)^-0.5. Bins over log10(p_hat).
-    Both histograms are normalised to sum 1; returns the L1 distance (0 = perfect match)."""
+    weights each bin by a(p) = w/w_max with w = (p + c_frac*p_ref)^-a. Bins over log10(p_hat).
+    a / c_frac MUST match the admission tilt (args.typicality_a / args.typicality_c_frac) or the
+    target is built for the wrong tilt and the metric is meaningless. Both histograms are normalised
+    to sum 1; returns the L1 distance (0 = perfect match)."""
     eps = 1e-8
     lp_pool = torch.log10(pool_phat + eps)
     lo = float(lp_pool.min().item()); hi = float(lp_pool.max().item())
@@ -139,7 +141,7 @@ def _thin_profile_err(committed_phat, pool_phat, p_ref, nbins=20):
     mu = torch.histc(lp_pool, bins=nbins, min=lo, max=hi)
     com = torch.histc(torch.log10(committed_phat + eps), bins=nbins, min=lo, max=hi)
     centers = torch.linspace(lo, hi, nbins, device=pool_phat.device) + 0.5 * (hi - lo) / nbins
-    w_c = 1.0 / (10.0 ** centers + 0.25 * p_ref).clamp(min=eps).pow(0.5)
+    w_c = 1.0 / (10.0 ** centers + c_frac * p_ref).clamp(min=eps).pow(a)
     a_c = w_c / w_c.max().clamp(min=eps)
     target = a_c * mu
     com_n = com / com.sum().clamp(min=eps)
@@ -975,10 +977,13 @@ def train_dinov2(args):
                     thin_accept_val = 1.0
                 else:
                     thin_pool_phat = p_local
-                    # Acceptance tilt. NOTE: a_tilt/c_frac_tilt are HARDCODED here (mirroring the
-                    # original call) -- they are NOT args.typicality_a/_c_frac. So the hi thinned arm
-                    # currently accepts at a=0.5 like lo. Flagged separately; not changed here.
-                    a_tilt, c_frac_tilt = 0.5, 0.25
+                    # Acceptance tilt reads the SAME knobs as the weighted path
+                    # (args.typicality_a / args.typicality_c_frac), so the hi thinned arm now
+                    # admits at its configured a=1.0. Previously a_tilt was hardcoded to 0.5,
+                    # which made hi accept like lo and silently cancelled the thinned tilt sweep.
+                    # a_tilt drives BOTH w_local and the analytic w_max below, so the two stay
+                    # consistent by construction (change one -> both move).
+                    a_tilt, c_frac_tilt = args.typicality_a, args.typicality_c_frac
                     w_local = TypicalityScorer.absolute_weights(
                         p_local, typicality_bank.p_ref, a_tilt, c_frac_tilt)
                     # Analytic w_max = sup_{p>=0} w = (c_frac*p_ref)^(-a): the exact upper bound of w,
@@ -1745,7 +1750,8 @@ def train_dinov2(args):
                                 and thin_pool_phat.numel() > 1):
                             metric_logger.update(thin_prof_err=_thin_profile_err(
                                 thin_committed_phat, thin_pool_phat,
-                                float(typicality_bank.p_ref.item())))
+                                float(typicality_bank.p_ref.item()),
+                                a=args.typicality_a, c_frac=args.typicality_c_frac))
 
         metric_logger.update(lr=optimizer_student.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer_student.param_groups[0]["weight_decay"])
