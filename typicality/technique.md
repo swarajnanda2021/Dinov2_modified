@@ -1148,13 +1148,19 @@ per-cell 0.125) did not, which is why it was re-run at 8×.
 <tr><td>thinned_lo (rev12)</td><td>32,768</td><td>0.5</td><td>8× (was 4×)</td><td>0.25 (was 0.125)</td><td>⟨measure⟩</td><td>4× did NOT settle; 8× ⟨measure⟩</td></tr>
 <tr><td>thinned_lo (rev13)</td><td>16,384</td><td>0.5</td><td>6×</td><td>0.375</td><td>⟨measure⟩</td><td>⟨measure⟩</td></tr>
 <tr><td>thinned_hi (rev13)</td><td>16,384</td><td>1.0</td><td>6×</td><td>0.375</td><td>⟨measure⟩</td><td>⟨measure⟩</td></tr>
+<tr><td>thinned_lo (32k, 4× demo) ‡</td><td>32,768</td><td>0.5</td><td>4×</td><td>0.125</td><td>⟨measure⟩</td><td>D → ∞ (below floor)</td></tr>
 </tbody>
 </table>
 
 **Table 3.** Oversample sizing per thinned run. `per-cell feed` is arithmetic (`oversample × 256 × 4
 / M`); `χ` (the measured fill floor, `1/thin_accept`) and the stability outcome are measured as each
 run settles. `⟨measure⟩` cells fill in as the runs finish (rev10 / rev11 / rev12-hi first, then
-rev12-lo at 8×, then rev13). `†` admitted at `a ≈ 0.5` via the pre-`rev11` hardcode.
+rev12-lo at 8×, then rev13). `†` admitted at `a ≈ 0.5` via the pre-`rev11` hardcode. `‡` a
+**deliberate below-feed-floor run** (`M = 32768`, `a = 0.5`, `4×`, per-cell `0.125`) held only
+`~10k` post-gate iterations, not a sweep point: it is the **negative control**, exhibiting the
+stability-threshold violation the floor exists to prevent, `lam_spread` diverging (`q_{0.1}(λ) → 0`)
+and `s` descending without settling. Its `lam_spread(t)` trajectory is the failure panel accompanying
+Figure 2.
 
 ### 4.5 A closed form for the presentation multiplier
 
