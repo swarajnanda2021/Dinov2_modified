@@ -981,6 +981,67 @@ baseline), `thinned` (this section), or `off` (no rebalancing). `p_ref`, `w_max`
 are re-measured on the unaugmented scout basis during warmup rather than carried from the augmented
 weighted arm, whose `p̂` distribution differs.
 
+### 3.10 Free and slaved hyperparameters
+
+The bank carries many named constants, but they are not independent knobs. Only two are free: the
+bank capacity `M` and the tilt exponent `a`. Every other constant is *slaved*, to `M`, to `a`, or to
+the data, and is fixed by the requirement that the bank sit at a stable operating point rather than
+by a separate search.
+
+**Slaved to `M` (the evidence budget).** A cell's hit-rate is estimated from the hits it collects
+before they decay, of order `(κ / M) · H` per cell (with `κ` the tiles fed per step and `H` the
+half-life), and the probation traffic scales with the number of cells to be discovered. So the
+half-life `H`, the reserve size, and the reserve residency scale linearly with `M`. Quadrupling `M`
+gives each cell a quarter of the hits, which a four-fold longer memory restores, while a four-fold
+larger reserve absorbs the four-fold larger inflow of newborns. Holding `(κ / M) · H` and
+`reserve / M` fixed keeps the per-cell estimator variance and the graduation dynamics invariant as
+resolution grows. Raising `M` alone, with memory and reserve unchanged, starves the rarest cells
+first and collapses the dynamic range toward `lam_spread → 1`.
+
+**Slaved to the data.** The hit radius `s` (the fill knee of §3.5), the readout neighbourhood size
+`j`, and the candidate-pool self-tuning are read off the stream at run time. As signatures pack
+denser they shrink to track the smaller spacing without intervention.
+
+**Slaved to `a` (fill).** Thinning over-draws `χ = 1 / E[a(p̂)]` candidates per committed tile
+(§3.9), and `χ` grows with the tilt, so the oversample factor tracks `a`: a stronger tilt lowers
+acceptance and needs a proportionally larger pool to admit `N` survivors. Its one side effect is on
+the rate at which the bank is fed, which the experiments hold under test rather than assume away.
+
+This is a parameterisation, not a confound. Co-scaling a slaved constant with its master is not a
+second, uncontrolled change; it is precisely what holds the bank's operating point fixed while the
+master moves. A confound would be perturbing an *independent* quantity by accident. These are
+dependent by construction, so the design space is genuinely two-dimensional in `(M, a)`, with the
+remainder determined.
+
+Table 2 instantiates this structure for the tilt-by-resolution study: `M` and `a` vary across rows,
+and the slaved constants take the values the scaling law assigns.
+
+<table>
+<thead>
+<tr>
+  <th colspan="2">MASTER — free (swept)</th>
+  <th colspan="5">SLAVE — dependent (fixed by the scaling law)</th>
+</tr>
+<tr>
+  <th><code>M</code></th><th><code>a</code></th>
+  <th>half-life <code>H</code> (∝ M)</th><th>reserve (∝ M)</th><th>residency (∝ M)</th>
+  <th>oversample (∝ a)</th><th><code>s, j</code>, pool (∝ data)</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>8,192</td><td>0.5</td><td>250</td><td>550</td><td>300</td><td>3×</td><td>auto</td></tr>
+<tr><td>8,192</td><td>1.0</td><td>250</td><td>550</td><td>300</td><td>6×</td><td>auto</td></tr>
+<tr><td>32,768</td><td>0.5</td><td>1,000</td><td>2,200</td><td>1,200</td><td>~4×</td><td>auto</td></tr>
+<tr><td>32,768</td><td>1.0</td><td>1,000</td><td>2,200</td><td>1,200</td><td>~8×</td><td>auto</td></tr>
+</tbody>
+</table>
+
+**Table 2.** The tilt-by-resolution runs as a master/slave grid. The two free hyperparameters are
+swept across rows; the slaved constants show the values fixed by the scaling law (`M`-slaved
+constants scale linearly with `M`; `s`, `j`, and the pool are auto-tuned at run time, shown as
+`auto`). Oversample factors are starting estimates, raised if the realised acceptance under-fills
+`N`.
+
 ---
 
 ### References
