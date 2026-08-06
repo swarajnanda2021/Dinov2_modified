@@ -8,7 +8,7 @@
 #       n_eff (effective hits) rises 721->1442.
 #   - graduation_hits STAYS 2 here: the 2 ln M bound rounds to 2 through 16k and only reaches 3 at
 #     32k, and holding it at 2 avoids the graduation-margin risk seen on the 32k lo arm.
-#   - Oversample: lo 4x, hi 6x (STARTING values; tune if thin_accept under-fills N=256).
+#   - Oversample: lo 6x, hi 6x (feed-matched at 16k; per-cell feed 0.375, safely above the floor).
 #   - This run exists to give the 3rd point so the s-vs-M and lam_spread-vs-M laws can be FIT
 #     (slope -> effective d*), not just drawn through two points. Same lam_spread guardrail applies.
 #
@@ -140,7 +140,7 @@ exp_dir="$BASE_DIR/$exp_name"
 echo "========================================"
 echo "Setup: $exp_name  (branch: $BRANCH)"
 echo "  ViT-B/16 fixed-loader recipe (== rev3/rev5/rev6/rev7) + ONE ingredient: $RUN"
-echo "  (rev13 = 16k middle M point; H/reserve/residency halved vs rev12; grad stays 2; oversample lo 4x / hi 6x)"
+echo "  (rev13 = 16k middle M point; H/reserve/residency halved vs rev12; grad stays 2; oversample lo 6x / hi 6x)"
 echo "========================================"
 
 [ -d "$exp_dir" ] && { echo "  Removing existing dir..."; rm -rf "$exp_dir"; }
@@ -390,7 +390,7 @@ case "$RUN" in
     ensure_arg typicality_reserve_size      1100                # DERIVED ~M: absorbs 2x newborn inflow
     ensure_arg typicality_reserve_residency 600                 # DERIVED ~M: longer window to reach graduation
     ensure_arg typicality_graduation_hits   2                   # STAYS 2: 2 ln M rounds to 2 through 16k (steps to 3 only at 32k)
-    ensure_arg thin_oversample_factor       4.0                 # DERIVED ~a, mild feed bump for 2x M. START; RAISE if thin_accept under-fills N=256.
+    ensure_arg thin_oversample_factor       6.0                 # 6x (per-cell feed 0.375, safely above the feed floor); margin over the fill floor too. Not taking chances on starvation at 2x M.
     ensure_arg thin_richardson_correct      False               # two-scale bias probe is measure-only
     ensure_arg scout_amp_bf16               True                # bf16 scout fwd: ~-470 ms. Rounds p_hat -> shifts admissions (accepted for speed).
     # GUARDRAIL: watch lam_spread. Hold >= ~2.5 = co-scaling worked. Slide toward 1 = rare starving -> ABORT, lengthen half-life.

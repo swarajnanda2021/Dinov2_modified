@@ -1044,7 +1044,7 @@ assigns, and the fixed constants are noted below.
 <tr><td>thinned_lo (rev10)</td><td>thinned</td><td>8,192</td><td>0.5</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>3×</td></tr>
 <tr><td>thinned_lo (rev10, 6×)</td><td>thinned</td><td>8,192</td><td>0.5</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>6×</td></tr>
 <tr><td>thinned_hi (rev11)</td><td>thinned</td><td>8,192</td><td>1.0</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>6×</td></tr>
-<tr><td>thinned_lo (16k, rev13)</td><td>thinned</td><td>16,384</td><td>0.5</td><td>1,442</td><td>500</td><td>1,100</td><td>600</td><td>2</td><td>~4×</td></tr>
+<tr><td>thinned_lo (16k, rev13)</td><td>thinned</td><td>16,384</td><td>0.5</td><td>1,442</td><td>500</td><td>1,100</td><td>600</td><td>2</td><td>6×</td></tr>
 <tr><td>thinned_hi (16k, rev13)</td><td>thinned</td><td>16,384</td><td>1.0</td><td>1,442</td><td>500</td><td>1,100</td><td>600</td><td>2</td><td>~6×</td></tr>
 <tr><td>thinned_lo (32k, rev12)</td><td>thinned</td><td>32,768</td><td>0.5</td><td>2,884</td><td>1,000</td><td>2,200</td><td>1,200</td><td>3</td><td>8×</td></tr>
 <tr><td>thinned_hi (32k, rev12)</td><td>thinned</td><td>32,768</td><td>1.0</td><td>2,884</td><td>1,000</td><td>2,200</td><td>1,200</td><td>3</td><td>~8×</td></tr>
@@ -1146,7 +1146,7 @@ per-cell 0.125) did not, which is why it was re-run at 8×.
 <tr><td>thinned_hi (rev11)</td><td>8,192</td><td>1.0</td><td>6×</td><td>0.75</td><td>⟨measure⟩</td><td>⟨measure⟩</td></tr>
 <tr><td>thinned_hi (rev12)</td><td>32,768</td><td>1.0</td><td>8×</td><td>0.25</td><td>⟨measure⟩</td><td>⟨measure⟩</td></tr>
 <tr><td>thinned_lo (rev12)</td><td>32,768</td><td>0.5</td><td>8× (was 4×)</td><td>0.25 (was 0.125)</td><td>⟨measure⟩</td><td>4× did NOT settle; 8× ⟨measure⟩</td></tr>
-<tr><td>thinned_lo (rev13)</td><td>16,384</td><td>0.5</td><td>4×</td><td>0.25</td><td>⟨measure⟩</td><td>⟨measure⟩</td></tr>
+<tr><td>thinned_lo (rev13)</td><td>16,384</td><td>0.5</td><td>6×</td><td>0.375</td><td>⟨measure⟩</td><td>⟨measure⟩</td></tr>
 <tr><td>thinned_hi (rev13)</td><td>16,384</td><td>1.0</td><td>6×</td><td>0.375</td><td>⟨measure⟩</td><td>⟨measure⟩</td></tr>
 </tbody>
 </table>
