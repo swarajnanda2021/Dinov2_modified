@@ -1019,8 +1019,8 @@ and the slaved constants take the values the scaling law assigns.
 <table>
 <thead>
 <tr>
-  <th colspan="2">MASTER — free (swept)</th>
-  <th colspan="5">SLAVE — dependent (fixed by the scaling law)</th>
+  <th colspan="2">MASTER (free, swept)</th>
+  <th colspan="5">SLAVE (dependent, set by the scaling law)</th>
 </tr>
 <tr>
   <th><code>M</code></th><th><code>a</code></th>
