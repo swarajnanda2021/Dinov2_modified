@@ -998,8 +998,13 @@ count each estimate integrates, `n_eff = (1 + η)/(1 − η)`, scales with the h
 newborns. Holding `(κ / M) · H` and `reserve / M` fixed keeps the per-cell estimator variance and the
 graduation dynamics invariant as resolution grows. Raising `M` alone, with memory and reserve
 unchanged, starves the rarest cells first and collapses the dynamic range toward `lam_spread → 1`.
-The graduation threshold itself stays at two hits: the argmin-stability evidence grows only as
-`2 ln M`, a weak dependence the longer memory already supplies, so the count need not change.
+The graduation threshold rises with `M`: resolving the genuinely lowest-rate cell by `argmin` over
+`M` noisy estimates needs of order `2 ln M` accumulated counts, so the corroboration to promote a
+newborn grows logarithmically, from two hits at `M = 8192` to three at `M = 32768`. The four-fold
+longer memory makes the extra hit reachable rather than exclusionary: the rate a newborn must sustain
+to graduate, `graduation_hits` over its exposure window, actually falls, since three hits over a
+four-fold window is a lower bar than two over the base window. Raising the count therefore buys
+argmin stability at finer resolution without starving the rare cells it is meant to protect.
 
 **Derived from the data.** The hit radius `s` (the fill knee of §3.5), the readout neighbourhood size
 `j`, and the candidate-pool self-tuning are read off the stream at run time. As signatures pack
@@ -1026,29 +1031,31 @@ assigns, and the fixed constants are noted below.
   <th rowspan="2">run (rev)</th>
   <th rowspan="2">mode</th>
   <th colspan="2">Free (swept)</th>
-  <th colspan="5">Derived (set by the scaling law)</th>
+  <th colspan="6">Derived (set by the scaling law)</th>
 </tr>
 <tr>
   <th><code>M</code></th><th><code>a</code></th>
-  <th><code>n_eff</code> (∝ M)</th><th>half-life <code>H</code> (∝ M)</th><th>reserve (∝ M)</th><th>residency (∝ M)</th><th>oversample (∝ a)</th>
+  <th><code>n_eff</code> (∝ M)</th><th>half-life <code>H</code> (∝ M)</th><th>reserve (∝ M)</th><th>residency (∝ M)</th><th>graduation hits (∝ ln M)</th><th>oversample (∝ a)</th>
 </tr>
 </thead>
 <tbody>
-<tr><td>weightedloss_lo (rev7)</td><td>weighted</td><td>8,192</td><td>0.5</td><td>721</td><td>250</td><td>550</td><td>300</td><td>n/a</td></tr>
-<tr><td>weightedloss_hi (rev7)</td><td>weighted</td><td>8,192</td><td>1.0</td><td>721</td><td>250</td><td>550</td><td>300</td><td>n/a</td></tr>
-<tr><td>thinned_lo (rev10)</td><td>thinned</td><td>8,192</td><td>0.5</td><td>721</td><td>250</td><td>550</td><td>300</td><td>3×</td></tr>
-<tr><td>thinned_hi (rev10) †</td><td>thinned</td><td>8,192</td><td>1.0</td><td>721</td><td>250</td><td>550</td><td>300</td><td>6×</td></tr>
-<tr><td>thinned_hi (rev11)</td><td>thinned</td><td>8,192</td><td>1.0</td><td>721</td><td>250</td><td>550</td><td>300</td><td>6×</td></tr>
-<tr><td>thinned_lo (32k, new)</td><td>thinned</td><td>32,768</td><td>0.5</td><td>2,884</td><td>1,000</td><td>2,200</td><td>1,200</td><td>~4×</td></tr>
-<tr><td>thinned_hi (32k, new)</td><td>thinned</td><td>32,768</td><td>1.0</td><td>2,884</td><td>1,000</td><td>2,200</td><td>1,200</td><td>~8×</td></tr>
+<tr><td>weightedloss_lo (rev7)</td><td>weighted</td><td>8,192</td><td>0.5</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>n/a</td></tr>
+<tr><td>weightedloss_hi (rev7)</td><td>weighted</td><td>8,192</td><td>1.0</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>n/a</td></tr>
+<tr><td>thinned_lo (rev10)</td><td>thinned</td><td>8,192</td><td>0.5</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>3×</td></tr>
+<tr><td>thinned_hi (rev10) †</td><td>thinned</td><td>8,192</td><td>1.0</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>6×</td></tr>
+<tr><td>thinned_hi (rev11)</td><td>thinned</td><td>8,192</td><td>1.0</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>6×</td></tr>
+<tr><td>thinned_lo (32k, new)</td><td>thinned</td><td>32,768</td><td>0.5</td><td>2,884</td><td>1,000</td><td>2,200</td><td>1,200</td><td>3</td><td>~4×</td></tr>
+<tr><td>thinned_hi (32k, new)</td><td>thinned</td><td>32,768</td><td>1.0</td><td>2,884</td><td>1,000</td><td>2,200</td><td>1,200</td><td>3</td><td>~8×</td></tr>
 </tbody>
 </table>
 
 **Table 2.** The complete run matrix as a free/derived grid, and the forward sensitivity sweep (its
 `thinned` rows). The two free hyperparameters vary across rows; the derived constants show the values
 fixed by the scaling law (`n_eff`, half-life, reserve, and residency scale linearly with `M`;
-oversample tracks `a`; `s` and the readout pool are auto-tuned). Fixed across every run: graduation
-hits `= 2`, `c_frac = 0.25`, `radius_mult = 1.5`, `K' = 256`. Weighted arms commit every tile and do
+oversample tracks `a`; `s` and the readout pool are auto-tuned). Graduation hits rise with `M` (two
+at 8k, three at 32k) by the `2 ln M` argmin-stability bound; the four-fold longer memory keeps the
+extra hit reachable. Fixed across every run: `c_frac = 0.25`, `radius_mult = 1.5`, `K' = 256`.
+Weighted arms commit every tile and do
 not over-draw (`n/a`). `†` the `rev10 thinned_hi` row admitted at `a ≈ 0.5` because of a pre-`rev11`
 tilt hardcode (corrected in `rev11`), so it is the feed-matched control rather than a true `a = 1.0`
 point. Oversample at `M = 32768` is a starting estimate, raised if the realised acceptance
