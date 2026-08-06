@@ -1042,7 +1042,7 @@ assigns, and the fixed constants are noted below.
 <tr><td>weightedloss_lo (rev7)</td><td>weighted</td><td>8,192</td><td>0.5</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>n/a</td></tr>
 <tr><td>weightedloss_hi (rev7)</td><td>weighted</td><td>8,192</td><td>1.0</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>n/a</td></tr>
 <tr><td>thinned_lo (rev10)</td><td>thinned</td><td>8,192</td><td>0.5</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>3×</td></tr>
-<tr><td>thinned_hi (rev10) †</td><td>thinned</td><td>8,192</td><td>1.0</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>6×</td></tr>
+<tr><td>thinned_lo (rev10, 6×)</td><td>thinned</td><td>8,192</td><td>0.5</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>6×</td></tr>
 <tr><td>thinned_hi (rev11)</td><td>thinned</td><td>8,192</td><td>1.0</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>6×</td></tr>
 <tr><td>thinned_lo (32k, new)</td><td>thinned</td><td>32,768</td><td>0.5</td><td>2,884</td><td>1,000</td><td>2,200</td><td>1,200</td><td>3</td><td>~4×</td></tr>
 <tr><td>thinned_hi (32k, new)</td><td>thinned</td><td>32,768</td><td>1.0</td><td>2,884</td><td>1,000</td><td>2,200</td><td>1,200</td><td>3</td><td>~8×</td></tr>
@@ -1056,8 +1056,9 @@ oversample tracks `a`; `s` and the readout pool are auto-tuned). Graduation hits
 at 8k, three at 32k) by the `2 ln M` argmin-stability bound; the four-fold longer memory keeps the
 extra hit reachable. Fixed across every run: `c_frac = 0.25`, `radius_mult = 1.5`, `K' = 256`.
 Weighted arms commit every tile and do
-not over-draw (`n/a`). `†` the `rev10 thinned_hi` row admitted at `a ≈ 0.5` because of a pre-`rev11`
-tilt hardcode (corrected in `rev11`), so it is the feed-matched control rather than a true `a = 1.0`
+not over-draw (`n/a`). The `thinned_lo (rev10, 6×)` row was configured as the `hi` arm but admitted
+at `a ≈ 0.5` because of a pre-`rev11` tilt hardcode, so it is really the `a = 0.5` arm at a larger
+pool; read against `thinned_lo (rev10)` at 3× it is an `a = 0.5` feed comparison, not an `a = 1.0`
 point. Oversample at `M = 32768` is a starting estimate, raised if the realised acceptance
 under-fills `N`.
 
