@@ -1123,6 +1123,39 @@ with `lam_q10 / lam_median / lam_q90`, `hit_frac`, `thin_accept`, `ess`, `w_mean
 (committed versus pool `p̂` distribution) is deferred: it needs the two histograms behind
 `thin_prof_err` logged, a small trainer change, not part of this pull.
 
+### 4.4 Oversample sizing (to be measured)
+
+Oversample must clear two floors: the **fill floor** `χ = 1/thin_accept` (the minimum pool that
+admits `N`), and a **feed floor** (enough hits per cell to hold a stable `s`, provisionally
+`per-cell feed ≥ 0.25`, i.e. `oversample ≥ M/4096`). The `per-cell feed = oversample × batch_gpu ×
+n_GPU / M` column is arithmetic and filled below; `χ` and the stability outcome are measured per run.
+The feed floor is not yet a validated law, it rests on a single stable point, so the claim to test is
+narrow: runs whose per-cell feed clears the floor settle, and the one below it (32k lo at 4×,
+per-cell 0.125) did not, which is why it was re-run at 8×.
+
+<table>
+<thead>
+<tr>
+  <th>run (rev)</th><th><code>M</code></th><th><code>a</code></th><th>oversample</th>
+  <th>per-cell feed</th><th><code>χ</code> (fill, measured)</th><th>s / lam_spread settled?</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>thinned_lo (rev10)</td><td>8,192</td><td>0.5</td><td>3×</td><td>0.375</td><td>⟨measure⟩</td><td>⟨measure⟩</td></tr>
+<tr><td>thinned_lo-6× (rev10) †</td><td>8,192</td><td>0.5</td><td>6×</td><td>0.75</td><td>⟨measure⟩</td><td>⟨measure⟩</td></tr>
+<tr><td>thinned_hi (rev11)</td><td>8,192</td><td>1.0</td><td>6×</td><td>0.75</td><td>⟨measure⟩</td><td>⟨measure⟩</td></tr>
+<tr><td>thinned_hi (rev12)</td><td>32,768</td><td>1.0</td><td>8×</td><td>0.25</td><td>⟨measure⟩</td><td>⟨measure⟩</td></tr>
+<tr><td>thinned_lo (rev12)</td><td>32,768</td><td>0.5</td><td>8× (was 4×)</td><td>0.25 (was 0.125)</td><td>⟨measure⟩</td><td>4× did NOT settle; 8× ⟨measure⟩</td></tr>
+<tr><td>thinned_lo (rev13)</td><td>16,384</td><td>0.5</td><td>4×</td><td>0.25</td><td>⟨measure⟩</td><td>⟨measure⟩</td></tr>
+<tr><td>thinned_hi (rev13)</td><td>16,384</td><td>1.0</td><td>6×</td><td>0.375</td><td>⟨measure⟩</td><td>⟨measure⟩</td></tr>
+</tbody>
+</table>
+
+**Table 3.** Oversample sizing per thinned run. `per-cell feed` is arithmetic (`oversample × 256 × 4
+/ M`); `χ` (the measured fill floor, `1/thin_accept`) and the stability outcome are measured as each
+run settles. `⟨measure⟩` cells fill in as the runs finish (rev10 / rev11 / rev12-hi first, then
+rev12-lo at 8×, then rev13). `†` admitted at `a ≈ 0.5` via the pre-`rev11` hardcode.
+
 ---
 
 ### References
