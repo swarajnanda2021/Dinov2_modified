@@ -1185,8 +1185,17 @@ r_⋆ ∝ p_⋆ · M^{1 − d_⋆/δ},        f_feed = φ_c · M / (KN) ∝ ln M
 
 `d_⋆` is the local mass exponent at the occupied lower-decile sites, fixed by regressing
 `[ln q_{0.1}(λ) − ln φ − ln M]` on `ln s_M` across the sweep (per-`M` data: `s_M`, `φ`, the `λ`
-deciles, `|Q|/M`). The measured stability bracket already forces `d_⋆ > 4.4`; the point estimate is
-`d_⋆ ≈ 6`, giving `f_feed ∝ ln M · M^{≈0.5}`, milder than a linear `M/4096`. `⟨d_⋆ to be regressed⟩`.
+deciles, `|Q|/M`). The measured stability bracket forces `d_⋆ > 4.4`. A point value is not yet
+recoverable: the only settled runs are both at `M = 8192`, and the single `M = 32768` arm has not
+plateaued (its `q_{0.1}(λ)` is still rising), which throws the fitted slope to a non-physical value
+above `d`. So for now `d_⋆ ∈ (4.4, ~9)` and the feed exponent `d_⋆/δ − 1 ∈ (0.1, 1.25)`.
+
+**Open item (closes §4.5).** Once one 32k arm settles (`rev12 hi`, or the `rev12 lo` restart at 8×,
+roughly 10+ half-lives to a plateau in `lam_q10` / `lam_spread`), re-pull the six per-`M` settled
+values (`s_M`, `φ`, `lam_q10 / median / q90`, `|Q|/M`) and regress `[ln q_{0.1}(λ) − ln φ − ln M]` on
+`ln s_M` across `M` to fix `d_⋆`; substitute into `f_feed` and into the symbolic `φ_c` from part (b).
+This is the only quantity left open. Oversample is meanwhile set operationally by the stability
+bracket alone: `3×` at 8k, `4–6×` at 16k, `8×` at 32k.
 
 **Resolution of the `δ ≈ 4` vs `d ≈ 9` gap** (Table 1, §6). The self-tuned radius exponent
 `s ∝ M^{−1/δ}` with `δ ≈ 4` is the *typical local mass dimension at occupied sites*, not the
