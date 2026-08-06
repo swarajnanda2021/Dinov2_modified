@@ -1044,23 +1044,84 @@ assigns, and the fixed constants are noted below.
 <tr><td>thinned_lo (rev10)</td><td>thinned</td><td>8,192</td><td>0.5</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>3×</td></tr>
 <tr><td>thinned_lo (rev10, 6×)</td><td>thinned</td><td>8,192</td><td>0.5</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>6×</td></tr>
 <tr><td>thinned_hi (rev11)</td><td>thinned</td><td>8,192</td><td>1.0</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>6×</td></tr>
-<tr><td>thinned_lo (32k, new)</td><td>thinned</td><td>32,768</td><td>0.5</td><td>2,884</td><td>1,000</td><td>2,200</td><td>1,200</td><td>3</td><td>~4×</td></tr>
-<tr><td>thinned_hi (32k, new)</td><td>thinned</td><td>32,768</td><td>1.0</td><td>2,884</td><td>1,000</td><td>2,200</td><td>1,200</td><td>3</td><td>~8×</td></tr>
+<tr><td>thinned_lo (16k, rev13)</td><td>thinned</td><td>16,384</td><td>0.5</td><td>1,442</td><td>500</td><td>1,100</td><td>600</td><td>2</td><td>~4×</td></tr>
+<tr><td>thinned_hi (16k, rev13)</td><td>thinned</td><td>16,384</td><td>1.0</td><td>1,442</td><td>500</td><td>1,100</td><td>600</td><td>2</td><td>~6×</td></tr>
+<tr><td>thinned_lo (32k, rev12)</td><td>thinned</td><td>32,768</td><td>0.5</td><td>2,884</td><td>1,000</td><td>2,200</td><td>1,200</td><td>3</td><td>~4×</td></tr>
+<tr><td>thinned_hi (32k, rev12)</td><td>thinned</td><td>32,768</td><td>1.0</td><td>2,884</td><td>1,000</td><td>2,200</td><td>1,200</td><td>3</td><td>~8×</td></tr>
 </tbody>
 </table>
 
 **Table 2.** The complete run matrix as a free/derived grid, and the forward sensitivity sweep (its
 `thinned` rows). The two free hyperparameters vary across rows; the derived constants show the values
 fixed by the scaling law (`n_eff`, half-life, reserve, and residency scale linearly with `M`;
-oversample tracks `a`; `s` and the readout pool are auto-tuned). Graduation hits rise with `M` (two
-at 8k, three at 32k) by the `2 ln M` argmin-stability bound; the four-fold longer memory keeps the
-extra hit reachable. Fixed across every run: `c_frac = 0.25`, `radius_mult = 1.5`, `K' = 256`.
+oversample tracks `a`; `s` and the readout pool are auto-tuned). Graduation hits track the `2 ln M`
+argmin-stability bound: held at two through 16k and raised to three at 32k, with the longer memory
+keeping the extra hit reachable. The `M` sweep is the three thinned levels 8k / 16k / 32k at each
+tilt (8k done, 32k running, 16k queued as rev13). Fixed across every run: `c_frac = 0.25`,
+`radius_mult = 1.5`, `K' = 256`.
 Weighted arms commit every tile and do
 not over-draw (`n/a`). The `thinned_lo (rev10, 6×)` row was configured as the `hi` arm but admitted
 at `a ≈ 0.5` because of a pre-`rev11` tilt hardcode, so it is really the `a = 0.5` arm at a larger
 pool; read against `thinned_lo (rev10)` at 3× it is an `a = 0.5` feed comparison, not an `a = 1.0`
 point. Oversample at `M = 32768` is a starting estimate, raised if the realised acceptance
 under-fills `N`.
+
+---
+
+## 4. Evaluation: grounded figures (to be measured)
+
+The figures below are the planned evaluation. Each pairs a theoretical law with the measured log
+quantity from the Table 2 runs that anchors it, and is only reported once the run points sit on it.
+All points are read at a matched post-gate age with settled bank statistics (§3.10); a point whose
+`s` has not flattened is provisional. Every block marked `⟨THIS NEEDS TO BE MEASURED⟩` is a
+reserved placeholder pending the completed 8k / 16k / 32k sweep.
+
+### 4.1 Resolution laws (the `M` sweep)
+
+**Figure 1. Fill-knee radius vs bank size.** `s` versus `M`, log-log, one series per tilt. Theory:
+`s ∝ M^{-1/d*}` (§3.5), so the slope is `-1/d*`. Anchor: settled `s` at each of the six thinned
+`(M, a)` points. Inference: the fitted slope measures an *effective* `d*` at the bank's operating
+scale, to compare against the TwoNN intrinsic dimension `d* ≈ 9.3` (Table 1). The 8k→32k pair
+already implies a steeper slope (effective `d* ≈ 4`); the 16k point tests whether the law is a clean
+power or curves.
+`⟨THIS NEEDS TO BE MEASURED⟩`
+
+**Figure 2. Density dynamic range vs bank size.** `lam_spread` (and the `q10 / median / q90`
+decomposition) versus `M`. Theory: finer catchments resolve a wider range of local density, so the
+stored hit-rate range widens with `M`. Anchor: settled `lam_spread` at each `(M, a)`. The
+decomposition guards against a widening that is bottom-body decay rather than true resolution.
+`⟨THIS NEEDS TO BE MEASURED⟩`
+
+**Figure 3. Hit fraction vs bank size.** `hit_frac` versus `M`. Theory: the knee hit-fraction falls
+as catchments shrink. Anchor: settled `hit_frac` at each `(M, a)`. This is the resolution cost that
+accompanies Figures 1 and 2.
+`⟨THIS NEEDS TO BE MEASURED⟩`
+
+### 4.2 Tilt laws (the `a` sweep)
+
+**Figure 4. Acceptance and over-draw vs tilt.** `E[a(p̂)] = ∫ (1 + p̂/c)^{-a} μ(p̂)` and
+`χ = 1/E[a]` versus `a`. Anchor: measured `thin_accept` at each `(a, M)`.
+`⟨THIS NEEDS TO BE MEASURED⟩`
+
+**Figure 5. Weight contrast vs tilt.** Rarest-to-commonest gradient-mass ratio versus `a`, log-y.
+Theory: contrast `= R^a`, so doubling `a` squares the contrast. Anchor: `R` measured as the density
+dynamic range `lam_spread`; the contrast points measured as the gradient-mass ratio in the weighted
+arms (2.77 at `a = 0.5`, 7.68 at `a = 1.0`).
+`⟨THIS NEEDS TO BE MEASURED⟩`
+
+**Figure 6. The cost duality.** Effective sample size and over-draw versus `a` on shared axes.
+Theory: matched mass reaches one committed diet by two mechanisms whose costs are orthogonal,
+weighting pays in `ESS`, thinning pays in `χ`. Anchor: measured `ess` in the weighted arms
+(0.89, 0.67) and `χ = 1/thin_accept` in the thinned arms.
+`⟨THIS NEEDS TO BE MEASURED⟩`
+
+### 4.3 What each figure needs from the logs
+
+Gathered once the sweep is complete, per run, at matched post-gate age (settled): `s`, `lam_spread`
+with `lam_q10 / lam_median / lam_q90`, `hit_frac`, `thin_accept`, `ess`, `w_mean`, `grad_per_step`,
+`p_ref`, `thin_prof_err`, and the config `M / a / H / oversample`. The matched-mass reshaping
+(committed versus pool `p̂` distribution) is deferred: it needs the two histograms behind
+`thin_prof_err` logged, a small trainer change, not part of this pull.
 
 ---
 
