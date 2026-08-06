@@ -1156,9 +1156,52 @@ per-cell 0.125) did not, which is why it was re-run at 8×.
 run settles. `⟨measure⟩` cells fill in as the runs finish (rev10 / rev11 / rev12-hi first, then
 rev12-lo at 8×, then rev13). `†` admitted at `a ≈ 0.5` via the pre-`rev11` hardcode.
 
+### 4.5 A closed form for the presentation multiplier
+
+The multiplier `f` (the oversample) obeys `f = max(f_fill, f_feed)`, the larger of a fill floor and a
+feed floor.
+
+**Fill (closed, exact).** Present `fN` points and retain each independently with probability `r(ξ)`.
+Marginalising over `ξ ∼ μ`, the retained count is *exactly* `Z ∼ Binomial(fN, 1/χ)`, `χ = 1/E_μ[r]`;
+the density-spread contribution `Var_μ(r)` cancels against the Poisson-binomial term, so there is no
+correction from the heaviness of the tail. Requiring `P(Z < N) ≤ ε` per block, over `K` independent
+blocks,
+
+```
+f_fill = χ · ( 1 + z_{ε/K} · sqrt( (χ − 1) / (χ N) ) ),
+```
+
+or, for small `ε`, the exact Chernoff form `f·D(1/f ‖ 1/χ) = ln(K/ε)/N` with `D` the binary relative
+entropy. `χ = 1/thin_accept` is measured per run (size against its worst value in the settled
+window); `K` enters only through `ln(K/ε)`. This floor is complete.
+
+**Feed (scaling law, one exponent pending).** Bank health requires the rarest resolved cells to keep
+re-inducting, `φ_c · r_⋆ · T ≳ g`, where `r_⋆ = ς · M · μ(B(a_⋆, s))` is the relative arrival mass at
+a near-minimal-intensity (low-density) cell. With `μ(B(a_⋆,s)) ∝ p_⋆ · s^{d_⋆}` and `s ∝ M^{−1/δ}`,
+
+```
+r_⋆ ∝ p_⋆ · M^{1 − d_⋆/δ},        f_feed = φ_c · M / (KN) ∝ ln M · M^{d_⋆/δ − 1}.
+```
+
+`d_⋆` is the local mass exponent at the occupied lower-decile sites, fixed by regressing
+`[ln q_{0.1}(λ) − ln φ − ln M]` on `ln s_M` across the sweep (per-`M` data: `s_M`, `φ`, the `λ`
+deciles, `|Q|/M`). The measured stability bracket already forces `d_⋆ > 4.4`; the point estimate is
+`d_⋆ ≈ 6`, giving `f_feed ∝ ln M · M^{≈0.5}`, milder than a linear `M/4096`. `⟨d_⋆ to be regressed⟩`.
+
+**Resolution of the `δ ≈ 4` vs `d ≈ 9` gap** (Table 1, §6). The self-tuned radius exponent
+`s ∝ M^{−1/δ}` with `δ ≈ 4` is the *typical local mass dimension at occupied sites*, not the
+box-counting dimension `d ≈ 9` of the support: the radius balance holds the captured mass fraction
+roughly constant, which forces `s ∝ M^{−1/d_typ}` with `d_typ ≈ δ`. Low-density sites carry thinner
+mass, so their local dimension `d_⋆ > d_typ`, and it is precisely `d_⋆ > δ` that makes the feed floor
+grow with `M` at all; were the support tiled at its box dimension the floor would be `M`-independent.
+Local dimension in the sense of Rossi (2013).
+
 ---
 
 ### References
+
+Rossi. *Local dimensions of measures on infinitely generated self-affine sets.* arXiv:1302.1435, 2013.
+
 
 Arthur and Vassilvitskii. *k-means++: The Advantages of Careful Seeding.* SODA 2007.
 
