@@ -1046,7 +1046,7 @@ assigns, and the fixed constants are noted below.
 <tr><td>thinned_hi (rev11)</td><td>thinned</td><td>8,192</td><td>1.0</td><td>721</td><td>250</td><td>550</td><td>300</td><td>2</td><td>6×</td></tr>
 <tr><td>thinned_lo (16k, rev13)</td><td>thinned</td><td>16,384</td><td>0.5</td><td>1,442</td><td>500</td><td>1,100</td><td>600</td><td>2</td><td>~4×</td></tr>
 <tr><td>thinned_hi (16k, rev13)</td><td>thinned</td><td>16,384</td><td>1.0</td><td>1,442</td><td>500</td><td>1,100</td><td>600</td><td>2</td><td>~6×</td></tr>
-<tr><td>thinned_lo (32k, rev12)</td><td>thinned</td><td>32,768</td><td>0.5</td><td>2,884</td><td>1,000</td><td>2,200</td><td>1,200</td><td>3</td><td>~4×</td></tr>
+<tr><td>thinned_lo (32k, rev12)</td><td>thinned</td><td>32,768</td><td>0.5</td><td>2,884</td><td>1,000</td><td>2,200</td><td>1,200</td><td>3</td><td>8×</td></tr>
 <tr><td>thinned_hi (32k, rev12)</td><td>thinned</td><td>32,768</td><td>1.0</td><td>2,884</td><td>1,000</td><td>2,200</td><td>1,200</td><td>3</td><td>~8×</td></tr>
 </tbody>
 </table>
