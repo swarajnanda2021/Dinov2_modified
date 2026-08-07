@@ -16,6 +16,25 @@ z(x)  →  s = R·z  →  λ̂ = S/E = p/g  →  p̂ = Σ λ̂·K(d/R)  →  w =
 
 ---
 
+### How to read this alongside `technique.md`
+
+The two documents share a spine. `technique.md` is the formal method; this is where each part is
+unpacked in plain terms. If you are reading the method deeply, here is the map.
+
+| In `technique.md` | Unpacked here |
+|---|---|
+| §3.1 to 3.2 · overview and signatures | §01 to §03 |
+| §3.3 to 3.4 · the distance bank and why it fails | §04 to §05 |
+| §3.5 · the counted-coverage bank | §06 to §09, and the algorithm |
+| §3.6 · modulating the objective | §10 |
+| §3.9 · rebalancing by thinning | §11 to §12 |
+| §3.7 to 3.8 · measured constants and limits | §08, §13, §15 |
+| §3.10 · free and derived hyperparameters | Scaling the bank |
+| §4.4 to 4.5 · oversample and its floors | Sizing the over-draw |
+| §4.1 to 4.3 · the planned figures | What the sweep will show |
+
+---
+
 ## 01 · The problem: a stream you cannot curate in advance
 
 A whole-slide image is labelled once, at the slide level, but consumed as thousands of tiles.
@@ -407,7 +426,7 @@ fail silently. Each signal guards one.
 |---|---|---|---|
 | `lam_spread` | density contrast, `q90/q10` of the hit-rates | **> 2.5** | the estimator going flat, losing rare-vs-common contrast, so the weight flattens and rebalancing becomes a no-op |
 | `hit_frac` | share of tiles landing on an existing point | **> 0.5** | starved counters, tallies resting on too few observations |
-| `turn_ratio` | point lifetime ÷ `n_eff` (~721) | **> 2** | eviction before a rate settles, so every density reads through counting noise |
+| `turn_ratio` | point lifetime ÷ `n_eff` (windows lived) | **> 2** | eviction before a rate settles, so every density reads through counting noise |
 | `underresolved` | stored-point spacing vs `L` | **0** | a memory budget coarser than the structure; the cure is more points |
 | `thin_accept` | thinned: `N ÷ pool ≈ 1/χ` | steady, above fill line | a stale ceiling; a *decaying* rate is the miscalibration alarm |
 | `thin_prof_err` | thinned: binned L1 of committed `p̂` vs target `a·μ` | low | admissions drifting off target, or the top-up fallback firing too often |
@@ -416,22 +435,119 @@ fail silently. Each signal guards one.
 `lam_spread` is the master signal, a *ratio*, so it reads shape not scale, and it is the one to
 watch above the others: when it collapses toward 1, the whole rebalancing flatlines.
 
+**Reading `turn_ratio`.** It counts how many memory windows a stored point survives before it is
+evicted. A point needs about one full window just to earn a settled hit-rate, so below roughly one it
+is thrown out before its number ever means anything, and the `argmin` that picks eviction victims
+starts choosing on noise. Two is the comfortable floor: one window to settle, one to be trusted. The
+thinned arms run below it on purpose, since finer and faster-fed banks turn over quicker in step
+units, which is why `lam_spread`, not `turn_ratio`, is the reading that says whether the estimator is
+still sharp.
+
 *Live snapshot* (thinned `a = 0.5`, iter 93k): `lam_spread 3.1`, `hit_frac 0.90`, `turn_ratio 2.6`,
 `underresolved 0`, `thin_accept 0.49`, `thin_prof_err 0.14`, all in range. The `a = 1.0` arm reads
 `turn_ratio 1.0` instead: its 6× pool feeds the bank faster, so entries graduate and turn over more
 often in step units. That is a feed-rate effect on the units, not instability, and the density
 signals stay healthy.
 
+## Scaling the bank: two free knobs, the rest co-scaled
+
+The bank carries a dozen named constants, but you only ever choose **two**. `M`, the number of
+stored points, sets the resolution: more points, smaller catchments, finer typicality. `a`, the tilt,
+sets how hard the diet leans into the tail. Everything else is *derived*, from `M`, from `a`, or from
+the data, and is pinned by one requirement: that the bank sit at the same operating point however
+fine you make it.
+
+What drives the derivation is the evidence each cell collects. A cell learns its hit-rate from the
+hits it gathers before they decay, about `(feed ÷ M) · halflife` of them. Quadruple `M` and every
+cell gets a quarter of the hits; a four-fold longer half-life hands them back, so `halflife` scales
+with `M` (250, 500, 1000 across the 8k / 16k / 32k sweep, carrying `n_eff` from 721 to 2,884). The
+reserve and its residency scale with `M` from the other side: more cells to discover means more
+newborns on probation at once, and a proportionally larger waiting room to hold them until they prove
+themselves. Keep `(feed ÷ M) · halflife` and `reserve ÷ M` fixed and the per-cell variance and the
+graduation dynamics do not move as resolution climbs.
+
+One constant scales differently. Picking the single quietest cell out of `M` noisy estimates by
+`argmin` gets harder the more cells there are: it takes on the order of `2 ln M` corroborating counts
+to be sure, so the bar to graduate a newborn creeps up, two hits through 16k, three at 32k. That
+looks like a stricter gate, but the longer memory makes it a looser one: three hits over a
+four-fold-longer window is a *lower* sustained rate than two over the base window, so the extra hit
+is reachable, not exclusionary.
+
+The last derived knob is the over-draw, and it belongs to the next section: the tilt sets acceptance,
+and acceptance sets how much you must draw to fill a batch.
+
+> **Co-scaling is not a confound, it is the control.** Moving a derived constant in lockstep with the
+> free knob it depends on is exactly what holds the operating point still while the free knob moves. A
+> confound would be nudging something *independent* by accident. These are dependent by construction,
+> so the design space is genuinely two-dimensional, `(M, a)`, and the rest follows.
+
+One reading note falls out of this. Because turnover and `n_eff` both grow with `M`, `turn_ratio`
+lands near the same value at every resolution, and the finer thinned banks sit *below* the
+dashboard's `2` line by construction, not by decay. That is a units effect; `lam_spread` is the
+signal that actually says whether the estimator is still sharp. (technique.md §3.10, Table 2.)
+
+## Sizing the over-draw: the fill floor and the feed floor
+
+Thinning throws away most of what it draws, so the candidate pool has to be over-drawn. The
+multiplier that says by how much, the **oversample**, must clear two separate floors, and you take
+the larger.
+
+**The fill floor: draw enough to fill the batch.** Each candidate survives independently with
+probability about `1/χ` (`χ = 1/thin_accept`, the average draws per commit). So the survivor count in
+a pool of `f·N` is an exact coin-flip count, `Binomial(fN, 1/χ)`. The pleasant surprise is that the
+heaviness of the density tail, which you might expect to make that count swing wildly, *cancels* and
+adds no correction. The fill floor is then a clean closed form: `χ`, plus a few standard deviations
+of headroom so a batch almost never comes up short. This floor is fully settled.
+
+**The feed floor: draw enough to keep the bank fed.** This is the subtle one, and the one that bites.
+The bank is fed *only the pool you draw*. Draw too thin and the rarest resolved cells stop being
+re-visited often enough to hold their hit radius steady: `s` slides, the contrast `lam_spread` runs
+away instead of settling, and the estimator quietly comes apart. Not hypothetical, this is the
+negative control in Table 3, the 32k `a = 0.5` arm at `4×` (per-cell feed `0.125`), which never
+settled and was re-run at `8×`.
+
+The feed floor *grows with `M`*. Finer cells each catch thinner mass, so you must over-draw harder to
+keep them fed. How fast it grows turns on one exponent, the local mass dimension at the sparse cells,
+and pinning it needs a 32k arm that has fully settled. Until then it is bracketed, and the oversample
+is set by where runs actually hold: `3×` at 8k, `4 to 6×` at 16k, `8×` at 32k.
+
+> **oversample = max(fill floor, feed floor).** At coarse `M` the fill floor dominates and you draw
+> for the batch. At fine `M` the feed floor takes over and you draw for the bank. (technique.md §4.4,
+> §4.5.)
+
+## What the sweep will show: resolution and tilt laws
+
+The evaluation is six figures, and it splits cleanly along the two free knobs; reading them is
+reading each knob's fingerprint.
+
+**Resolution laws (vary `M`).** As the bank gets finer, the hit radius `s` shrinks as a power of `M`,
+and the slope of that power *is* an effective dimension of the data at the bank's scale (Figure 1).
+The contrast `lam_spread` should widen, because smaller catchments resolve sharper differences in
+local density (Figure 2). And the hit fraction falls, the standing price of finer cells (Figure 3).
+Together they say what buying resolution actually buys.
+
+**Tilt laws (vary `a`).** As the diet leans harder, acceptance drops and the over-draw `χ` climbs
+(Figure 4); the rarest-to-commonest gradient-mass contrast grows as `R^a`, so doubling the tilt
+squares the contrast (Figure 5); and the cost of reaching that diet shows up in two currencies
+depending on the road, effective sample size for weighting and over-draw for thinning, the same
+target paid for two ways (Figure 6).
+
+Each figure pairs a predicted law with the measured log quantity that should land on it, and none is
+reported until its run points have settled onto it. (technique.md §4.1 to §4.3.)
+
 ## Where it stands: what the numbers say so far
 
 The mechanism behaves as designed in the live runs: acceptance is scale-invariant, effective sample
 size is exactly 1 under thinning against 0.67 to 0.89 under weighting, and the bank's health signals
-sit in range. The downstream picture is honest and still forming. On twelve slide-level MIL
+sit in range. The resolution sweep is filling in: the 8k thinned pair is complete, the 16k pair
+(rev13) and the 32k pair (rev12) are training toward settled statistics, and one deliberate
+below-feed-floor run stands as the negative control that shows what starving the bank looks like.
+The downstream picture is honest and still forming. On twelve slide-level MIL
 biomarker tasks, the two completed *weighted* arms land within ±3.5% of the untuned baseline, inside
 the split-to-split spread on essentially every task and with no consistent direction: neutral, not
-yet a win. The *thinned* arms are still training (93k and 70k of 125k steps) and have no downstream
-evaluation yet. What is shown here is that the estimator does the thing it claims to do; whether
-that reshaped diet improves the encoder is the open question the runs exist to answer.
+yet a win. The *thinned* arms have no downstream evaluation yet. What is shown here is that the
+estimator does the thing it claims to do, at every resolution it is asked to; whether that reshaped
+diet improves the encoder is the open question the runs exist to answer.
 
 ## 16 · Making it run: the engineering underneath
 
