@@ -253,6 +253,7 @@ def main():
     args.thin_oversample_factor  = 3.0    # thinned only: candidate pool = ceil(factor)*N; MUST exceed the
                                           #    measured chi or the step under-fills (launcher: 6 lo / 12 hi).
     args.thin_richardson_correct = False  # thinned only: debias p_hat via u*=2u_s-u_2s (off; probe is measure-only).
+    args.use_gpu_augmentation    = False  # opt-in for baselines: thinned raw-tile loader + GPU augmentation, no thinning.
 
     # ---- activation / representation head ----
     args.typicality_warmup_iters = 50000  # bank inert until here (late-fill; bc arms warm-start from a 50k ckpt).

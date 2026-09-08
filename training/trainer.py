@@ -218,6 +218,11 @@ def train_dinov2(args):
             "--balance_mode thinned requires --use_typicality_dampening True "
             "(thinned mode reuses the counted-coverage bank for the scout density)")
     print(f"Balance mode: {balance_mode}")
+    # --use_gpu_augmentation: a weighted/off baseline reuses the thinned raw-tile loader + GPU
+    # augmentation path (no scout/bank/thinning). No-op under thinned (which already does this).
+    use_gpu_aug = bool(getattr(args, 'use_gpu_augmentation', False)) and balance_mode != 'thinned'
+    if use_gpu_aug:
+        print("GPU augmentation (baseline): raw-tile loader + kornia GPU crops, no typicality machinery")
 
     # Augmentation configuration
     augmentation_free_mode = (args.global_views == 0)
@@ -351,7 +356,8 @@ def train_dinov2(args):
         # GPU-augments (kornia) ONLY the thinned survivors, so the 5/6 of the over-drawn pool that gets
         # discarded costs no augmentation. weighted/off keep the full CPU crop pipeline -> byte-identical.
         emit_scout=False,
-        scout_pool_mode=(getattr(args, 'balance_mode', 'weighted') == 'thinned'),
+        scout_pool_mode=(getattr(args, 'balance_mode', 'weighted') == 'thinned'
+                         or getattr(args, 'use_gpu_augmentation', False)),
     )
 
     train_loader = torch.utils.data.DataLoader(
@@ -823,11 +829,11 @@ def train_dinov2(args):
     # ---- thinned GPU augmentation (kornia): the loader emits raw uint8 tiles (scout_pool_mode); the
     # scout is the NORMALIZED raw (fed to the bank), and ONLY the committed survivors are augmented,
     # on-GPU -- so the 5/6 of the over-drawn pool discarded by thinning is never augmented. weighted/off
-    # never construct this (they keep the exact CPU crop pipeline). ----
+    # never construct this (they keep the exact CPU crop pipeline) unless --use_gpu_augmentation. ----
     gpu_augment = None
     _raw_mean = torch.tensor([0.6816, 0.5640, 0.7232]).view(1, 3, 1, 1)  # PATHOLOGY norm (NOT ImageNet);
     _raw_std = torch.tensor([0.1617, 0.1714, 0.1389]).view(1, 3, 1, 1)   #   matches the dataloader default.
-    if balance_mode == 'thinned':
+    if balance_mode == 'thinned' or use_gpu_aug:
         # grid_sample augmenter: ~-386 ms/step vs the kornia path, distribution-matched with exact
         # torchvision HSV hue. Different RNG stream than kornia (the thinned arm was never pixel-
         # comparable to weighted anyway); adopted deliberately for the speed.
@@ -915,6 +921,13 @@ def train_dinov2(args):
                 batch_data = next(data_iterator)
                 dataset_position = dataset_passes * loader_len
                 print(f"Starting pass {dataset_passes + 1} at iteration {current_iteration}")
+            if use_gpu_aug:
+                # --use_gpu_augmentation: the loader emitted ONE raw Resize(224) uint8 tile per sample
+                # (scout_pool_mode). Commit all N and GPU-augment them -> [g1, g2, l1..lL] normalized
+                # on GPU -- the same transform sequence as the thinned pre-warmup path below (raw
+                # uint8 -> gpu_augment, which normalizes internally). No over-draw, no scout, no bank,
+                # no thin_* telemetry (thin_active stays at its baseline 0).
+                batch_data = gpu_augment(batch_data[0].to('cuda', non_blocking=True))
         else:
             # ===== THINNED (raw-carry + GPU augmentation, section 3.9) =====
             # The loader yields ONE raw Resize(224) uint8 tile per sample (scout_pool_mode). We

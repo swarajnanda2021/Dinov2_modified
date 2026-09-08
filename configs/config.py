@@ -224,6 +224,9 @@ def get_args_parser():
                         help='Thinned mode: candidate pool = ceil(factor) consecutive loader '
                              'batches concatenated (~factor*N tiles) so N survivors can be drawn '
                              'after thinning; must sit comfortably above the realized chi.')
+    parser.add_argument('--use_gpu_augmentation', default=False, type=utils.bool_flag,
+                        help='baseline-only: raw-tile loader + kornia GPU augmentation (the '
+                             'thinned-mode data path) without any thinning/typicality machinery')
 
     # ========== Adversarial mask-as-student-view augmentation parameters ==========
     # Note: --num_masks, --mask_model_arch, --mask_checkpoint are already declared
