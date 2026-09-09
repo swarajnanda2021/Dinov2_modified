@@ -190,8 +190,8 @@ def main():
     args.local_crop_size = 96
 
     # Semantic iBOT
-    args.use_semantic_ibot = True
-    args.use_semantic_prototypes = True
+    args.use_semantic_ibot = False
+    args.use_semantic_prototypes = False
     args.semantic_ibot_weight = 1.0
     args.semantic_clustering_weight = 1.0
     args.semantic_masks_per_iteration = 1
