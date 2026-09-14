@@ -632,7 +632,10 @@ def train_dinov2(args):
         print("Using bf16 end-to-end (no GradScaler). H100-appropriate; "
               "avoids fp16 NaN issues flagged by Virchow2G.")
     else:
-        fp16_scaler = torch.cuda.amp.GradScaler() if args.use_fp16 else None
+        # bf16 autocast needs no loss scaling; a default GradScaler doubles its scale
+        # every 2000 clean steps unbounded under bf16 and overflows fp32 near it~190k
+        # (observed scale 2^111 at 190k iters, then NaN collapse). Disabled.
+        fp16_scaler = None
         bf16_mode = False
 
     # ============ Create optimizers ============
