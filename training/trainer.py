@@ -576,6 +576,12 @@ def train_dinov2(args):
     teacher_without_ddp.classhead.load_state_dict(student.module.classhead.state_dict())
     teacher_without_ddp.patchhead.load_state_dict(student.module.patchhead.state_dict())
     teacher.requires_grad_(False)
+    # The teacher is an EMA target and must be deterministic: eval mode disables stochastic
+    # depth (DropPath gates on self.training; the teacher is a deepcopy of a student built
+    # with drop_path_rate > 0). Nothing below calls .train() on it. Per-block torch.compile
+    # recompiles the teacher blocks once for the eval-mode guard.
+    teacher.eval()
+    assert not teacher.module.backbone.training, "teacher must stay in eval mode"
 
     # ============ Initialize losses ============
     # teacher_temp=0.04 fixed is a Virchow2G ViT-G scaling-package choice that
