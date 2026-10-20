@@ -303,6 +303,16 @@ def main():
     args.weight_decay_end = 0.4
     args.lr_decay_rate = 1.0    # DINOv2 ssl_default layerwise_decay=1.0 for ViT-L (was 0.9)
 
+    # Continual learning (DINOv3 constant schedules). OFF by default: the cosine recipe above is
+    # byte-unchanged. Flip args.continual to True for a horizon-free run; the _continual values
+    # replace the cosine endpoints only in that mode.
+    args.continual = False
+    args.lr_continual = None                 # None -> args.lr
+    args.warmup_iterations_continual = None  # None -> args.warmup_iterations (fresh runs only)
+    args.weight_decay_continual = 0.04       # DINOv3 7B: constant 0.04, no 0.04->0.4 cosine
+    args.momentum_teacher_continual = 0.994  # DINOv3 7B pretrain: constant 0.994
+    args.rewarm_iters_continual = 10_000     # LR ramp when resuming a cosine-trained checkpoint
+
     # Training setup
     args.use_fp16 = True
     args.clip_grad = 3.0

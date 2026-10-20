@@ -282,6 +282,33 @@ def get_args_parser():
                              '(on top of layer-wise decay). DINOv2 ssl_default_config uses '
                              '0.2; set 1.0 to disable. Rationale: MoCo v3 patch-projection '
                              'stability.')
+    # ---- continual learning: DINOv3 constant schedules (horizon-free) ----
+    # Replaces the cosine schedules by constants after warmup, as in the DINOv3 ViT-7B recipe
+    # (dinov3/configs/train/dinov3_vit7b16_pretrain.yaml): LR linear warmup then constant,
+    # weight decay constant, teacher EMA momentum constant; the teacher temperature warmup is
+    # unchanged (already horizon-free). --total_iterations then only decides when to stop, and
+    # the loader no longer halts after a fixed number of passes. Every value below carries the
+    # _continual tag and applies only when --continual is True.
+    parser.add_argument('--continual', default=False, type=utils.bool_flag,
+                        help='Continual-learning mode: constant LR / weight decay / teacher momentum '
+                             'after warmup (DINOv3 recipe); no fixed horizon.')
+    parser.add_argument('--lr_continual', default=None, type=float,
+                        help='Base LR of the constant plateau at a global batch of 1024 (scaled by '
+                             'sqrt(B/1024) like --lr). Default None: use --lr.')
+    parser.add_argument('--warmup_iterations_continual', default=None, type=int,
+                        help='Linear LR warmup length from 0 for a FRESH continual run. Default '
+                             'None: use --warmup_iterations.')
+    parser.add_argument('--weight_decay_continual', default=0.04, type=float,
+                        help='Constant weight decay (DINOv3 ViT-7B: 0.04 in every stage).')
+    parser.add_argument('--momentum_teacher_continual', default=0.994, type=float,
+                        help='Constant teacher EMA momentum (DINOv3 ViT-7B pretrain: 0.994; '
+                             'Gram and high-res stages: 0.999).')
+    parser.add_argument('--rewarm_iters_continual', default=10000, type=int,
+                        help='When resuming a checkpoint that was trained under the cosine '
+                             'schedules, ramp the LR linearly from its value at the checkpoint to the '
+                             'constant plateau over this many iterations (DINOv3 high-res adaptation '
+                             'ramps over 10k). Weight decay and momentum switch to their constants '
+                             'at once. 0 = no ramp.')
     # ---- speed (opt-in; both default OFF so nothing changes unless asked) ----
     parser.add_argument('--compile_blocks', default=False, type=utils.bool_flag,
                         help="torch.compile each TransformerBlock (NOT the whole backbone: the "

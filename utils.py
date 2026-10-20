@@ -342,6 +342,34 @@ def cosine_scheduler(base_value, final_value, total_iters, warmup_iters=0, start
     assert len(schedule) == total_iters
     return schedule
 
+class ConstantSchedule(object):
+    """Horizon-free schedule (DINOv3 recipe): an optional linear ramp, then a constant held
+    for ever. Indexing past the ramp returns the constant, so raising the iteration budget
+    on resume changes no value at the current step.
+
+    ramp_start / ramp_iters: value ramps linearly from ramp_start to `value` over
+    ramp_iters steps beginning at ramp_from (iteration index); zero ramp_iters means the
+    constant applies everywhere. Used for the LR warmup from 0 at a fresh start, and for the
+    re-warm from a cosine-schedule checkpoint's current LR on a continual resume.
+    """
+    def __init__(self, value, ramp_iters=0, ramp_start=0.0, ramp_from=0):
+        self.value = float(value)
+        self.ramp_iters = int(ramp_iters)
+        self.ramp_start = float(ramp_start)
+        self.ramp_from = int(ramp_from)
+
+    def __getitem__(self, it):
+        if self.ramp_iters <= 0 or it >= self.ramp_from + self.ramp_iters:
+            return self.value
+        if it < self.ramp_from:
+            return self.ramp_start
+        t = (it - self.ramp_from) / float(self.ramp_iters)
+        return self.ramp_start + t * (self.value - self.ramp_start)
+
+    def __len__(self):
+        return self.ramp_from + self.ramp_iters
+
+
 def bool_flag(s):
     """
     Parse boolean arguments from the command line.

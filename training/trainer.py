@@ -693,13 +693,28 @@ def train_dinov2(args):
         print(f"Created R optimizer (lr={args.typicality_repr_lr}, no weight decay)")
 
     # ============ Create schedulers ============
-    student_lr_schedule = utils.cosine_scheduler(
-        base_value=args.lr * math.sqrt(args.batch_size_per_gpu * utils.get_world_size() / 1024.0),
-        final_value=args.min_lr,
-        total_iters=args.total_iterations,
-        warmup_iters=args.warmup_iterations,
-        start_warmup_value=0
-    )
+    continual = bool(getattr(args, 'continual', False))
+    _lr_scale = math.sqrt(args.batch_size_per_gpu * utils.get_world_size() / 1024.0)
+    if continual:
+        # DINOv3 constant schedules (horizon-free). The LR ramp for a FRESH run is the linear
+        # warmup from 0; on a resume from a cosine-trained checkpoint it is re-targeted below,
+        # after the optimizer state is loaded, to start from the checkpoint's own LR.
+        lr_plateau = (args.lr if args.lr_continual is None else args.lr_continual) * _lr_scale
+        warmup_c = (args.warmup_iterations if args.warmup_iterations_continual is None
+                    else args.warmup_iterations_continual)
+        student_lr_schedule = utils.ConstantSchedule(lr_plateau, ramp_iters=warmup_c,
+                                                     ramp_start=0.0, ramp_from=0)
+        print(f"[continual] LR: linear warmup {warmup_c} iters -> constant {lr_plateau:.3e}; "
+              f"weight decay constant {args.weight_decay_continual}; teacher momentum constant "
+              f"{args.momentum_teacher_continual}; no horizon (--total_iterations is the stop only)")
+    else:
+        student_lr_schedule = utils.cosine_scheduler(
+            base_value=args.lr * _lr_scale,
+            final_value=args.min_lr,
+            total_iters=args.total_iterations,
+            warmup_iters=args.warmup_iterations,
+            start_warmup_value=0
+        )
 
     proto_lr_schedule = None
     if args.use_prototype_clustering:
@@ -711,21 +726,25 @@ def train_dinov2(args):
             start_warmup_value=0
         )
 
-    wd_schedule = utils.cosine_scheduler(
-        base_value=args.weight_decay,
-        final_value=args.weight_decay_end,
-        total_iters=args.total_iterations,
-        warmup_iters=args.warmup_iterations,
-        start_warmup_value=args.weight_decay
-    )
+    if continual:
+        wd_schedule = utils.ConstantSchedule(args.weight_decay_continual)
+        momentum_schedule = utils.ConstantSchedule(args.momentum_teacher_continual)
+    else:
+        wd_schedule = utils.cosine_scheduler(
+            base_value=args.weight_decay,
+            final_value=args.weight_decay_end,
+            total_iters=args.total_iterations,
+            warmup_iters=args.warmup_iterations,
+            start_warmup_value=args.weight_decay
+        )
 
-    momentum_schedule = utils.cosine_scheduler(
-        base_value=args.momentum_teacher,
-        final_value=1.0,
-        total_iters=args.total_iterations,
-        warmup_iters=0,
-        start_warmup_value=args.momentum_teacher
-    )
+        momentum_schedule = utils.cosine_scheduler(
+            base_value=args.momentum_teacher,
+            final_value=1.0,
+            total_iters=args.total_iterations,
+            warmup_iters=0,
+            start_warmup_value=args.momentum_teacher
+        )
 
     # ============ Load checkpoint ============
     to_restore = {"iteration": 0, "dataset_position": 0}
@@ -795,6 +814,44 @@ def train_dinov2(args):
             print(f"WARNING: Checkpoint found but no RNG state. Re-seeding.")
         utils.fix_random_seeds(args.seed + utils.get_rank())
 
+    # ============ Continual mode: LR ramp on resume ============
+    # Three resume cases once --continual is on:
+    #   (a) the checkpoint carries a ramp record (written by a continual run): restore it, so a
+    #       resume in the middle of a re-warm continues the same ramp;
+    #   (b) the checkpoint was trained under the cosine schedules (stored args.continual is
+    #       False or absent): re-warm the LR linearly from the LR the optimizer holds at that
+    #       step (exact: restored with the optimizer state) to the plateau over
+    #       --rewarm_iters_continual, as DINOv3's high-res stage ramps over 10k iterations.
+    #       Weight decay and momentum switch to their constants at once;
+    #   (c) fresh start: the warmup ramp from 0 built above applies.
+    continual_lr_ramp = None   # (ramp_from, ramp_start, ramp_iters) persisted in the checkpoint
+    if continual and current_iteration > 0 and loaded_checkpoint is not None:
+        if loaded_checkpoint.get('continual_lr_ramp') is not None:
+            ramp_from, ramp_start, ramp_iters = loaded_checkpoint['continual_lr_ramp']
+            continual_lr_ramp = (int(ramp_from), float(ramp_start), int(ramp_iters))
+            print(f"[continual] restored LR ramp: {ramp_start:.3e} -> {lr_plateau:.3e} over "
+                  f"{ramp_iters} iters from iter {ramp_from}")
+        else:
+            ck_args = loaded_checkpoint.get('args')
+            was_cosine = not bool(getattr(ck_args, 'continual', False))
+            if was_cosine:
+                pg0 = optimizer_student.param_groups[0]
+                lr_at_ckpt = float(pg0['lr']) / float(pg0.get('lr_multiplier', 1.0) or 1.0)
+                n_rewarm = int(args.rewarm_iters_continual)
+                if n_rewarm > 0:
+                    continual_lr_ramp = (int(current_iteration), lr_at_ckpt, n_rewarm)
+                    print(f"[continual] resumed a cosine-trained checkpoint at iter {current_iteration}: "
+                          f"LR re-warm {lr_at_ckpt:.3e} -> {lr_plateau:.3e} over {n_rewarm} iters; "
+                          f"weight decay -> {args.weight_decay_continual}, momentum -> "
+                          f"{args.momentum_teacher_continual} at once")
+                else:
+                    print(f"[continual] resumed a cosine-trained checkpoint at iter {current_iteration}: "
+                          f"no re-warm (--rewarm_iters_continual 0), LR jumps to {lr_plateau:.3e}")
+        if continual_lr_ramp is not None:
+            student_lr_schedule = utils.ConstantSchedule(
+                lr_plateau, ramp_iters=continual_lr_ramp[2],
+                ramp_start=continual_lr_ramp[1], ramp_from=continual_lr_ramp[0])
+
     # ============ Verify checkpoint ============
     if utils.is_main_process() and current_iteration > 0:
         print(f"\n=== Checkpoint Loaded at Iteration {current_iteration} ===")
@@ -824,7 +881,9 @@ def train_dinov2(args):
 
     loader_len = len(train_loader) if len(train_loader) > 0 else 1
     dataset_passes = dataset_position // loader_len
-    max_passes = 5
+    # Continual mode has no horizon: the loader restarts for as long as --total_iterations
+    # allows. The cosine recipe keeps its historical 5-pass stop.
+    max_passes = (1 << 30) if continual else 5
 
     # ---- stream-thinning gate state (section 3.9; thinned mode only) ----
     # w_max is now the ANALYTIC bound (c_frac*p_ref)^(-a) computed each step (see the acceptance
@@ -1864,6 +1923,9 @@ def train_dinov2(args):
                 'numpy_rng_state': np.random.get_state(),
                 'random_rng_state': random.getstate(),
             }
+            if continual:
+                # (ramp_from, ramp_start, ramp_iters) or None: lets a resume continue a re-warm.
+                save_dict['continual_lr_ramp'] = continual_lr_ramp
 
             if args.use_prototype_clustering:
                 if prototype_bank is not None:
