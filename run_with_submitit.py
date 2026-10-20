@@ -311,7 +311,6 @@ def main():
     args.warmup_iterations_continual = None  # None -> args.warmup_iterations (fresh runs only)
     args.weight_decay_continual = 0.04       # DINOv3 7B: constant 0.04, no 0.04->0.4 cosine
     args.momentum_teacher_continual = 0.994  # DINOv3 7B pretrain: constant 0.994
-    args.rewarm_iters_continual = 10_000     # LR ramp when resuming a cosine-trained checkpoint
 
     # Training setup
     args.use_fp16 = True

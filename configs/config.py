@@ -303,12 +303,6 @@ def get_args_parser():
     parser.add_argument('--momentum_teacher_continual', default=0.994, type=float,
                         help='Constant teacher EMA momentum (DINOv3 ViT-7B pretrain: 0.994; '
                              'Gram and high-res stages: 0.999).')
-    parser.add_argument('--rewarm_iters_continual', default=10000, type=int,
-                        help='When resuming a checkpoint that was trained under the cosine '
-                             'schedules, ramp the LR linearly from its value at the checkpoint to the '
-                             'constant plateau over this many iterations (DINOv3 high-res adaptation '
-                             'ramps over 10k). Weight decay and momentum switch to their constants '
-                             'at once. 0 = no ramp.')
     # ---- speed (opt-in; both default OFF so nothing changes unless asked) ----
     parser.add_argument('--compile_blocks', default=False, type=utils.bool_flag,
                         help="torch.compile each TransformerBlock (NOT the whole backbone: the "
