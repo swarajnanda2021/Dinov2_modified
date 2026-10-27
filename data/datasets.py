@@ -298,7 +298,13 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         rng = random.Random((self.seed * 1000003) ^ (gid * 9973) ^ (epoch * 31))
         rng.shuffle(my_zips)
 
-        skip_per_worker = self._resume_global // max(total, 1)
+        # Apply the resume fast-forward ONLY on this worker's first pass (epoch 0). The proportional
+        # wrapper re-enters __iter__ on every sub-dataset restart ("... exhausted, restarting"), and
+        # _resume_global persists, so without this gate the full skip was re-applied on every restart:
+        # the stream never advanced past the resume prefix and churned until the NCCL watchdog
+        # aborted. persistent_workers=True keeps _epoch incrementing, so epoch>0 restarts skip 0.
+        # Preserves exact, deterministic resume (skip once to the true position); no image decode.
+        skip_per_worker = (self._resume_global // max(total, 1)) if epoch == 0 else 0
         # Wrap the resume skip within one pass of this worker's shard, so it can never skip the
         # whole shard and yield nothing (which, in the multi-dataset wrapper, raises StopIteration
         # out of the generator -> a PEP-479 RuntimeError that kills the worker on resume).

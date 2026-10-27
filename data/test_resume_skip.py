@@ -109,6 +109,32 @@ def test_resume_skip_wraps_within_pass():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_resume_skip_applies_once_per_worker():
+    """REGRESSION: the resume skip must apply on a worker's FIRST pass only. The proportional
+    wrapper re-enters __iter__ on every sub-dataset restart while _resume_global persists; an
+    ungated skip re-applied the whole fast-forward on each restart, so the stream never advanced
+    past the resume prefix (observed as a run that churned at the resume iteration until the
+    NCCL watchdog killed it). The second pass over the same dataset object must emit the full
+    shard, and a resume past the shard end must still leave the restart intact."""
+    tmp = tempfile.mkdtemp(prefix='resume_once_')
+    try:
+        zips, colours = _make_shards(tmp, 5, 20)
+        total = len(colours)
+        full, _ = _run(zips, 0, total)
+
+        ds = _bare_dataset(zips, 30, total)
+        first = list(iter(ds))
+        assert first == full[30:], "first pass must apply the resume skip exactly once"
+        second = list(iter(ds))
+        assert len(second) == total, \
+            f"second pass emitted {len(second)}/{total}: the resume skip was re-applied on restart"
+        assert set(second) == set(full), "second pass must cover the whole shard"
+        third = list(iter(ds))
+        assert len(third) == total, "every later pass must also be a full pass"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _bare_wrapper(datasets, names, per_dataset):
     w = D.ProportionalMultiDatasetWrapper.__new__(D.ProportionalMultiDatasetWrapper)
     w.datasets = list(datasets)
