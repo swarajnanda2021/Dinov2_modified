@@ -224,6 +224,26 @@ def get_args_parser():
                         help='Thinned mode: candidate pool = ceil(factor) consecutive loader '
                              'batches concatenated (~factor*N tiles) so N survivors can be drawn '
                              'after thinning; must sit comfortably above the realized chi.')
+    # ---- v2 keep rule (thinned mode, gate open): quantile threshold c, model-driven pool size f ----
+    parser.add_argument('--keep_rule', default='v1', type=str, choices=['v1', 'v2'],
+                        help='Thinned-mode keep rule. v1 (default): q = (1 + p_hat/c)^-a with '
+                             'c = c_frac*p_ref and a fixed pool of ceil(--thin_oversample_factor) '
+                             'batches (unchanged). v2: c = the u0-quantile of the GATHERED pool '
+                             'p_hat; q = 1 for p_hat <= c and (c/p_hat)^a above; the pool size f '
+                             'follows the mean keep chance; the scout runs without stochastic '
+                             'depth, in chunks of N.')
+    parser.add_argument('--keep_u0', default=0.05, type=float,
+                        help='v2: share of the gathered pool kept for sure, 0 < u0 < 1. Sets '
+                             'c = u0-quantile of p_hat and the upper bound 1/u0 on f.')
+    parser.add_argument('--keep_m_ema', default=0.99, type=float,
+                        help='v2: EMA decay of the mean keep chance m that drives f. The first v2 '
+                             'step sets m_ema = m.')
+    parser.add_argument('--keep_f_margin', default=1.1, type=float,
+                        help='v2: f_next = min(max(margin / m_ema, 1), cap); n_draws = ceil(f_next). '
+                             'margin > 1 keeps the expected accepted count above N.')
+    parser.add_argument('--keep_f_max', default=0.0, type=float,
+                        help='v2: extra cap on f. cap = 1/u0 when <= 0 (default), else '
+                             'min(1/u0, keep_f_max). Set it from the B1 loader rate.')
     parser.add_argument('--use_gpu_augmentation', default=False, type=utils.bool_flag,
                         help='baseline-only: raw-tile loader + kornia GPU augmentation (the '
                              'thinned-mode data path) without any thinning/typicality machinery')

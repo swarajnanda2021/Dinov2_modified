@@ -45,6 +45,7 @@ from typicality import RepresentativePrototypes, TypicalityScorer, CountedCovera
 # GPU: full state_dict torch.equal every step, matured bank, 40 steps x 3 shape configs); it only
 # removes the per-row cdist/.item() launches in _update (~40k device syncs/step at B=6144).
 from typicality.counted_coverage_bank_fast import FastCountedCoverageBank
+from typicality.keep_rule_v2 import keep_chance_v2, f_update_v2, f_cap_v2
 
 
 def _gather_and_compute_weights(patch_tokens, mask, masks_weight=None):
@@ -124,6 +125,27 @@ def _assert_bank_synced(bank, tag=""):
         ok = bool(torch.allclose(lo, hi))
         print(f"[typicality bank sync{tag}] cross-rank identical: {ok} "
               f"(fp_min={lo.tolist()}, fp_max={hi.tolist()})")
+
+
+def _sync_n_draws(n_draws, check=False, tag=""):
+    """Cross-rank agreement on the next pool size (keep_rule v2). Every rank computes n_draws
+    from the same gathered values, so the values agree when the reduction is deterministic.
+    MAX makes a disagreement safe: the largest value wins on every rank, so no rank draws fewer
+    batches than another (unequal local shapes would break _all_gather_signatures, which needs
+    equal shapes on every rank). With check=True a MIN all-reduce also detects a disagreement
+    and prints it (same 2000-step cadence as _assert_bank_synced). Identity on a single rank."""
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return int(n_draws)
+    t = torch.tensor([int(n_draws)], dtype=torch.int64, device='cuda')
+    hi = t.clone()
+    dist.all_reduce(hi, op=dist.ReduceOp.MAX)
+    if check:
+        lo = t.clone()
+        dist.all_reduce(lo, op=dist.ReduceOp.MIN)
+        if utils.is_main_process():
+            print(f"[thinned n_draws sync{tag}] cross-rank identical: "
+                  f"{int(lo.item()) == int(hi.item())} (min={int(lo.item())}, max={int(hi.item())})")
+    return int(hi.item())
 
 
 def _thin_profile_err(committed_phat, pool_phat, p_ref, a=0.5, c_frac=0.25, nbins=20):
@@ -218,6 +240,20 @@ def train_dinov2(args):
             "--balance_mode thinned requires --use_typicality_dampening True "
             "(thinned mode reuses the counted-coverage bank for the scout density)")
     print(f"Balance mode: {balance_mode}")
+    # ---- v2 keep rule (typicality/keep_rule_v2.py). v1 is the default and leaves every path below
+    # unchanged. v2: quantile threshold c, model-driven pool size f, eval-mode chunked scout. ----
+    keep_rule = getattr(args, 'keep_rule', 'v1')
+    if keep_rule == 'v2':
+        assert balance_mode == 'thinned', "--keep_rule v2 requires --balance_mode thinned"
+        assert 0.0 < float(args.keep_u0) < 1.0, f"--keep_u0 must be in (0, 1), got {args.keep_u0}"
+        assert 0.0 <= float(args.keep_m_ema) < 1.0, f"--keep_m_ema must be in [0, 1), got {args.keep_m_ema}"
+        assert float(args.keep_f_margin) > 0.0, f"--keep_f_margin must be > 0, got {args.keep_f_margin}"
+        assert float(args.keep_f_max) <= 0.0 or float(args.keep_f_max) >= 1.0, \
+            f"--keep_f_max must be <= 0 (no extra cap) or >= 1, got {args.keep_f_max}"
+        assert float(args.typicality_a) > 0.0, "--keep_rule v2 requires --typicality_a > 0"
+        print(f"Keep rule: v2 (a={args.typicality_a}, u0={args.keep_u0}, m_ema={args.keep_m_ema}, "
+              f"f_margin={args.keep_f_margin}, f cap={f_cap_v2(args.keep_u0, args.keep_f_max):.3g}); "
+              f"the thinned keep step does not read --typicality_c_frac")
     # --use_gpu_augmentation: a weighted/off baseline reuses the thinned raw-tile loader + GPU
     # augmentation path (no scout/bank/thinning). No-op under thinned (which already does this).
     use_gpu_aug = bool(getattr(args, 'use_gpu_augmentation', False)) and balance_mode != 'thinned'
@@ -864,6 +900,13 @@ def train_dinov2(args):
     thin_ready_streak = 0         # consecutive steps with bank_ready true (resets on any miss)
     thin_active = 0               # 0 = gate closed; 1 = acceptance live (immediate once gate opens)
     THIN_GATE_K = 5              # consecutive bank_ready steps required to open the gate
+    # ---- v2 keep rule state (model-driven f). v1 never reads these. ----
+    thin_m_ema = None                 # EMA of the mean keep chance m (None until the first v2 step)
+    thin_f_next = None                # f of the next step (None until the first v2 step)
+    thin_f_raw = None                 # uncapped f of the next step
+    thin_f_capped = False             # True when the cap bound f_next in this step
+    thin_n_draws_cur = max(1, math.ceil(args.thin_oversample_factor))   # pool size of the next v2 step
+    thin_n_draws_used = None          # pool size (batches) of the step in flight; None while the gate is closed
 
     # ---- thinned GPU augmentation (kornia): the loader emits raw uint8 tiles (scout_pool_mode); the
     # scout is the NORMALIZED raw (fed to the bank), and ONLY the committed survivors are augmented,
@@ -945,6 +988,8 @@ def train_dinov2(args):
         # ========== Get batch (weighted/off: one batch; thinned: over-drawn pool -> N) ==========
         thin_seen_val = None; thin_bias_val = None; thin_accept_val = None
         thin_committed_phat = None; thin_pool_phat = None
+        thin_c = None; thin_m = None; thin_sure = None; thin_zero = None; thin_c_guard = None
+        thin_refill = None
         if balance_mode != 'thinned':
             # ===== weighted / off: draw exactly one full-crop batch (UNCHANGED, byte-identical) =====
             try:
@@ -1008,7 +1053,12 @@ def train_dinov2(args):
                 # density a(p_hat)=w/w_max -> fixed to EXACTLY N. No "pull more" loop (that desynced
                 # NCCL); a rare under-fill is topped up from the SAME pool by highest-a rejects. w_max
                 # is the ANALYTIC bound (c_frac*p_ref)^(-a), recomputed each step (see below). =====
-                n_draws = max(1, math.ceil(args.thin_oversample_factor))
+                if keep_rule == 'v2':
+                    n_draws = max(1, int(thin_n_draws_cur))               # model-driven f (keep_rule_v2)
+                    thin_n_draws_used = n_draws                            # pool size of THIS step
+                    _n_next = thin_n_draws_cur                             # next pool size; updated below
+                else:
+                    n_draws = max(1, math.ceil(args.thin_oversample_factor))
                 pool_batches = []; _stop = False
                 for _ in range(n_draws):
                     b, _stop = _draw_one()
@@ -1029,33 +1079,48 @@ def train_dinov2(args):
                     thin_accept_val = 1.0
                 else:
                     thin_pool_phat = p_local
-                    # Acceptance tilt reads the SAME knobs as the weighted path
-                    # (args.typicality_a / args.typicality_c_frac), so the hi thinned arm now
-                    # admits at its configured a=1.0. Previously a_tilt was hardcoded to 0.5,
-                    # which made hi accept like lo and silently cancelled the thinned tilt sweep.
-                    # a_tilt drives BOTH w_local and the analytic w_max below, so the two stay
-                    # consistent by construction (change one -> both move).
-                    a_tilt, c_frac_tilt = args.typicality_a, args.typicality_c_frac
-                    w_local = TypicalityScorer.absolute_weights(
-                        p_local, typicality_bank.p_ref, a_tilt, c_frac_tilt)
-                    # Analytic w_max = sup_{p>=0} w = (c_frac*p_ref)^(-a): the exact upper bound of w,
-                    # attained as p_hat->0 (absolute_weights docstring: "1/c^a, no clipping required").
-                    # Recomputed EACH STEP so it tracks p_ref. Provably >= max(w) => a=w/w_max never
-                    # clamps => the admitted distribution is w_max-INVARIANT (w_max cancels in the
-                    # top-N selection); only the acceptance RATE changes. This replaces the frozen
-                    # 200-step running max, which stayed pinned to the gate-open p_ref scale while
-                    # p_ref grew ~10x, inflating the normalizer ~3.3x and starving accept to ~0.15
-                    # (85% under-fill + top-up, which breaks the Bernoulli matched-mass guarantee).
-                    # Because w depends only on p_hat/p_ref, accept is scale-invariant (~0.49) at every
-                    # p_ref, so there is no early-or-late under-fill.
-                    _pref_now = typicality_bank.p_ref
-                    _pref_now = float(_pref_now.item()) if torch.is_tensor(_pref_now) else float(_pref_now)
-                    wmax = (c_frac_tilt * max(_pref_now, 1e-8)) ** (-a_tilt)
-                    a = (w_local / max(wmax, 1e-8)).clamp(0.0, 1.0)
+                    if keep_rule == 'v2':
+                        # ----- v2 keep rule (typicality/keep_rule_v2.py). c = the u0-quantile of the
+                        # GATHERED p_hat, so every rank uses the same c and the same m. q = 1 at
+                        # p_hat <= c and (c/p_hat)^a above. The keep step below (Bernoulli, first N,
+                        # refill from the highest-q rejects) is shared with v1: the v2 keep chance
+                        # is named `a` like the v1 one. -----
+                        q_g, thin_c, thin_c_guard, thin_sure, thin_zero, thin_m = keep_chance_v2(
+                            p_gathered, float(args.typicality_a), float(args.keep_u0))
+                        a = _local_rows(q_g, pool_n)                       # this rank's keep chances [pool_n]
+                        thin_m_ema, thin_f_raw, thin_f_next, _n_next, thin_f_capped = f_update_v2(
+                            thin_m, thin_m_ema, float(args.keep_m_ema), float(args.keep_f_margin),
+                            float(args.keep_u0), float(args.keep_f_max))
+                    else:
+                        # ----- v1 keep rule (unchanged text, indented one level) -----
+                        # Acceptance tilt reads the SAME knobs as the weighted path
+                        # (args.typicality_a / args.typicality_c_frac), so the hi thinned arm now
+                        # admits at its configured a=1.0. Previously a_tilt was hardcoded to 0.5,
+                        # which made hi accept like lo and silently cancelled the thinned tilt sweep.
+                        # a_tilt drives BOTH w_local and the analytic w_max below, so the two stay
+                        # consistent by construction (change one -> both move).
+                        a_tilt, c_frac_tilt = args.typicality_a, args.typicality_c_frac
+                        w_local = TypicalityScorer.absolute_weights(
+                            p_local, typicality_bank.p_ref, a_tilt, c_frac_tilt)
+                        # Analytic w_max = sup_{p>=0} w = (c_frac*p_ref)^(-a): the exact upper bound of w,
+                        # attained as p_hat->0 (absolute_weights docstring: "1/c^a, no clipping required").
+                        # Recomputed EACH STEP so it tracks p_ref. Provably >= max(w) => a=w/w_max never
+                        # clamps => the admitted distribution is w_max-INVARIANT (w_max cancels in the
+                        # top-N selection); only the acceptance RATE changes. This replaces the frozen
+                        # 200-step running max, which stayed pinned to the gate-open p_ref scale while
+                        # p_ref grew ~10x, inflating the normalizer ~3.3x and starving accept to ~0.15
+                        # (85% under-fill + top-up, which breaks the Bernoulli matched-mass guarantee).
+                        # Because w depends only on p_hat/p_ref, accept is scale-invariant (~0.49) at every
+                        # p_ref, so there is no early-or-late under-fill.
+                        _pref_now = typicality_bank.p_ref
+                        _pref_now = float(_pref_now.item()) if torch.is_tensor(_pref_now) else float(_pref_now)
+                        wmax = (c_frac_tilt * max(_pref_now, 1e-8)) ** (-a_tilt)
+                        a = (w_local / max(wmax, 1e-8)).clamp(0.0, 1.0)
                     accepted = torch.nonzero(torch.rand_like(a) < a, as_tuple=False).flatten()
                     thin_accept_val = accepted.numel() / max(1, pool_n)   # realized acceptance ~ 1/chi
                     if accepted.numel() >= N:
                         keep_idx = accepted[:N]
+                        thin_refill = 0
                     else:
                         # rare under-fill: top up to N with the highest-a rejects (deterministic, no
                         # extra draw/collective). Persistent -> raise --thin_oversample_factor.
@@ -1064,11 +1129,21 @@ def train_dinov2(args):
                         rej_idx = torch.nonzero(rej, as_tuple=False).flatten()
                         order = torch.argsort(a[rej_idx], descending=True)
                         keep_idx = torch.cat([accepted, rej_idx[order[:N - accepted.numel()]]])
-                        if utils.is_main_process():
+                        thin_refill = int(N - accepted.numel())
+                        if utils.is_main_process() and keep_rule == 'v1':
                             print(f"[thinned] under-filled (accepted {accepted.numel()} < N={N}) at iter "
                                   f"{current_iteration}; topped up from pool -- consider raising "
                                   f"--thin_oversample_factor")
+                        elif utils.is_main_process() and thin_refill > N // 10:
+                            print(f"[thinned v2] under-filled (accepted {accepted.numel()} < N={N}) at iter "
+                                  f"{current_iteration}; refilled {thin_refill} from the highest-q rejects; "
+                                  f"f_next={thin_f_next:.2f} (raw {thin_f_raw:.2f}, capped={thin_f_capped})")
                     thin_committed_phat = p_local[keep_idx]
+                if keep_rule == 'v2':
+                    # Pool size of the NEXT step, agreed across ranks (MAX; MIN check every 2000 steps).
+                    # Called on every rank on every gate-open step, outside the p_local branches.
+                    thin_n_draws_cur = _sync_n_draws(
+                        _n_next, check=(current_iteration % 2000 == 0), tag=f"@it{current_iteration}")
                 survivor_raw = pool_raw[keep_idx.detach().to(pool_raw.device)]   # [N,3,224,224] uint8
             # GPU-augment the committed survivors: raw uint8 -> [g1, g2, l1..lL] normalized, on GPU.
             batch_data = gpu_augment(survivor_raw.to('cuda', non_blocking=True))
