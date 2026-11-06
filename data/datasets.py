@@ -141,10 +141,13 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         self.num_workers = num_workers
         print(f"Worker info set: worker_id={worker_id}, num_workers={num_workers}")
 
-    def set_resume_position(self, global_samples_processed: int):
+    def set_resume_position(self, global_samples_processed: int, replay_passes: bool = False):
         """Store the global resume position. __iter__ divides it by the live worker
-        count to get this worker's per-shard skip."""
+        count to get this worker's per-shard skip. replay_passes=True (keep_rule v2 resume)
+        also sets the per-worker pass counter from the position, so a resume after a full
+        pass continues with the next pass's order instead of replaying the first pass."""
         self._resume_global = global_samples_processed
+        self._replay_passes = bool(replay_passes)
         print(f"Resume: global samples processed = {self._resume_global}")
 
     def _load_known_corrupted_files(self) -> Set[str]:
@@ -293,6 +296,14 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         my_zips = live[gid::total]  # strided -> disjoint by construction; O(1), no RNG, no hash()
         print(f"Worker {gid}/{total} -> {len(my_zips)} zips")
 
+        first_pass = (self._epoch == 0)                 # first __iter__ call in this worker process
+        if first_pass and getattr(self, '_replay_passes', False):
+            # keep_rule v2 resume: a new worker process starts at _epoch 0, so after a full pass of
+            # this shard the first-pass order would replay. Set the pass counter from the resume
+            # position instead; the skip below stays the within-pass offset (it wraps per pass).
+            _pp = getattr(self, 'total_images', 0) // max(total, 1)
+            if _pp > 0:
+                self._epoch = (self._resume_global // max(total, 1)) // _pp   # passes already completed
         epoch = self._epoch
         self._epoch += 1
         rng = random.Random((self.seed * 1000003) ^ (gid * 9973) ^ (epoch * 31))
@@ -304,7 +315,7 @@ class MemoryEfficientShardedPathologyDataset(IterableDataset):
         # the stream never advanced past the resume prefix and churned until the NCCL watchdog
         # aborted. persistent_workers=True keeps _epoch incrementing, so epoch>0 restarts skip 0.
         # Preserves exact, deterministic resume (skip once to the true position); no image decode.
-        skip_per_worker = (self._resume_global // max(total, 1)) if epoch == 0 else 0
+        skip_per_worker = (self._resume_global // max(total, 1)) if first_pass else 0
         # Wrap the resume skip within one pass of this worker's shard, so it can never skip the
         # whole shard and yield nothing (which, in the multi-dataset wrapper, raises StopIteration
         # out of the generator -> a PEP-479 RuntimeError that kills the worker on resume).
@@ -622,15 +633,16 @@ class ProportionalMultiDatasetWrapper(IterableDataset):
         for dataset in self.datasets:
             dataset.set_worker_info(worker_id, num_workers)
     
-    def set_resume_position(self, global_samples_processed):
+    def set_resume_position(self, global_samples_processed, replay_passes=False):
         """Propagate resume position to each sub-dataset as ITS proportional share of the
         global count. A small dataset contributed only its fraction of the samples, so passing
         the full global count to every dataset would tell the small ones to skip more images
-        than they have -- emptying them on resume (StopIteration out of the generator below)."""
+        than they have -- emptying them on resume (StopIteration out of the generator below).
+        replay_passes is passed through (keep_rule v2 resume; default False = unchanged)."""
         bs = max(self.batch_size_per_gpu, 1)
         for i, dataset in enumerate(self.datasets):
             share = int(global_samples_processed * self.samples_per_dataset[i] / bs)
-            dataset.set_resume_position(share)
+            dataset.set_resume_position(share, replay_passes=replay_passes)
     
     def __iter__(self):
         """

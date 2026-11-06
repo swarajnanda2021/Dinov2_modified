@@ -814,12 +814,16 @@ def train_dinov2(args):
 
     # ============ Load checkpoint ============
     to_restore = {"iteration": 0, "dataset_position": 0}
+    if keep_rule == 'v2':
+        to_restore["thin_state"] = None    # utils.restart_from_checkpoint fills it when the key exists
 
     checkpoint_path = os.path.join(args.output_dir, "checkpoint.pth")
     loaded_checkpoint = None
     if os.path.exists(checkpoint_path):
         try:
-            loaded_checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            # weights_only=False: the checkpoint holds the args Namespace and the numpy RNG state,
+            # which the weights-only unpickler (the torch >= 2.6 default) rejects.
+            loaded_checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
             print(f"Pre-loaded checkpoint from iteration {loaded_checkpoint.get('iteration', 'N/A')}.")
         except Exception as e:
             print(f"Could not pre-load checkpoint. Starting fresh. Error: {e}")
@@ -857,27 +861,35 @@ def train_dinov2(args):
 
     # ============ Set resume position in dataset ============
     if current_iteration > 0:
-        global_samples_processed = current_iteration * args.batch_size_per_gpu * dist.get_world_size()
-        trainset.set_resume_position(global_samples_processed)
+        if keep_rule == 'v2':
+            # R1: the loader position is the number of batches DRAWN per rank (dataset_position), not
+            # the iteration count: a thinned step draws n_draws batches. The checkpointed step i is
+            # re-run on restart, so its draws are subtracted (1 when the gate was closed) and the
+            # counter is reset to the pre-step value, which keeps it exact across repeated restarts.
+            _ts_pos = to_restore.get("thin_state") or {}
+            _used = int(_ts_pos.get('thin_n_draws_used') or 1)
+            dataset_position = max(0, dataset_position - _used)
+            global_samples_processed = dataset_position * args.batch_size_per_gpu * dist.get_world_size()
+            trainset.set_resume_position(global_samples_processed, replay_passes=True)
+            print(f"[thinned v2] resume: loader position = {dataset_position} batches per rank "
+                  f"(re-run step {current_iteration} drew {_used})")
+        else:
+            global_samples_processed = current_iteration * args.batch_size_per_gpu * dist.get_world_size()
+            trainset.set_resume_position(global_samples_processed)
         print(f"Resuming from iteration {current_iteration}")
 
-    # ============ Restore RNGs ============
-    if loaded_checkpoint and 'torch_rng_state' in loaded_checkpoint:
-        try:
-            print("Restoring RNG states from checkpoint...")
-            torch.set_rng_state(loaded_checkpoint['torch_rng_state'])
-            torch.cuda.set_rng_state_all(loaded_checkpoint['cuda_rng_state'])
-            np.random.set_state(loaded_checkpoint['numpy_rng_state'])
-            random.setstate(loaded_checkpoint['random_rng_state'])
-            print(f"Successfully restored all RNG states to iteration {current_iteration}.")
-        except Exception as e:
-            print(f"WARNING: Failed to restore RNG states. Re-seeding. Error: {e}")
-            utils.fix_random_seeds(args.seed + utils.get_rank())
+    # ============ Seed the RNGs ============
+    # The saved RNG states are rank 0's (built on every rank, saved by rank 0 only). Applying them
+    # on every rank would give all ranks one random stream (augmentation, masks, stochastic depth,
+    # keep draws). A resumed run therefore seeds each rank from (seed, iteration, rank); iteration 0
+    # keeps the fresh-start seed. The saved RNG keys stay in the checkpoint (no format change).
+    if current_iteration > 0:
+        seed_r = (args.seed + 1_000_003 * current_iteration + 7_919 * utils.get_rank()) % (2 ** 32)
+        utils.fix_random_seeds(seed_r)            # torch CPU + every CUDA device + numpy
+        random.seed(seed_r)
+        print(f"[resume] rank {utils.get_rank()}: seed {seed_r} at iteration {current_iteration}")
     else:
-        if current_iteration == 0:
-            print("Starting from scratch. Fixing random seeds.")
-        else:
-            print(f"WARNING: Checkpoint found but no RNG state. Re-seeding.")
+        print("Starting from scratch. Fixing random seeds.")
         utils.fix_random_seeds(args.seed + utils.get_rank())
 
     # ============ Continual mode: no schedule crossover ============
@@ -891,6 +903,8 @@ def train_dinov2(args):
                 f"checkpoint at iteration {current_iteration} was trained with continual="
                 f"{ck_continual} but this run sets --continual {continual}; a run keeps the "
                 f"schedule it started with (cosine stays cosine, continual stays continual).")
+    del loaded_checkpoint                 # last use above: release the CPU copy of the checkpoint
+    gc.collect()
 
     # ============ Verify checkpoint ============
     if utils.is_main_process() and current_iteration > 0:
@@ -940,6 +954,29 @@ def train_dinov2(args):
     thin_f_capped = False             # True when the cap bound f_next in this step
     thin_n_draws_cur = max(1, math.ceil(args.thin_oversample_factor))   # pool size of the next v2 step
     thin_n_draws_used = None          # pool size (batches) of the step in flight; None while the gate is closed
+    thin_n_draws_resume = None        # pool size of the re-run step right after a resume (None otherwise)
+    if keep_rule == 'v2':
+        # R2: restore the curation state saved by a v2 checkpoint (gate, streak, m_ema, f). A v1 or
+        # baseline checkpoint has no thin_state: the gate starts closed with the start pool size.
+        _ts = to_restore.get("thin_state")
+        if isinstance(_ts, dict):
+            thin_gate_open = bool(_ts.get('thin_gate_open', False))
+            thin_ready_streak = int(_ts.get('thin_ready_streak', 0))
+            thin_m_ema = _ts.get('thin_m_ema', None)
+            thin_f_next = _ts.get('thin_f_next', None)
+            thin_f_raw = _ts.get('thin_f_raw', None)
+            thin_f_capped = bool(_ts.get('thin_f_capped', False))
+            thin_n_draws_cur = max(1, int(_ts.get('thin_n_draws_cur', thin_n_draws_cur)))
+            if thin_gate_open and _ts.get('thin_n_draws_used'):
+                thin_n_draws_resume = int(_ts['thin_n_draws_used'])   # the re-run step draws its old pool
+            if utils.is_main_process():
+                print(f"[thinned v2] restored curation state saved at iteration {_ts.get('iteration')}: "
+                      f"gate_open={thin_gate_open} ready_streak={thin_ready_streak} m_ema={thin_m_ema} "
+                      f"f_next={thin_f_next} n_draws_next={thin_n_draws_cur} "
+                      f"re-run step draws={thin_n_draws_resume}")
+        elif current_iteration > 0 and utils.is_main_process():
+            print(f"[thinned v2] checkpoint has no thin_state: gate closed, "
+                  f"n_draws={thin_n_draws_cur} = ceil(--thin_oversample_factor)")
 
     # ---- thinned GPU augmentation (kornia): the loader emits raw uint8 tiles (scout_pool_mode); the
     # scout is the NORMALIZED raw (fed to the bank), and ONLY the committed survivors are augmented,
@@ -1011,8 +1048,11 @@ def train_dinov2(args):
                         so = student([_sc], token_masks=[None], mode='dino', bottleneck_only=True)
                 else:
                     so = student([_sc], token_masks=[None], mode='dino', bottleneck_only=True)
-                # compute_signatures stays OUTSIDE autocast, as in v1: fp32 matmul.
-                sig_chunks.append(repr_protos.compute_signatures(so['bottleneck'].detach()).detach())
+                # compute_signatures stays OUTSIDE autocast, as in v1: fp32 matmul. The bottleneck is
+                # fp32 under CUDA autocast (F.normalize runs its norm in fp32); .float() is a no-op
+                # then and a guard if a torch version ever returns it in bf16.
+                sig_chunks.append(repr_protos.compute_signatures(
+                    so['bottleneck'].detach().float()).detach())
                 del so, _sc                                                   # free patch tokens + input
         return torch.cat(sig_chunks, dim=0)                                   # [pool_n, K'], pool order
 
@@ -1139,7 +1179,11 @@ def train_dinov2(args):
                 # NCCL); a rare under-fill is topped up from the SAME pool by highest-a rejects. w_max
                 # is the ANALYTIC bound (c_frac*p_ref)^(-a), recomputed each step (see below). =====
                 if keep_rule == 'v2':
-                    n_draws = max(1, int(thin_n_draws_cur))               # model-driven f (keep_rule_v2)
+                    if thin_n_draws_resume is not None:
+                        n_draws = max(1, int(thin_n_draws_resume))         # re-run step after a resume
+                        thin_n_draws_resume = None
+                    else:
+                        n_draws = max(1, int(thin_n_draws_cur))           # model-driven f (keep_rule_v2)
                     thin_n_draws_used = n_draws                            # pool size of THIS step
                     _n_next = thin_n_draws_cur                             # next pool size; updated below
                 else:
@@ -2099,6 +2143,20 @@ def train_dinov2(args):
                               f"s={_st['s']:.4f}")
                 if richardson_bank is not None:
                     save_dict['richardson_bank'] = richardson_bank.state_dict()
+                if keep_rule == 'v2':
+                    # v2 curation state (R2). Written ONLY under v2, so v1 and baseline checkpoints
+                    # keep exactly the keys they have now. Plain Python scalars, no tensors.
+                    save_dict['thin_state'] = {
+                        'thin_gate_open': bool(thin_gate_open),
+                        'thin_ready_streak': int(thin_ready_streak),
+                        'thin_m_ema': (None if thin_m_ema is None else float(thin_m_ema)),
+                        'thin_f_next': (None if thin_f_next is None else float(thin_f_next)),
+                        'thin_f_raw': (None if thin_f_raw is None else float(thin_f_raw)),
+                        'thin_f_capped': bool(thin_f_capped),
+                        'thin_n_draws_cur': int(thin_n_draws_cur),       # pool size of the NEXT step
+                        'thin_n_draws_used': thin_n_draws_used,           # pool size of THIS step (None pre-gate)
+                        'iteration': int(current_iteration),
+                    }
 
             if fp16_scaler is not None:
                 save_dict['fp16_scaler'] = fp16_scaler.state_dict()

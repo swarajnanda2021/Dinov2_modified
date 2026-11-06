@@ -156,6 +156,49 @@ def test_wrapper_resume_position_is_proportional():
     assert d1._resume_global == 3000, d1._resume_global   # 4000 * 30/40
 
 
+def test_replay_passes_continues_next_pass_order():
+    """keep_rule v2 resume (replay_passes=True): a new worker process starts at _epoch 0, so
+    after a full pass of its shard a plain resume replays the FIRST pass's shuffle order (with
+    the wrapped skip). With replay_passes the pass counter is set from the resume position, so
+    the resumed worker continues with the next pass's order at the right offset. The default
+    (replay_passes unset / False) keeps the old behaviour."""
+    tmp = tempfile.mkdtemp(prefix='resume_replay_')
+    try:
+        zips, colours = _make_shards(tmp, 5, 20)
+        total = len(colours)                             # 100 = one pass of this shard
+        ref = _bare_dataset(zips, 0, total)
+        pass0 = list(iter(ref))                          # epoch 0 order
+        pass1 = list(iter(ref))                          # epoch 1 order
+        assert pass0 != pass1 and set(pass0) == set(pass1)
+
+        # resumed at one full pass + 30 samples
+        ds = _bare_dataset(zips, total + 30, total)
+        ds._replay_passes = True
+        tail = list(iter(ds))
+        assert ds._epoch == 2, f"pass counter must be passes_done + 1 = 2, got {ds._epoch}"
+        assert tail == pass1[30:], "replay_passes must continue the SECOND pass's order at offset 30"
+        assert len(list(iter(ds))) == total and ds._epoch == 3   # later passes are full passes
+
+        # default: the old behaviour (first-pass order, wrapped skip) is unchanged
+        ds0 = _bare_dataset(zips, total + 30, total)
+        assert list(iter(ds0)) == pass0[30:] and ds0._epoch == 1
+
+        # within the first pass both paths agree
+        ds2 = _bare_dataset(zips, 30, total)
+        ds2._replay_passes = True
+        assert list(iter(ds2)) == pass0[30:] and ds2._epoch == 1
+
+        # the wrapper passes the flag through to every sub-dataset
+        d0 = _bare_dataset([], 0); d1 = _bare_dataset([], 0)
+        w = _bare_wrapper([d0, d1], ['A', 'B'], [10, 30])
+        w.set_resume_position(4000, replay_passes=True)
+        assert d0._replay_passes is True and d1._replay_passes is True
+        w.set_resume_position(4000)
+        assert d0._replay_passes is False and d1._replay_passes is False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_wrapper_survives_overskipped_empty_dataset():
     """An over-skipped (empty-on-restart) sub-dataset must not crash the wrapper generator
     with 'generator raised StopIteration' (PEP 479); the wrapper skips that slot and keeps
