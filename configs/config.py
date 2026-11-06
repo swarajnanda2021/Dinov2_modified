@@ -334,6 +334,15 @@ def get_args_parser():
                              "OUTSIDE the trainer's autocast block, so the scout currently runs fp32: "
                              "1164 ms vs 784 ms measured at pool=1536. SCIENCE-TOUCHING -- it perturbs "
                              "p_hat and therefore which tiles are admitted. A/B before enabling.")
+    parser.add_argument('--fp8_scout', default=True, type=utils.bool_flag,
+                        help="v2 scout only: run the STUDENT block linears (qkv, proj, the two MLP "
+                             "linears) in fp8 E4M3 inside the scout forward (per-token / per-output-"
+                             "channel scales, torch._scaled_mm, fp32 accumulate, bf16 out). Active only "
+                             "when --keep_rule v2; with v1, weighted, off or a baseline the flag has no "
+                             "effect (no swap, no check). When active the scout runs under bf16 autocast "
+                             "whatever --scout_amp_bf16 says. Needs an sm>=8.9 GPU (H100); pass "
+                             "--fp8_scout False to run the v2 scout in bf16 on another GPU. The training "
+                             "forward/backward, the teacher, the heads, R and the cache are untouched.")
     parser.add_argument('--grad_checkpointing', default=False, type=utils.bool_flag,
                     help='Enable gradient checkpointing to reduce memory at cost of ~40% speed')
 

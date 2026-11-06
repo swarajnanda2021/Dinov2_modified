@@ -24,6 +24,7 @@ import torch.nn.functional as F
 import utils
 from models import CombinedModelDINO, LinearPrototypeBank, ModernViT, DINOHead
 from models.vision_transformer.modern_vit import Mlp, SwiGLUFFNFused
+from models.fp8_scout import fp8_active_for, swap_student_linears, fp8_scout, check_fp8_capability
 from losses import DINOLoss, iBOTPatchLoss, KoLeoLoss, KDELoss, PatchPrototypeLoss
 from data import ProportionalMultiDatasetWrapper
 from .helpers import (
@@ -256,6 +257,14 @@ def train_dinov2(args):
         print(f"Keep rule: v2 (a={args.typicality_a}, u0={args.keep_u0}, m_ema={args.keep_m_ema}, "
               f"f_margin={args.keep_f_margin}, f cap={f_cap_v2(args.keep_u0, args.keep_f_max):.3g}); "
               f"the thinned keep step does not read --typicality_c_frac")
+    # ---- fp8 scout (models/fp8_scout.py): acts only in the v2 scout. With v1, weighted, off or a
+    # baseline the flag has no effect: no swap, no check, no change. ----
+    fp8_active = fp8_active_for(keep_rule, getattr(args, 'fp8_scout', True))
+    if fp8_active:
+        _fp8_dev, _fp8_cap = check_fp8_capability()      # all ranks stop together on a failure
+        print(f"[fp8_scout] active on {_fp8_dev} (capability {_fp8_cap}): the v2 scout runs the student "
+              f"block linears in fp8 E4M3 and uses bf16 autocast (independent of --scout_amp_bf16). "
+              f"Training, teacher, heads, R and the cache are unchanged.")
     # --use_gpu_augmentation: a weighted/off baseline reuses the thinned raw-tile loader + GPU
     # augmentation path (no scout/bank/thinning). No-op under thinned (which already does this).
     use_gpu_aug = bool(getattr(args, 'use_gpu_augmentation', False)) and balance_mode != 'thinned'
@@ -582,10 +591,26 @@ def train_dinov2(args):
     student = student.cuda()
     teacher = teacher.cuda()
 
+    # fp8 scout: swap the STUDENT block linears to ScoutFP8Linear by __class__ assignment. After the
+    # teacher deepcopy (above) and .cuda(), before torch.compile and HandRolledDP, so the compiled
+    # forwards, HandRolledDP._params and the optimizer groups all see the same Parameter objects.
+    # Nothing is swapped unless fp8 is active (--fp8_scout True AND --keep_rule v2).
+    scout_linears = None
+    if fp8_active:
+        scout_linears = swap_student_linears(student.backbone)
+        print(f"[fp8_scout] swapped {len(scout_linears)} student linears to ScoutFP8Linear "
+              f"(teacher untouched)")
+
     # Per-block torch.compile. Compiling backbone-as-a-whole trips a dynamo guard on the module-global
     # attn_bias_cache in models/vision_transformer/modern_vit.py ("Duplicate tensors found"); compiling
     # the blocks leaves the sequence-packing eager and sidesteps it entirely.
     if getattr(args, 'compile_blocks', False):
+        if keep_rule == 'v2':
+            # The v2 scout adds eval-mode (and fp8) entries on the shared TransformerBlock.forward code
+            # object. Widen the per-code-object cache so a new entry never stops compilation. Inert
+            # for every v1 run; a cache bound only, no change to numerics.
+            import torch._dynamo
+            torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 16)
         for _blk in student.backbone.blocks:
             _blk.forward = torch.compile(_blk.forward, dynamic=False)
         for _blk in teacher.backbone.blocks:
@@ -954,9 +979,12 @@ def train_dinov2(args):
     @contextlib.contextmanager
     def _scout_contexts():
         """Contexts of the v2 scout forward, in one place so every chunk sees the same contexts:
-        eval mode (no stochastic depth, exact restore of every training flag)."""
+        eval mode (no stochastic depth, exact restore of every training flag), and the fp8 linears
+        when fp8 is active (the 48 weights are quantized once per scout call, before the chunks)."""
         with contextlib.ExitStack() as _st:
             _st.enter_context(scout_eval_mode(student))
+            if fp8_active:
+                _st.enter_context(fp8_scout(scout_linears))
             yield
 
     def _scout_signatures_v2(pool_raw):
@@ -967,7 +995,7 @@ def train_dinov2(args):
         n_chunk = args.batch_size_per_gpu
         pool_n = pool_raw.shape[0]
         assert pool_n % n_chunk == 0, f"v2 scout: pool {pool_n} is not a multiple of N={n_chunk}"
-        use_bf16 = bool(getattr(args, 'scout_amp_bf16', False))
+        use_bf16 = bool(getattr(args, 'scout_amp_bf16', False)) or fp8_active   # fp8 linears emit bf16
         sig_chunks = []
         with _scout_contexts():
             for c0 in range(0, pool_n, n_chunk):
