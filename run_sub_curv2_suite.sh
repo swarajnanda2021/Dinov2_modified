@@ -55,10 +55,11 @@ if [ -d "$exp_dir" ] && ls "$exp_dir"/logs/checkpoint*.pth >/dev/null 2>&1; then
   launch_line; exit 0
 fi
 [ -d "$exp_dir" ] && { echo "  Removing existing dir (no checkpoints in it)..."; rm -rf "$exp_dir"; }
-mkdir -p "$exp_dir/logs"; cd "$exp_dir"
+mkdir -p "$exp_dir"; cd "$exp_dir"
 echo "  Cloning ($BRANCH)..."
 git clone -b "$BRANCH" "$GITHUB_REPO" .
 git log -1 --oneline | tee "$exp_dir/CLONED_COMMIT.txt"
+mkdir -p "$exp_dir/logs"
 
 # ---- guards: the rev13 loader/DP/bank/thinning guards that still apply, plus the v2 + fp8 code ----
 grep -q "get_worker_info" data/datasets.py              || { echo "  FATAL: loader fix absent"; exit 1; }
