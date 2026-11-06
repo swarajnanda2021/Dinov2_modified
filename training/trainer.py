@@ -9,6 +9,7 @@ import datetime
 import json
 from pathlib import Path
 from copy import deepcopy
+import contextlib
 import gc
 import random
 import math
@@ -40,6 +41,7 @@ from .helpers import (
     worker_init_fn,
     setup_ddp_model,
 )
+from .scout_mode import scout_eval_mode
 from typicality import RepresentativePrototypes, TypicalityScorer, CountedCoverageBank
 # Vectorized drop-in for the bank's hot path. BIT-IDENTICAL state and return values (verified on
 # GPU: full state_dict torch.equal every step, matured bank, 40 steps x 3 shape configs); it only
@@ -946,6 +948,40 @@ def train_dinov2(args):
             print(f"Starting pass {dataset_passes + 1} at iteration {current_iteration}")
         return b, False
 
+    # ---- v2 scout helpers (keep_rule == 'v2' only; the v1 path never calls these) ----
+    _keep_v2 = (keep_rule == 'v2')
+
+    @contextlib.contextmanager
+    def _scout_contexts():
+        """Contexts of the v2 scout forward, in one place so every chunk sees the same contexts:
+        eval mode (no stochastic depth, exact restore of every training flag)."""
+        with contextlib.ExitStack() as _st:
+            _st.enter_context(scout_eval_mode(student))
+            yield
+
+    def _scout_signatures_v2(pool_raw):
+        """v2: raw uint8 pool [pool_n,3,224,224] (CPU) -> [pool_n, K'] fp32 signatures in pool
+        order. The forward runs in chunks of N = args.batch_size_per_gpu (one loader batch). Each
+        chunk is normalized, forwarded (eval mode), reduced to its [N, K'] signature, and freed, so
+        the scout memory and the compiled scout shape do not depend on pool_n."""
+        n_chunk = args.batch_size_per_gpu
+        pool_n = pool_raw.shape[0]
+        assert pool_n % n_chunk == 0, f"v2 scout: pool {pool_n} is not a multiple of N={n_chunk}"
+        use_bf16 = bool(getattr(args, 'scout_amp_bf16', False))
+        sig_chunks = []
+        with _scout_contexts():
+            for c0 in range(0, pool_n, n_chunk):
+                _sc = _normalize_raw(pool_raw[c0:c0 + n_chunk])              # [N,3,224,224] fp32, GPU
+                if use_bf16:
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                        so = student([_sc], token_masks=[None], mode='dino', bottleneck_only=True)
+                else:
+                    so = student([_sc], token_masks=[None], mode='dino', bottleneck_only=True)
+                # compute_signatures stays OUTSIDE autocast, as in v1: fp32 matmul.
+                sig_chunks.append(repr_protos.compute_signatures(so['bottleneck'].detach()).detach())
+                del so, _sc                                                   # free patch tokens + input
+        return torch.cat(sig_chunks, dim=0)                                   # [pool_n, K'], pool order
+
     def _scout_and_bank(scout_crop, cur_iter):
         """Thinned mode: forward the unaugmented scout crop no-grad, update the PRIMARY and the
         coarse Richardson banks on the all-gathered scout signatures (the only bank updates), and
@@ -956,14 +992,19 @@ def train_dinov2(args):
             # out_dim prototype layer over the whole over-drawn pool. Bottleneck is bit-identical.
             # (Measured: this saves ~0 ms -- the skipped GEMM is tiny -- but it avoids materializing a
             # [pool, out_dim] fp32 activation, ~400 MB at pool=1536/out_dim=65536.)
-            _sc = scout_crop.cuda(non_blocking=True)
-            if getattr(args, 'scout_amp_bf16', False):
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    so = student([_sc], token_masks=[None], mode='dino', bottleneck_only=True)
+            if _keep_v2:
+                # v2: scout_crop is the RAW uint8 pool (CPU); chunked eval-mode forward.
+                sg = _all_gather_signatures(_scout_signatures_v2(scout_crop))
             else:
-                so = student([_sc], token_masks=[None], mode='dino', bottleneck_only=True)
-            sg = _all_gather_signatures(
-                repr_protos.compute_signatures(so['bottleneck'].detach()).detach())
+                # v1: unchanged single whole-pool forward on the normalized pool.
+                _sc = scout_crop.cuda(non_blocking=True)
+                if getattr(args, 'scout_amp_bf16', False):
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                        so = student([_sc], token_masks=[None], mode='dino', bottleneck_only=True)
+                else:
+                    so = student([_sc], token_masks=[None], mode='dino', bottleneck_only=True)
+                sg = _all_gather_signatures(
+                    repr_protos.compute_signatures(so['bottleneck'].detach()).detach())
             bo = typicality_bank.score_and_update(sg, cur_iter)
             if bo['ready'] and cur_iter % 2000 == 0:
                 _assert_bank_synced(typicality_bank.sync_fingerprint(), tag=f"@it{cur_iter}(scout)")
@@ -1031,7 +1072,8 @@ def train_dinov2(args):
                     break
                 pool_raw = b[0]                                   # [N,3,224,224] uint8 (CPU)
                 if current_iteration >= args.typicality_warmup_iters:
-                    _pl, _pg, bias = _scout_and_bank(_normalize_raw(pool_raw), current_iteration)
+                    _pl, _pg, bias = _scout_and_bank(pool_raw if _keep_v2 else _normalize_raw(pool_raw),
+                                                     current_iteration)
                     thin_bias_val = bias
                     thin_seen_val = N                             # no over-draw; committed = drawn = N
                     thin_accept_val = 1.0                         # plain baseline: everything committed
@@ -1069,7 +1111,8 @@ def train_dinov2(args):
                     print(f"Reached maximum passes ({max_passes}). Stopping.")
                     break
                 pool_raw = torch.cat([pb[0] for pb in pool_batches], dim=0)   # [pool_n,3,224,224] uint8
-                p_local, p_gathered, bias = _scout_and_bank(_normalize_raw(pool_raw), current_iteration)
+                p_local, p_gathered, bias = _scout_and_bank(pool_raw if _keep_v2 else _normalize_raw(pool_raw),
+                                                            current_iteration)
                 thin_bias_val = bias
                 pool_n = pool_raw.shape[0]
                 thin_seen_val = pool_n
