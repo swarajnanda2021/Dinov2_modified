@@ -271,6 +271,12 @@ def train_dinov2(args):
         print(f"[fp8_scout] active on {_fp8_dev} (capability {_fp8_cap}): the v2 scout runs the student "
               f"block linears in fp8 E4M3 and uses bf16 autocast (independent of --scout_amp_bf16). "
               f"Training, teacher, heads, R and the cache are unchanged.")
+    # ---- iteration checkpoints: checkpoint_iter_XXXXXXXX.pth every --save_iter_checkpoint_freq
+    # (0 = every --save_checkpoint_freq, the previous behaviour); checkpoint.pth keeps its cadence. ----
+    iter_ckpt_freq = int(getattr(args, 'save_iter_checkpoint_freq', 0)) or int(args.save_checkpoint_freq)
+    assert iter_ckpt_freq % int(args.save_checkpoint_freq) == 0, (
+        f"--save_iter_checkpoint_freq ({iter_ckpt_freq}) must be a multiple of "
+        f"--save_checkpoint_freq ({args.save_checkpoint_freq})")
     # --use_gpu_augmentation: a weighted/off baseline reuses the thinned raw-tile loader + GPU
     # augmentation path (no scout/bank/thinning). No-op under thinned (which already does this).
     use_gpu_aug = bool(getattr(args, 'use_gpu_augmentation', False)) and balance_mode != 'thinned'
@@ -2161,7 +2167,8 @@ def train_dinov2(args):
             if fp16_scaler is not None:
                 save_dict['fp16_scaler'] = fp16_scaler.state_dict()
 
-            utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint_iter_{current_iteration:08d}.pth'))
+            if current_iteration % iter_ckpt_freq == 0:
+                utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint_iter_{current_iteration:08d}.pth'))
             utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
 
         current_iteration += 1

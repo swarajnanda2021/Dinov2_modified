@@ -353,6 +353,11 @@ def get_args_parser():
                         help='Output directory for checkpoints and logs')
     parser.add_argument('--save_checkpoint_freq', default=2000, type=int,
                         help='Checkpoint saving frequency')
+    parser.add_argument('--save_iter_checkpoint_freq', default=0, type=int,
+                        help='Write checkpoint_iter_XXXXXXXX.pth only every this many iterations '
+                             '(a multiple of --save_checkpoint_freq). 0 (default) = every '
+                             '--save_checkpoint_freq, the previous behaviour. checkpoint.pth is '
+                             'still written every --save_checkpoint_freq.')
     parser.add_argument('--visualization_freq', default=100, type=int,
                         help='Mask visualization frequency')
     parser.add_argument('--seed', default=42, type=int,
