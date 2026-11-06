@@ -151,13 +151,16 @@ def _sync_n_draws(n_draws, check=False, tag=""):
     return int(hi.item())
 
 
-def _thin_profile_err(committed_phat, pool_phat, p_ref, a=0.5, c_frac=0.25, nbins=20):
+def _thin_profile_err(committed_phat, pool_phat, p_ref, a=0.5, c_frac=0.25, nbins=20,
+                      rule='v1', c=None):
     """Cheap binned-histogram L1 between the achieved committed-batch p_hat distribution and the
     target thinned profile a*mu (section 3.9). mu is the candidate-pool p_hat histogram; the target
     weights each bin by a(p) = w/w_max with w = (p + c_frac*p_ref)^-a. Bins over log10(p_hat).
     a / c_frac MUST match the admission tilt (args.typicality_a / args.typicality_c_frac) or the
     target is built for the wrong tilt and the metric is meaningless. Both histograms are normalised
-    to sum 1; returns the L1 distance (0 = perfect match)."""
+    to sum 1; returns the L1 distance (0 = perfect match).
+    rule='v2' with c > 0 builds the v2 target q(p) = min(1, (c/p)^a), c the keep threshold of the
+    step (keep_rule_v2). rule='v1' (default) keeps the v1 target above."""
     eps = 1e-8
     lp_pool = torch.log10(pool_phat + eps)
     lo = float(lp_pool.min().item()); hi = float(lp_pool.max().item())
@@ -166,8 +169,11 @@ def _thin_profile_err(committed_phat, pool_phat, p_ref, a=0.5, c_frac=0.25, nbin
     mu = torch.histc(lp_pool, bins=nbins, min=lo, max=hi)
     com = torch.histc(torch.log10(committed_phat + eps), bins=nbins, min=lo, max=hi)
     centers = torch.linspace(lo, hi, nbins, device=pool_phat.device) + 0.5 * (hi - lo) / nbins
-    w_c = 1.0 / (10.0 ** centers + c_frac * p_ref).clamp(min=eps).pow(a)
-    a_c = w_c / w_c.max().clamp(min=eps)
+    if rule == 'v2' and c is not None and float(c) > 0.0:
+        a_c = (float(c) / (10.0 ** centers).clamp(min=eps)).clamp(max=1.0).pow(a)   # q(p) = min(1, (c/p)^a)
+    else:
+        w_c = 1.0 / (10.0 ** centers + c_frac * p_ref).clamp(min=eps).pow(a)
+        a_c = w_c / w_c.max().clamp(min=eps)
     target = a_c * mu
     com_n = com / com.sum().clamp(min=eps)
     tgt_n = target / target.sum().clamp(min=eps)
@@ -1112,7 +1118,16 @@ def train_dinov2(args):
                     thin_ready_streak = thin_ready_streak + 1 if bank_ready else 0
                     if thin_ready_streak >= THIN_GATE_K:
                         thin_gate_open = True
-                        if utils.is_main_process():
+                        if utils.is_main_process() and keep_rule == 'v2':
+                            print(f"[thinned] gate OPEN at iter {current_iteration}: bank filled "
+                                  f"(p_ref={_pref:.4g}, n_est={typicality_bank._ne()}/{typicality_bank.M}, "
+                                  f"reserve={typicality_bank._nr()}/{typicality_bank.reserve_cap}); "
+                                  f"keep_rule=v2 a={args.typicality_a} u0={args.keep_u0} "
+                                  f"m_ema_decay={args.keep_m_ema} f_margin={args.keep_f_margin} "
+                                  f"f_cap={f_cap_v2(args.keep_u0, args.keep_f_max):.3g} "
+                                  f"start n_draws={thin_n_draws_cur}; c = u0-quantile of the gathered "
+                                  f"p_hat each step (the analytic w_max line does not apply)")
+                        elif utils.is_main_process():
                             print(f"[thinned] gate OPEN at iter {current_iteration}: bank filled "
                                   f"(p_ref={_pref:.4g}, n_est={typicality_bank._ne()}/{typicality_bank.M}, "
                                   f"reserve={typicality_bank._nr()}/{typicality_bank.reserve_cap}); "
@@ -1949,7 +1964,21 @@ def train_dinov2(args):
                             metric_logger.update(thin_prof_err=_thin_profile_err(
                                 thin_committed_phat, thin_pool_phat,
                                 float(typicality_bank.p_ref.item()),
-                                a=args.typicality_a, c_frac=args.typicality_c_frac))
+                                a=args.typicality_a, c_frac=args.typicality_c_frac,
+                                rule=keep_rule, c=thin_c))
+                        if keep_rule == 'v2' and thin_c is not None:
+                            # v2 curation telemetry. Rank-0 values (log.txt is written by the main
+                            # process only); thin_refill is the LOCAL refill count of rank 0.
+                            _pref_log = float(typicality_bank.p_ref.item())
+                            metric_logger.update(
+                                thin_f=float(thin_f_next), thin_f_raw=float(thin_f_raw),
+                                thin_f_capped=float(bool(thin_f_capped)),
+                                thin_n_draws=float(thin_n_draws_used),
+                                thin_c=float(thin_c), thin_c_over_pref=float(thin_c) / max(_pref_log, 1e-12),
+                                thin_m=float(thin_m), thin_m_ema=float(thin_m_ema),
+                                thin_sure=float(thin_sure), thin_zero=float(thin_zero),
+                                thin_refill=float(thin_refill if thin_refill is not None else 0),
+                                thin_c_guard=float(bool(thin_c_guard)))
 
         metric_logger.update(lr=optimizer_student.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer_student.param_groups[0]["weight_decay"])
@@ -2021,6 +2050,11 @@ def train_dinov2(args):
                     'typicality_dampening': args.use_typicality_dampening,
                 }
             }
+            if keep_rule == 'v2':
+                # train_<k> is the mean since the job started (global_avg); a cumulative mean of f, c
+                # or m is not usable, so v2 also writes the 20-step window mean of every thin_* meter.
+                log_stats.update({f'win_{k}': v.avg for k, v in metric_logger.meters.items()
+                                  if k.startswith('thin_')})
 
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
