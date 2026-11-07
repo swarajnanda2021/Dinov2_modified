@@ -71,7 +71,9 @@ def build_pair(ffn, out_dim):
     """Student and teacher wrapped like the trainer. The teacher is a deepcopy taken BEFORE the
     swap; the swap runs after .cuda() and before HandRolledDP. Returns (student, teacher, swapped)."""
     core = build_core(ffn, out_dim)
-    teacher_core = copy.deepcopy(core)
+    teacher_core = build_core(ffn, out_dim)  # fresh, same seed = same weights; deepcopy of the
+    # weight_norm heads raises on torch 2.6 (non-leaf weight). The trainer also deepcopies only
+    # the backbone and rebuilds the heads.
     core = core.cuda()
     swapped = swap_student_linears(core.backbone)
     student = HandRolledDP(core, broadcast=False)
@@ -236,7 +238,7 @@ def test_a_fp8_vs_bf16(args):
 def test_b_train_forward_identity(args):
     """Training forward bit-identical with the switch off; grads within the run-to-run floor."""
     core = build_core(args.ffn_type, args.out_dim)
-    core2 = copy.deepcopy(core).cuda()                   # same weights, copied BEFORE the swap
+    core2 = build_core(args.ffn_type, args.out_dim).cuda()  # same weights (seeded build), no deepcopy
     plain = HandRolledDP(core.cuda(), broadcast=False)
     swap_student_linears(core2.backbone)
     swapped = HandRolledDP(core2, broadcast=False)

@@ -23,6 +23,7 @@ import os
 import sys
 
 import torch
+import torch._dynamo
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import CombinedModelDINO, DINOHead, ModernViT  # noqa: E402
@@ -49,7 +50,6 @@ def build_student(seed=0, out_dim=1024, compile_blocks=False):
     model.set_grad_checkpointing(True)
     student = HandRolledDP(model, broadcast=False).cuda()
     if compile_blocks:
-        import torch._dynamo
         torch._dynamo.config.cache_size_limit = 16
         for _blk in student.module.backbone.blocks:
             _blk.forward = torch.compile(_blk.forward, dynamic=False)

@@ -16,6 +16,7 @@ import math
 import numpy as np
 
 import torch
+import torch._dynamo
 import torch.nn as nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
@@ -620,8 +621,9 @@ def train_dinov2(args):
         if keep_rule == 'v2':
             # The v2 scout adds eval-mode (and fp8) entries on the shared TransformerBlock.forward code
             # object. Widen the per-code-object cache so a new entry never stops compilation. Inert
-            # for every v1 run; a cache bound only, no change to numerics.
-            import torch._dynamo
+            # for every v1 run; a cache bound only, no change to numerics. (torch._dynamo is imported
+            # at module scope: an import inside this function would make `torch` a local name for the
+            # whole function and raise UnboundLocalError at its first use above.)
             torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 16)
         for _blk in student.backbone.blocks:
             _blk.forward = torch.compile(_blk.forward, dynamic=False)

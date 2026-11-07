@@ -37,6 +37,7 @@ from copy import deepcopy
 
 import numpy as np
 import torch
+import torch._dynamo
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 
@@ -548,8 +549,7 @@ def main():
     args = parse_args()
     utils.init_distributed_mode(args)
     cudnn.benchmark = True
-    import torch._dynamo
-    torch._dynamo.config.cache_size_limit = 16
+    torch._dynamo.config.cache_size_limit = 16        # torch._dynamo is imported at module scope
 
     bench = Bench(args)
     utils.fix_random_seeds(bench.ck_args.seed + bench.rank)
